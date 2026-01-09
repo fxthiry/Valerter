@@ -14,6 +14,9 @@ config/config.yaml
 *.swp
 *~
 
+# Coverage reports
+tarpaulin-report.*
+
 # BMAD - excluded from public repo
 _bmad/
 _bmad-output/
