@@ -1,0 +1,26 @@
+# Configuration fixture with invalid Jinja template for testing fail-fast validation
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "broken_template"
+
+templates:
+  broken_template:
+    # Invalid Jinja: unclosed block
+    title: "{% if error %}Alert"
+    body: "{{ body }}"
+
+  valid_template:
+    title: "{{ title }}"
+    body: "{{ body }}"
+
+rules:
+  - name: "valid_rule"
+    query: '_stream:{host="server1"}'
+    parser:
+      regex: '(?P<host>\S+)'

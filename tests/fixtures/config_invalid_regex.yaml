@@ -1,0 +1,27 @@
+# Configuration fixture with invalid regex pattern for testing fail-fast validation
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title }}"
+    body: "{{ body }}"
+
+rules:
+  - name: "valid_rule"
+    query: '_stream:{host="server1"}'
+    parser:
+      regex: '(?P<timestamp>\S+) (?P<level>\S+)'
+
+  - name: "invalid_regex_rule"
+    query: '_stream:{app="myapp"}'
+    parser:
+      # Invalid regex: unclosed group
+      regex: '(?P<timestamp>\S+) (?P<level'

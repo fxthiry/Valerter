@@ -1,0 +1,30 @@
+# Configuration fixture with disabled rule containing invalid regex
+# Validation should STILL fail even for disabled rules (AD-11)
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title }}"
+    body: "{{ body }}"
+
+rules:
+  - name: "active_valid_rule"
+    enabled: true
+    query: '_stream:{host="server1"}'
+    parser:
+      regex: '(?P<host>\S+)'
+
+  - name: "disabled_invalid_rule"
+    enabled: false
+    query: '_stream:{app="test"}'
+    parser:
+      # Invalid regex even though rule is disabled - should still fail
+      regex: '[invalid(regex'
