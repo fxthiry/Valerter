@@ -1,7 +1,8 @@
 //! Asynchronous notification queue for Mattermost alerts.
 //!
 //! This module implements a bounded notification queue with Drop Oldest strategy
-//! using `tokio::sync::broadcast` channel.
+//! using `tokio::sync::broadcast` channel, plus HTTP sending with exponential
+//! backoff retry to Mattermost.
 //!
 //! # Architecture
 //!
@@ -16,6 +17,7 @@
 //! - **Drop Oldest**: When queue is full, oldest alerts are dropped (AD-02)
 //! - **Metrics**: Queue size and dropped alerts are tracked (AD-05)
 //! - **Graceful shutdown**: Worker supports cancellation token
+//! - **Retry with backoff**: Exponential backoff on transient failures (AD-07)
 //!
 //! # Example
 //!
@@ -24,7 +26,11 @@
 //! use tokio_util::sync::CancellationToken;
 //!
 //! let queue = NotificationQueue::new(100);
-//! let mut worker = NotificationWorker::new(&queue);
+//! let client = reqwest::Client::builder()
+//!     .timeout(std::time::Duration::from_secs(10))
+//!     .build()
+//!     .unwrap();
+//! let mut worker = NotificationWorker::new(&queue, client);
 //! let cancel = CancellationToken::new();
 //!
 //! // Send alert (non-blocking)
@@ -36,13 +42,84 @@
 //! });
 //! ```
 
-use crate::error::QueueError;
+use crate::error::{NotifyError, QueueError};
 use crate::template::RenderedMessage;
+use serde::Serialize;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+/// Backoff base delay for Mattermost retries (AD-07).
+const MATTERMOST_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Maximum backoff delay for Mattermost retries (AD-07).
+const MATTERMOST_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Maximum number of retry attempts for Mattermost (AD-07).
+const MATTERMOST_MAX_RETRIES: u32 = 3;
+
 /// Default queue capacity (FR32).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 100;
+
+/// Mattermost attachment structure for incoming webhooks.
+#[derive(Debug, Clone, Serialize)]
+struct MattermostAttachment {
+    fallback: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    title: String,
+    text: String,
+    footer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    footer_icon: Option<String>,
+}
+
+/// Mattermost webhook payload structure.
+#[derive(Debug, Clone, Serialize)]
+struct MattermostPayload {
+    attachments: Vec<MattermostAttachment>,
+}
+
+/// Calculate exponential backoff delay.
+///
+/// Formula: min(base * 2^attempt, max)
+///
+/// # Arguments
+///
+/// * `attempt` - Current attempt number (0-indexed)
+/// * `base` - Base delay duration
+/// * `max` - Maximum delay cap
+///
+/// # Returns
+///
+/// The calculated delay, capped at `max`.
+///
+/// # Example
+///
+/// With base=500ms, max=5s:
+/// - Attempt 0: 500ms
+/// - Attempt 1: 1s
+/// - Attempt 2: 2s
+/// - Attempt 3: 4s
+/// - Attempt 4+: 5s (capped)
+fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
+    let delay = base.saturating_mul(2_u32.saturating_pow(attempt));
+    std::cmp::min(delay, max)
+}
+
+/// Build Mattermost webhook payload from rendered message.
+fn build_mattermost_payload(message: &RenderedMessage, rule_name: &str) -> MattermostPayload {
+    MattermostPayload {
+        attachments: vec![MattermostAttachment {
+            fallback: message.title.clone(),
+            color: message.color.clone(),
+            title: message.title.clone(),
+            text: message.body.clone(),
+            footer: format!("valerter | {}", rule_name),
+            footer_icon: message.icon.clone(),
+        }],
+    }
+}
 
 /// Payload ready to be sent to Mattermost.
 ///
@@ -154,6 +231,8 @@ pub struct NotificationWorker {
     rx: broadcast::Receiver<AlertPayload>,
     /// Reference to sender for queue size metrics.
     tx: broadcast::Sender<AlertPayload>,
+    /// HTTP client for sending to Mattermost.
+    client: reqwest::Client,
 }
 
 impl NotificationWorker {
@@ -162,10 +241,12 @@ impl NotificationWorker {
     /// # Arguments
     ///
     /// * `queue` - Reference to the notification queue.
-    pub fn new(queue: &NotificationQueue) -> Self {
+    /// * `client` - HTTP client for Mattermost requests (shared, connection pooling).
+    pub fn new(queue: &NotificationQueue, client: reqwest::Client) -> Self {
         Self {
             rx: queue.subscribe(),
             tx: queue.tx.clone(),
+            client,
         }
     }
 
@@ -174,7 +255,7 @@ impl NotificationWorker {
     /// The worker will:
     /// 1. Consume alerts from the queue
     /// 2. Handle `Lagged` errors by logging and updating metrics
-    /// 3. Send alerts via `send_to_mattermost` (stub for Story 3.3)
+    /// 3. Send alerts to Mattermost with retry on transient failures
     /// 4. Stop gracefully when cancellation is requested
     ///
     /// # Arguments
@@ -225,6 +306,7 @@ impl NotificationWorker {
     /// Process a single alert payload.
     ///
     /// Creates a tracing span with rule_name for debugging.
+    /// Uses Log+Continue pattern: never panics on error.
     async fn process_alert(&self, payload: AlertPayload) {
         let span = tracing::info_span!(
             "process_notification",
@@ -232,15 +314,19 @@ impl NotificationWorker {
         );
         let _guard = span.enter();
 
-        // Update queue size metric after consuming
-        // Note: This is handled by the queue on send, but we log processing here
         tracing::debug!(
-            webhook_url = %payload.webhook_url,
+            // Note: Don't log full webhook URL (contains secret token)
             "Processing alert"
         );
 
-        // Delegate to Mattermost sender (stub for Story 3.3)
-        send_to_mattermost(&payload).await;
+        // Pattern Log+Continue: never panic on error
+        if let Err(e) = send_to_mattermost(&self.client, &payload).await {
+            tracing::error!(
+                error = %e,
+                "Failed to send notification after all retries"
+            );
+            // Metric already incremented in send_to_mattermost
+        }
     }
 }
 
@@ -250,29 +336,108 @@ impl std::fmt::Debug for NotificationWorker {
     }
 }
 
-/// Send alert to Mattermost (stub for Story 3.3).
+/// Send alert to Mattermost with retry on transient failures.
 ///
-/// This function will be implemented in Story 3.3 with:
-/// - HTTP POST to webhook URL
-/// - Exponential backoff retry (500ms -> 5s)
-/// - Proper error handling
+/// Implements exponential backoff: 500ms -> 1s -> 2s (max 5s cap).
+/// Maximum 3 retries before giving up.
 ///
-/// For now, it just logs that it would send.
-async fn send_to_mattermost(payload: &AlertPayload) {
-    tracing::info!(
-        rule_name = %payload.rule_name,
-        webhook_url = %payload.webhook_url,
-        title = %payload.message.title,
-        "Would send alert to Mattermost (stub - Story 3.3)"
+/// # Retry Policy
+///
+/// - **5xx errors**: Retry (server temporarily unavailable)
+/// - **Network errors**: Retry (timeout, connection refused)
+/// - **4xx errors**: Do NOT retry (client error, invalid payload)
+///
+/// # Arguments
+///
+/// * `client` - HTTP client (shared, connection pooling)
+/// * `payload` - Alert payload with webhook URL and rendered message
+///
+/// # Returns
+///
+/// * `Ok(())` - Successfully sent
+/// * `Err(NotifyError)` - Failed after all retries
+async fn send_to_mattermost(
+    client: &reqwest::Client,
+    payload: &AlertPayload,
+) -> Result<(), NotifyError> {
+    let span = tracing::info_span!(
+        "send_mattermost",
+        rule_name = %payload.rule_name
     );
+    let _guard = span.enter();
 
-    // Increment sent counter for testing purposes
-    // In Story 3.3, this will only increment on successful send
+    let mattermost_payload = build_mattermost_payload(&payload.message, &payload.rule_name);
+
+    for attempt in 0..MATTERMOST_MAX_RETRIES {
+        match client
+            .post(&payload.webhook_url)
+            .json(&mattermost_payload)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!("Alert sent successfully");
+                metrics::counter!(
+                    "valerter_alerts_sent_total",
+                    "rule_name" => payload.rule_name.clone()
+                )
+                .increment(1);
+                return Ok(());
+            }
+            Ok(response) if response.status().is_client_error() => {
+                // 4xx errors: don't retry (invalid payload, bad webhook)
+                let status = response.status();
+                tracing::error!(
+                    status = %status,
+                    "Mattermost returned client error, not retrying"
+                );
+                metrics::counter!(
+                    "valerter_notify_errors_total",
+                    "rule_name" => payload.rule_name.clone()
+                )
+                .increment(1);
+                return Err(NotifyError::SendFailed(format!(
+                    "client error: {}",
+                    status
+                )));
+            }
+            Ok(response) => {
+                // 5xx errors: retry
+                tracing::warn!(
+                    attempt = attempt,
+                    status = %response.status(),
+                    "Mattermost returned server error, retrying"
+                );
+            }
+            Err(e) => {
+                // Network errors: retry
+                tracing::warn!(
+                    attempt = attempt,
+                    error = %e,
+                    "Failed to send to Mattermost, retrying"
+                );
+            }
+        }
+
+        // Apply backoff delay before next retry (except after last attempt)
+        if attempt < MATTERMOST_MAX_RETRIES - 1 {
+            let delay = backoff_delay(attempt, MATTERMOST_BACKOFF_BASE, MATTERMOST_BACKOFF_MAX);
+            tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    // All retries exhausted
+    tracing::error!(
+        max_retries = MATTERMOST_MAX_RETRIES,
+        "Failed to send alert after all retries"
+    );
     metrics::counter!(
-        "valerter_alerts_sent_total",
+        "valerter_notify_errors_total",
         "rule_name" => payload.rule_name.clone()
     )
     .increment(1);
+    Err(NotifyError::MaxRetriesExceeded)
 }
 
 #[cfg(test)]
@@ -291,6 +456,13 @@ mod tests {
             rule_name: rule_name.to_string(),
             webhook_url: "https://mattermost.example.com/hooks/xxx".to_string(),
         }
+    }
+
+    fn make_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("Failed to create test client")
     }
 
     // ===================================================================
@@ -330,7 +502,8 @@ mod tests {
     #[tokio::test]
     async fn worker_consumes_message() {
         let queue = NotificationQueue::new(10);
-        let mut worker = NotificationWorker::new(&queue);
+        let client = make_test_client();
+        let mut worker = NotificationWorker::new(&queue, client);
         let cancel = CancellationToken::new();
 
         // Send a message
@@ -411,7 +584,8 @@ mod tests {
     async fn worker_increments_dropped_metric_on_lag() {
         // Create small queue to trigger lag
         let queue = NotificationQueue::new(3);
-        let mut worker = NotificationWorker::new(&queue);
+        let client = make_test_client();
+        let mut worker = NotificationWorker::new(&queue, client);
         let cancel = CancellationToken::new();
 
         // Overflow the queue before worker starts consuming
@@ -444,7 +618,8 @@ mod tests {
     #[tokio::test]
     async fn worker_graceful_shutdown() {
         let queue = NotificationQueue::new(10);
-        let mut worker = NotificationWorker::new(&queue);
+        let client = make_test_client();
+        let mut worker = NotificationWorker::new(&queue, client);
         let cancel = CancellationToken::new();
 
         let cancel_clone = cancel.clone();
@@ -479,16 +654,99 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 6.8: Test send_to_mattermost stub (préparation Story 3.3)
+    // Story 3.3: Tests backoff_delay calculation
     // ===================================================================
 
-    #[tokio::test]
-    async fn send_to_mattermost_stub_logs() {
-        let payload = make_payload("test_rule");
+    #[test]
+    fn backoff_delay_calculation() {
+        let base = Duration::from_millis(500);
+        let max = Duration::from_secs(5);
 
-        // This should just log, no errors
-        send_to_mattermost(&payload).await;
-        // If we get here without panic, stub works correctly
+        // Attempt 0: 500ms * 2^0 = 500ms
+        assert_eq!(backoff_delay(0, base, max), Duration::from_millis(500));
+        // Attempt 1: 500ms * 2^1 = 1000ms
+        assert_eq!(backoff_delay(1, base, max), Duration::from_millis(1000));
+        // Attempt 2: 500ms * 2^2 = 2000ms
+        assert_eq!(backoff_delay(2, base, max), Duration::from_millis(2000));
+        // Attempt 3: 500ms * 2^3 = 4000ms
+        assert_eq!(backoff_delay(3, base, max), Duration::from_millis(4000));
+        // Attempt 4: 500ms * 2^4 = 8000ms, capped to 5000ms
+        assert_eq!(backoff_delay(4, base, max), Duration::from_secs(5));
+        // Attempt 10: would overflow, capped to max
+        assert_eq!(backoff_delay(10, base, max), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn backoff_delay_handles_overflow() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+
+        // Very high attempt should not panic, should cap at max
+        assert_eq!(backoff_delay(100, base, max), max);
+    }
+
+    // ===================================================================
+    // Story 3.3: Tests Mattermost payload building
+    // ===================================================================
+
+    #[test]
+    fn build_mattermost_payload_structure() {
+        let message = RenderedMessage {
+            title: "Test Alert".to_string(),
+            body: "Something happened".to_string(),
+            color: Some("#ff0000".to_string()),
+            icon: Some(":warning:".to_string()),
+        };
+
+        let payload = build_mattermost_payload(&message, "test_rule");
+
+        assert_eq!(payload.attachments.len(), 1);
+        let attachment = &payload.attachments[0];
+        assert_eq!(attachment.fallback, "Test Alert");
+        assert_eq!(attachment.title, "Test Alert");
+        assert_eq!(attachment.text, "Something happened");
+        assert_eq!(attachment.color, Some("#ff0000".to_string()));
+        assert_eq!(attachment.footer, "valerter | test_rule");
+        assert_eq!(attachment.footer_icon, Some(":warning:".to_string()));
+    }
+
+    #[test]
+    fn build_mattermost_payload_without_optional_fields() {
+        let message = RenderedMessage {
+            title: "Simple Alert".to_string(),
+            body: "Body text".to_string(),
+            color: None,
+            icon: None,
+        };
+
+        let payload = build_mattermost_payload(&message, "simple_rule");
+
+        let attachment = &payload.attachments[0];
+        assert_eq!(attachment.color, None);
+        assert_eq!(attachment.footer_icon, None);
+    }
+
+    #[test]
+    fn mattermost_payload_serializes_correctly() {
+        let message = RenderedMessage {
+            title: "Test".to_string(),
+            body: "Body".to_string(),
+            color: Some("#00ff00".to_string()),
+            icon: None,
+        };
+
+        let payload = build_mattermost_payload(&message, "rule");
+        let json = serde_json::to_string(&payload).unwrap();
+
+        // Verify JSON structure
+        assert!(json.contains("\"attachments\""));
+        assert!(json.contains("\"fallback\":\"Test\""));
+        assert!(json.contains("\"title\":\"Test\""));
+        assert!(json.contains("\"text\":\"Body\""));
+        assert!(json.contains("\"color\":\"#00ff00\""));
+        assert!(json.contains("\"footer\":\"valerter | rule\""));
+        // footer_icon should be omitted when None
+        assert!(!json.contains("footer_icon"));
     }
 
     // ===================================================================
@@ -535,7 +793,8 @@ mod tests {
     #[test]
     fn worker_debug_format() {
         let queue = NotificationQueue::new(10);
-        let worker = NotificationWorker::new(&queue);
+        let client = reqwest::Client::new();
+        let worker = NotificationWorker::new(&queue, client);
         let debug = format!("{:?}", worker);
         assert!(debug.contains("NotificationWorker"));
     }
