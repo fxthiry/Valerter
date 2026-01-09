@@ -47,6 +47,15 @@ pub enum NotifyError {
     MaxRetriesExceeded,
 }
 
+/// Errors related to template rendering.
+#[derive(Error, Debug)]
+pub enum TemplateError {
+    #[error("template '{name}' not found")]
+    NotFound { name: String },
+    #[error("template render failed: {message}")]
+    RenderFailed { message: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +115,21 @@ mod tests {
 
         let err = NotifyError::MaxRetriesExceeded;
         assert_eq!(err.to_string(), "max retries exceeded");
+    }
+
+    #[test]
+    fn template_error_display() {
+        let err = TemplateError::NotFound {
+            name: "alert_template".to_string(),
+        };
+        assert_eq!(err.to_string(), "template 'alert_template' not found");
+
+        let err = TemplateError::RenderFailed {
+            message: "undefined variable".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "template render failed: undefined variable"
+        );
     }
 }

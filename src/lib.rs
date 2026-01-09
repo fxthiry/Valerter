@@ -7,10 +7,12 @@ pub mod error;
 pub mod parser;
 pub mod stream_buffer;
 pub mod tail;
+pub mod template;
 pub mod throttle;
 
 // Re-export commonly used types
 pub use cli::LogFormat;
 pub use parser::{record_parse_error, RuleParser};
 pub use stream_buffer::StreamBuffer;
+pub use template::{RenderedMessage, TemplateEngine};
 pub use throttle::{ThrottleResult, Throttler};
