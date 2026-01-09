@@ -56,6 +56,13 @@ pub enum TemplateError {
     RenderFailed { message: String },
 }
 
+/// Errors related to notification queue operations.
+#[derive(Error, Debug)]
+pub enum QueueError {
+    #[error("notification queue closed")]
+    Closed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +138,11 @@ mod tests {
             err.to_string(),
             "template render failed: undefined variable"
         );
+    }
+
+    #[test]
+    fn queue_error_display() {
+        let err = QueueError::Closed;
+        assert_eq!(err.to_string(), "notification queue closed");
     }
 }
