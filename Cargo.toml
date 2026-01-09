@@ -21,6 +21,9 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 humantime-serde = "1.1"
 
+# URL Encoding
+urlencoding = "2.1"
+
 # Parsing & Templating
 regex = "1.12"
 minijinja = { version = "2.12", features = ["builtins", "json"] }
