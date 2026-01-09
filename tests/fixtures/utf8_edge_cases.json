@@ -1,0 +1,78 @@
+{
+  "description": "UTF-8 edge cases for stream_buffer.rs testing (AD-01)",
+  "reference": "https://en.wikipedia.org/wiki/UTF-8#Encoding",
+  "cases": [
+    {
+      "name": "emoji_split",
+      "description": "4-byte emoji split across two TCP chunks",
+      "character": "🚨",
+      "unicode_codepoint": "U+1F6A8",
+      "bytes_hex": ["F0", "9F", "9A", "A8"],
+      "chunk_1_hex": ["F0", "9F"],
+      "chunk_2_hex": ["9A", "A8", "0A"],
+      "expected_output": "🚨"
+    },
+    {
+      "name": "accent_split",
+      "description": "2-byte French accent split across two TCP chunks",
+      "character": "é",
+      "unicode_codepoint": "U+00E9",
+      "bytes_hex": ["C3", "A9"],
+      "chunk_1_hex": ["43", "61", "66", "C3"],
+      "chunk_2_hex": ["A9", "0A"],
+      "expected_output": "Café"
+    },
+    {
+      "name": "chinese_split",
+      "description": "3-byte Chinese character split across three TCP chunks",
+      "character": "中",
+      "unicode_codepoint": "U+4E2D",
+      "bytes_hex": ["E4", "B8", "AD"],
+      "chunk_1_hex": ["E4"],
+      "chunk_2_hex": ["B8"],
+      "chunk_3_hex": ["AD", "0A"],
+      "expected_output": "中"
+    },
+    {
+      "name": "invalid_sequence",
+      "description": "Invalid UTF-8 byte 0xFF (never valid in UTF-8)",
+      "bytes_hex": ["48", "65", "6C", "6C", "6F", "FF", "0A"],
+      "expected_error": "StreamError::Utf8Error",
+      "reason": "0xFF is reserved and never appears in valid UTF-8"
+    },
+    {
+      "name": "continuation_only",
+      "description": "Buffer containing only continuation bytes (0x80-0xBF)",
+      "bytes_hex": ["80", "81", "82"],
+      "expected_boundary": 0,
+      "reason": "Continuation bytes without leading byte form invalid UTF-8"
+    }
+  ],
+  "utf8_structure": {
+    "1_byte": {
+      "range": "0x00-0x7F",
+      "pattern": "0xxxxxxx",
+      "description": "ASCII characters"
+    },
+    "2_byte": {
+      "range": "0xC0-0xDF",
+      "pattern": "110xxxxx 10xxxxxx",
+      "description": "Latin accents, Greek, Hebrew, Arabic"
+    },
+    "3_byte": {
+      "range": "0xE0-0xEF",
+      "pattern": "1110xxxx 10xxxxxx 10xxxxxx",
+      "description": "CJK characters (Chinese, Japanese, Korean)"
+    },
+    "4_byte": {
+      "range": "0xF0-0xF7",
+      "pattern": "11110xxx 10xxxxxx 10xxxxxx 10xxxxxx",
+      "description": "Emojis, rare scripts"
+    },
+    "continuation": {
+      "range": "0x80-0xBF",
+      "pattern": "10xxxxxx",
+      "description": "Continuation byte (always follows leading byte)"
+    }
+  }
+}
