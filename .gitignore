@@ -1,20 +1,22 @@
+# Build artifacts
+/target
+
+# Local config (secrets)
+config/config.yaml
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+*.orig
+*.swp
+*~
+
 # BMAD - excluded from public repo
 _bmad/
 _bmad-output/
 
 # Claude Code settings
 .claude/
-
-# Rust
-target/
-Cargo.lock
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
