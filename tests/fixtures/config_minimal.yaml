@@ -1,0 +1,22 @@
+# Minimal valid config - tests defaults
+victorialogs:
+  url: "http://localhost:9428"
+
+defaults:
+  throttle:
+    count: 10
+    window: 30s
+  notify:
+    template: "simple"
+
+templates:
+  simple:
+    title: "Alert"
+    body: "{{ body }}"
+
+rules:
+  - name: "simple_rule"
+    query: '_stream:{app="test"}'
+    parser:
+      json:
+        fields: ["message"]

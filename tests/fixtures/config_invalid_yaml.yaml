@@ -1,0 +1,4 @@
+# Invalid YAML for testing error handling
+victorialogs:
+  url: [this is invalid yaml
+  missing_colon_here

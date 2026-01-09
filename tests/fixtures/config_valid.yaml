@@ -1,0 +1,49 @@
+# Valid configuration fixture for tests
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+    color: "#ff0000"
+  custom_template:
+    title: "Custom: {{ title }}"
+    body: "{{ message }}"
+    icon: "warning"
+
+rules:
+  - name: "high_cpu_alert"
+    enabled: true
+    query: '_stream:{host="server1"} | json | cpu > 90'
+    parser:
+      json:
+        fields: ["host", "cpu", "timestamp"]
+    throttle:
+      key: "{{ host }}"
+      count: 3
+      window: 5m
+    notify:
+      template: "default_alert"
+      channel: "alerts"
+
+  - name: "error_log_alert"
+    enabled: true
+    query: '_stream:{app="myapp"} level:error'
+    parser:
+      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
+    # Uses defaults for throttle and notify
+
+  - name: "disabled_rule"
+    enabled: false
+    query: '_stream:{app="test"}'
+    parser:
+      json:
+        fields: ["message"]

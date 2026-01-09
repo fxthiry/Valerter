@@ -1,0 +1,66 @@
+# Valerter Configuration Example
+# Copy to /etc/valerter/config.yaml and customize
+
+# VictoriaLogs connection settings
+victorialogs:
+  url: "http://victorialogs:9428"
+  # auth_token loaded from $VL_AUTH_TOKEN if needed
+
+# Default values applied to rules when not specified
+defaults:
+  throttle:
+    count: 5          # Max alerts per window
+    window: 60s       # Time window for throttling
+  notify:
+    template: "default_alert"
+
+# Reusable message templates
+templates:
+  default_alert:
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+    color: "#ff0000"
+
+  custom_template:
+    title: "{{ severity }}: {{ title }}"
+    body: |
+      **Host:** {{ host }}
+      **Message:** {{ message }}
+      **Time:** {{ timestamp }}
+    color: "{{ '#ff0000' if severity == 'critical' else '#ffaa00' }}"
+    icon: "warning"
+
+# Alert rules
+rules:
+  - name: "high_cpu_alert"
+    enabled: true
+    query: '_stream:{host="server1"} | json | cpu > 90'
+    parser:
+      json:
+        fields: ["host", "cpu", "timestamp"]
+    throttle:
+      key: "{{ host }}"      # Group throttling by host
+      count: 3               # Max 3 alerts
+      window: 5m             # Per 5 minutes
+    notify:
+      template: "default_alert"
+      channel: "alerts"
+
+  - name: "error_log_alert"
+    enabled: true
+    query: '_stream:{app="myapp"} level:error'
+    parser:
+      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
+    # Uses defaults for throttle and notify
+
+  - name: "disabled_example"
+    enabled: false
+    query: '_stream:{app="test"}'
+    parser:
+      json:
+        fields: ["message"]
+
+# Environment variables:
+# - MATTERMOST_WEBHOOK: Webhook URL for notifications (required in production)
+# - VL_AUTH_TOKEN: VictoriaLogs authentication token (optional)
+# - RUST_LOG: Log level (default: info)
