@@ -676,9 +676,11 @@ mod tests {
         assert_eq!(lines[0], r#"{"_msg":"test1"}"#);
 
         // Simulate multiple lines in one chunk
-        buffer.push(br#"{"_msg":"test2"}
+        buffer.push(
+            br#"{"_msg":"test2"}
 {"_msg":"test3"}
-"#);
+"#,
+        );
 
         let lines = buffer.drain_complete_lines().unwrap();
         assert_eq!(lines.len(), 2);

@@ -283,10 +283,7 @@ impl Config {
     ///
     /// Used for testing to avoid environment variable race conditions.
     #[cfg(test)]
-    pub fn load_with_webhook(
-        path: &Path,
-        webhook: Option<String>,
-    ) -> Result<Self, ConfigError> {
+    pub fn load_with_webhook(path: &Path, webhook: Option<String>) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::LoadError(format!("{}: {}", path.display(), e)))?;
 
@@ -357,10 +354,7 @@ impl Config {
             {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: rule.name.clone(),
-                    message: format!(
-                        "notify.template '{}' not found in templates",
-                        template_name
-                    ),
+                    message: format!("notify.template '{}' not found in templates", template_name),
                 });
             }
         }
@@ -416,33 +410,31 @@ impl Config {
     /// let runtime_config = config.compile()?;
     /// ```
     pub fn compile(self) -> Result<RuntimeConfig, ConfigError> {
-        let rules = self
-            .rules
-            .into_iter()
-            .map(|rule| {
-                let regex = rule
-                    .parser
-                    .regex
-                    .as_ref()
-                    .map(|p| Regex::new(p).expect("validate() should have caught invalid regex"));
+        let rules =
+            self.rules
+                .into_iter()
+                .map(|rule| {
+                    let regex = rule.parser.regex.as_ref().map(|p| {
+                        Regex::new(p).expect("validate() should have caught invalid regex")
+                    });
 
-                CompiledRule {
-                    name: rule.name,
-                    enabled: rule.enabled,
-                    query: rule.query,
-                    parser: CompiledParser {
-                        regex,
-                        json: rule.parser.json,
-                    },
-                    throttle: rule.throttle.map(|t| CompiledThrottle {
-                        key_template: t.key,
-                        count: t.count,
-                        window: t.window,
-                    }),
-                    notify: rule.notify,
-                }
-            })
-            .collect();
+                    CompiledRule {
+                        name: rule.name,
+                        enabled: rule.enabled,
+                        query: rule.query,
+                        parser: CompiledParser {
+                            regex,
+                            json: rule.parser.json,
+                        },
+                        throttle: rule.throttle.map(|t| CompiledThrottle {
+                            key_template: t.key,
+                            count: t.count,
+                            window: t.window,
+                        }),
+                        notify: rule.notify,
+                    }
+                })
+                .collect();
 
         let templates = self
             .templates
@@ -604,10 +596,7 @@ mod tests {
 
         assert!(config.mattermost_webhook.is_some());
         let webhook = config.mattermost_webhook.as_ref().unwrap();
-        assert_eq!(
-            webhook.expose(),
-            "https://mattermost.example.com/hooks/xxx"
-        );
+        assert_eq!(webhook.expose(), "https://mattermost.example.com/hooks/xxx");
     }
 
     #[test]
@@ -676,7 +665,11 @@ mod tests {
     fn validate_valid_config_passes() {
         let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
         let result = config.validate();
-        assert!(result.is_ok(), "Valid config should pass validation: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Valid config should pass validation: {:?}",
+            result.err()
+        );
     }
 
     // Test 6.2: Invalid regex - returns InvalidRegex with rule name
@@ -690,10 +683,13 @@ mod tests {
         assert!(!errors.is_empty(), "Should have at least one error");
 
         // Check that the error mentions the rule name
-        let has_invalid_regex_error = errors.iter().any(|e| {
-            matches!(e, ConfigError::InvalidRegex { rule, .. } if rule == "invalid_regex_rule")
-        });
-        assert!(has_invalid_regex_error, "Should have InvalidRegex error for 'invalid_regex_rule'");
+        let has_invalid_regex_error = errors.iter().any(
+            |e| matches!(e, ConfigError::InvalidRegex { rule, .. } if rule == "invalid_regex_rule"),
+        );
+        assert!(
+            has_invalid_regex_error,
+            "Should have InvalidRegex error for 'invalid_regex_rule'"
+        );
     }
 
     // Test 6.3: Disabled rule with invalid regex - must still fail (AD-11)
@@ -701,13 +697,19 @@ mod tests {
     fn validate_disabled_rule_with_invalid_regex_still_fails() {
         let config = Config::load(&fixture_path("config_disabled_invalid.yaml")).unwrap();
         let result = config.validate();
-        assert!(result.is_err(), "Disabled rules with invalid regex should still fail validation");
+        assert!(
+            result.is_err(),
+            "Disabled rules with invalid regex should still fail validation"
+        );
 
         let errors = result.unwrap_err();
         let has_disabled_rule_error = errors.iter().any(|e| {
             matches!(e, ConfigError::InvalidRegex { rule, .. } if rule == "disabled_invalid_rule")
         });
-        assert!(has_disabled_rule_error, "Should fail validation for disabled rule with invalid regex");
+        assert!(
+            has_disabled_rule_error,
+            "Should fail validation for disabled rule with invalid regex"
+        );
     }
 
     // Test: Collects all errors (not just first one)
@@ -773,7 +775,11 @@ mod tests {
         assert!(result.is_err());
 
         let errors = result.unwrap_err();
-        assert_eq!(errors.len(), 2, "Should collect all regex errors, not stop at first");
+        assert_eq!(
+            errors.len(),
+            2,
+            "Should collect all regex errors, not stop at first"
+        );
     }
 
     // Task 2: Template validation tests
@@ -786,9 +792,9 @@ mod tests {
         assert!(result.is_err(), "Invalid template should fail validation");
 
         let errors = result.unwrap_err();
-        let has_template_error = errors.iter().any(|e| {
-            matches!(e, ConfigError::InvalidTemplate { .. })
-        });
+        let has_template_error = errors
+            .iter()
+            .any(|e| matches!(e, ConfigError::InvalidTemplate { .. }));
         assert!(has_template_error, "Should have InvalidTemplate error");
     }
 
@@ -798,7 +804,11 @@ mod tests {
         // config_valid.yaml has valid templates
         let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
         let result = config.validate();
-        assert!(result.is_ok(), "Valid templates should pass: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Valid templates should pass: {:?}",
+            result.err()
+        );
     }
 
     // Task 3: RuntimeConfig tests
@@ -815,12 +825,21 @@ mod tests {
         assert_eq!(runtime.rules.len(), 3);
 
         // Check regex is compiled in rule with regex parser
-        let error_rule = runtime.rules.iter().find(|r| r.name == "error_log_alert").unwrap();
-        assert!(error_rule.parser.regex.is_some(), "Regex should be compiled");
+        let error_rule = runtime
+            .rules
+            .iter()
+            .find(|r| r.name == "error_log_alert")
+            .unwrap();
+        assert!(
+            error_rule.parser.regex.is_some(),
+            "Regex should be compiled"
+        );
 
         // Test that compiled regex actually works
         let regex = error_rule.parser.regex.as_ref().unwrap();
-        let captures = regex.captures("2026-01-09T10:00:00 ERROR something failed").unwrap();
+        let captures = regex
+            .captures("2026-01-09T10:00:00 ERROR something failed")
+            .unwrap();
         assert_eq!(captures.name("level").unwrap().as_str(), "ERROR");
     }
 
@@ -842,7 +861,11 @@ mod tests {
         assert!(runtime.templates.contains_key("default_alert"));
 
         // Rule details
-        let cpu_rule = runtime.rules.iter().find(|r| r.name == "high_cpu_alert").unwrap();
+        let cpu_rule = runtime
+            .rules
+            .iter()
+            .find(|r| r.name == "high_cpu_alert")
+            .unwrap();
         assert!(cpu_rule.enabled);
         assert!(cpu_rule.throttle.is_some());
         let throttle = cpu_rule.throttle.as_ref().unwrap();
@@ -868,23 +891,21 @@ mod tests {
                 },
             },
             templates: HashMap::new(),
-            rules: vec![
-                RuleConfig {
-                    name: "rule_with_invalid_throttle_key".to_string(),
-                    enabled: true,
-                    query: "test".to_string(),
-                    parser: ParserConfig {
-                        regex: None,
-                        json: None,
-                    },
-                    throttle: Some(ThrottleConfig {
-                        key: Some("{% if host %}{{ host".to_string()), // Invalid: unclosed
-                        count: 5,
-                        window: Duration::from_secs(60),
-                    }),
-                    notify: None,
+            rules: vec![RuleConfig {
+                name: "rule_with_invalid_throttle_key".to_string(),
+                enabled: true,
+                query: "test".to_string(),
+                parser: ParserConfig {
+                    regex: None,
+                    json: None,
                 },
-            ],
+                throttle: Some(ThrottleConfig {
+                    key: Some("{% if host %}{{ host".to_string()), // Invalid: unclosed
+                    count: 5,
+                    window: Duration::from_secs(60),
+                }),
+                notify: None,
+            }],
             mattermost_webhook: None,
         };
 
@@ -896,7 +917,10 @@ mod tests {
             matches!(e, ConfigError::InvalidTemplate { rule, message }
                 if rule == "rule_with_invalid_throttle_key" && message.contains("throttle.key"))
         });
-        assert!(has_template_error, "Should have InvalidTemplate error for throttle.key");
+        assert!(
+            has_template_error,
+            "Should have InvalidTemplate error for throttle.key"
+        );
     }
 
     // Fix M2: Test env var MATTERMOST_WEBHOOK is loaded via Config::load()
@@ -991,7 +1015,10 @@ mod tests {
         };
 
         let result = config.validate();
-        assert!(result.is_err(), "Should fail when notify.template doesn't exist");
+        assert!(
+            result.is_err(),
+            "Should fail when notify.template doesn't exist"
+        );
 
         let errors = result.unwrap_err();
         let has_missing_template_error = errors.iter().any(|e| {

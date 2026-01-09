@@ -2,14 +2,14 @@
 //!
 //! Uses wiremock to simulate VictoriaLogs tail endpoint behavior.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use valerter::error::StreamError;
 use valerter::tail::{
-    backoff_delay, log_reconnection_attempt, log_reconnection_success, ReconnectCallback,
-    TailClient, TailConfig, BACKOFF_BASE, BACKOFF_MAX,
+    BACKOFF_BASE, BACKOFF_MAX, ReconnectCallback, TailClient, TailConfig, backoff_delay,
+    log_reconnection_attempt, log_reconnection_success,
 };
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -396,10 +396,10 @@ async fn test_stream_with_reconnect_receives_lines() {
     // Configure streaming response
     Mock::given(method("POST"))
         .and(path("/select/logsql/tail"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(b"{\"_msg\":\"line1\"}\n{\"_msg\":\"line2\"}\n", "application/x-ndjson"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"line1\"}\n{\"_msg\":\"line2\"}\n",
+            "application/x-ndjson",
+        ))
         .mount(&mock_server)
         .await;
 

@@ -90,10 +90,7 @@ fn validate_invalid_regex_exits_failure() {
     );
 
     let exit_code = output.status.code().unwrap_or(-1);
-    assert_eq!(
-        exit_code, 1,
-        "Exit code should be 1 for validation failure"
-    );
+    assert_eq!(exit_code, 1, "Exit code should be 1 for validation failure");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

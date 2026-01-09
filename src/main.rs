@@ -35,7 +35,10 @@ fn main() -> Result<()> {
         for e in &errors {
             error!(error = %e, "Configuration validation error");
         }
-        error!(error_count = errors.len(), "Configuration validation failed");
+        error!(
+            error_count = errors.len(),
+            "Configuration validation failed"
+        );
         std::process::exit(1);
     }
 
@@ -43,7 +46,8 @@ fn main() -> Result<()> {
     if cli.validate {
         println!("Configuration is valid: {}", cli.config.display());
         println!("  VictoriaLogs URL: {}", config.victorialogs.url);
-        println!("  Rules: {} ({} enabled)",
+        println!(
+            "  Rules: {} ({} enabled)",
             config.rules.len(),
             config.rules.iter().filter(|r| r.enabled).count()
         );

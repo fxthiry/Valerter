@@ -48,8 +48,8 @@ impl StreamBuffer {
             let complete: Vec<u8> = self.buffer.drain(..safe_end).collect();
 
             // Decode and split into lines
-            let text = String::from_utf8(complete)
-                .map_err(|e| StreamError::Utf8Error(e.to_string()))?;
+            let text =
+                String::from_utf8(complete).map_err(|e| StreamError::Utf8Error(e.to_string()))?;
 
             for line in text.lines() {
                 lines.push(line.to_string());
@@ -379,16 +379,10 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         buffer.push(b"First\n");
-        assert_eq!(
-            buffer.drain_complete_lines().unwrap(),
-            vec!["First"]
-        );
+        assert_eq!(buffer.drain_complete_lines().unwrap(), vec!["First"]);
 
         buffer.push(b"Second\n");
-        assert_eq!(
-            buffer.drain_complete_lines().unwrap(),
-            vec!["Second"]
-        );
+        assert_eq!(buffer.drain_complete_lines().unwrap(), vec!["Second"]);
 
         buffer.push(b"Third\nFourth\n");
         assert_eq!(

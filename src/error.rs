@@ -54,7 +54,10 @@ mod tests {
     #[test]
     fn config_error_display() {
         let err = ConfigError::LoadError("file not found".to_string());
-        assert_eq!(err.to_string(), "failed to load config file: file not found");
+        assert_eq!(
+            err.to_string(),
+            "failed to load config file: file not found"
+        );
     }
 
     #[test]
@@ -96,7 +99,10 @@ mod tests {
     #[test]
     fn notify_error_display() {
         let err = NotifyError::SendFailed("network error".to_string());
-        assert_eq!(err.to_string(), "failed to send notification: network error");
+        assert_eq!(
+            err.to_string(),
+            "failed to send notification: network error"
+        );
 
         let err = NotifyError::MaxRetriesExceeded;
         assert_eq!(err.to_string(), "max retries exceeded");
