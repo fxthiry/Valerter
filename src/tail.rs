@@ -35,8 +35,9 @@ use tracing::{info, warn};
 use crate::error::StreamError;
 use crate::stream_buffer::StreamBuffer;
 
-/// Read timeout for zombie connection detection (FR4).
-pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+// Note: No read_timeout - VictoriaLogs tail endpoint doesn't send keepalives,
+// so we rely on CancellationToken for shutdown. Connection health is implicit
+// (if VL dies, the stream ends and we reconnect via backoff).
 
 /// Base delay for exponential backoff (AD-07).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -73,7 +74,6 @@ impl TailClient {
     /// Returns `StreamError::ConnectionFailed` if the HTTP client cannot be built.
     pub fn new(config: TailConfig) -> Result<Self, StreamError> {
         let client = Client::builder()
-            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
@@ -119,7 +119,6 @@ impl TailClient {
     /// # Errors
     ///
     /// - `StreamError::ConnectionFailed` if HTTP connection fails
-    /// - `StreamError::Timeout` if read timeout is reached (zombie connection)
     /// - `StreamError::Utf8Error` if stream contains invalid UTF-8
     pub async fn connect_and_receive(
         &mut self,
@@ -134,13 +133,7 @@ impl TailClient {
             .header("Connection", "keep-alive")
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    StreamError::Timeout(READ_TIMEOUT.as_secs())
-                } else {
-                    StreamError::ConnectionFailed(e.to_string())
-                }
-            })?;
+            .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
         if !response.status().is_success() {
             return Err(StreamError::ConnectionFailed(format!(
@@ -157,13 +150,8 @@ impl TailClient {
 
         // Process chunks as they arrive
         while let Some(chunk_result) = stream.next().await {
-            let chunk: Bytes = chunk_result.map_err(|e| {
-                if e.is_timeout() {
-                    StreamError::Timeout(READ_TIMEOUT.as_secs())
-                } else {
-                    StreamError::ConnectionFailed(e.to_string())
-                }
-            })?;
+            let chunk: Bytes =
+                chunk_result.map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
             // Push chunk to buffer and extract complete lines
             self.buffer.push(&chunk);
@@ -281,17 +269,13 @@ impl TailClient {
                     continue;
                 }
                 Err(e) => {
-                    // Connection error or timeout
+                    // Connection error
                     had_failure = true;
                     let delay = backoff_delay_default(attempt);
                     log_reconnection_attempt(rule_name, attempt, delay);
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
-                    if e.is_timeout() {
-                        warn!(rule_name = %rule_name, "Connection timeout");
-                    } else {
-                        warn!(rule_name = %rule_name, error = %e, "Connection failed");
-                    }
+                    warn!(rule_name = %rule_name, error = %e, "Connection failed");
                     continue;
                 }
             };
@@ -319,11 +303,7 @@ impl TailClient {
                         log_reconnection_attempt(rule_name, attempt, delay);
                         tokio::time::sleep(delay).await;
                         attempt = attempt.saturating_add(1);
-                        if e.is_timeout() {
-                            warn!(rule_name = %rule_name, "Read timeout, connection zombie");
-                        } else {
-                            warn!(rule_name = %rule_name, error = %e, "Stream read error");
-                        }
+                        warn!(rule_name = %rule_name, error = %e, "Stream read error");
                         break; // Break inner loop to reconnect
                     }
                 }
@@ -644,7 +624,6 @@ mod tests {
 
     #[test]
     fn test_constants_values() {
-        assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
         assert_eq!(BACKOFF_BASE, Duration::from_secs(1));
         assert_eq!(BACKOFF_MAX, Duration::from_secs(60));
     }
