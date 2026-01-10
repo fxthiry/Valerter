@@ -1,0 +1,32 @@
+# Valerter Test Configuration
+# Test contre logs.te-mgmt.io
+
+victorialogs:
+  url: "https://logs.te-mgmt.io"
+
+defaults:
+  throttle:
+    count: 100
+    window: 60s
+  notify:
+    template: "simple_alert"
+
+templates:
+  simple_alert:
+    title: "Switch Warning"
+    body: |
+      **Stream:** {{ _stream }}
+      **Message:** {{ _msg }}
+      **Time:** {{ _time }}
+    color: "#ffaa00"
+
+rules:
+  - name: "switch_platform_warning"
+    enabled: true
+    query: 'group:"sw" AND _msg:"%PLATFORM-4-ELEMENT_WARNING"'
+    parser:
+      json:
+        fields: []
+    throttle:
+      count: 10
+      window: 60s

@@ -90,7 +90,7 @@ pub fn record_parse_error(rule_name: &str, error: &ParseError) {
 /// let parser = RuleParser::new(Some(regex), None);
 /// let fields = parser.parse(r#"{"_msg":"192.168.1.1 GET /api",...}"#)?;
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuleParser {
     /// Pre-compiled regex pattern (from CompiledRule) - applied to _msg
     regex: Option<Regex>,

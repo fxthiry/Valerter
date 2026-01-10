@@ -6,6 +6,11 @@ victorialogs:
   url: "http://victorialogs:9428"
   # auth_token loaded from $VL_AUTH_TOKEN if needed
 
+# Metrics exposition settings
+metrics:
+  enabled: true       # Enable Prometheus metrics endpoint
+  port: 9090          # Port for /metrics endpoint
+
 # Default values applied to rules when not specified
 defaults:
   throttle:

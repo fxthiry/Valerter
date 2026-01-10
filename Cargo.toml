@@ -47,3 +47,4 @@ clap = { version = "4.5", features = ["derive", "env"] }
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
+portpicker = "0.1"

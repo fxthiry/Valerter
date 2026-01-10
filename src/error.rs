@@ -63,6 +63,21 @@ pub enum QueueError {
     Closed,
 }
 
+/// Errors related to rule execution.
+#[derive(Error, Debug)]
+pub enum RuleError {
+    #[error("stream error: {0}")]
+    Stream(#[from] StreamError),
+    #[error("parse error: {0}")]
+    Parse(#[from] ParseError),
+    #[error("template error: {0}")]
+    Template(#[from] TemplateError),
+    #[error("queue error: {0}")]
+    Queue(#[from] QueueError),
+    #[error("rule panicked")]
+    Panic,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +159,20 @@ mod tests {
     fn queue_error_display() {
         let err = QueueError::Closed;
         assert_eq!(err.to_string(), "notification queue closed");
+    }
+
+    #[test]
+    fn rule_error_display() {
+        let err = RuleError::Panic;
+        assert_eq!(err.to_string(), "rule panicked");
+
+        let err = RuleError::Stream(StreamError::Timeout(30));
+        assert_eq!(err.to_string(), "stream error: stream timeout after 30 seconds");
+
+        let err = RuleError::Parse(ParseError::NoMatch);
+        assert_eq!(err.to_string(), "parse error: regex did not match");
+
+        let err = RuleError::Queue(QueueError::Closed);
+        assert_eq!(err.to_string(), "queue error: notification queue closed");
     }
 }

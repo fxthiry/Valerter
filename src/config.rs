@@ -60,6 +60,30 @@ impl std::fmt::Display for SecretString {
     }
 }
 
+/// Metrics exposition configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Whether metrics exposition is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Port to expose metrics on.
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 9090,
+        }
+    }
+}
+
 /// Main configuration structure for valerter.
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -71,6 +95,9 @@ pub struct Config {
     pub templates: HashMap<String, TemplateConfig>,
     /// Alert rules definitions.
     pub rules: Vec<RuleConfig>,
+    /// Metrics exposition configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Mattermost webhook URL (loaded from environment).
     #[serde(skip)]
     pub mattermost_webhook: Option<SecretString>,
@@ -198,12 +225,14 @@ pub struct RuntimeConfig {
     pub templates: HashMap<String, CompiledTemplate>,
     /// Alert rules with pre-compiled regex (FR15).
     pub rules: Vec<CompiledRule>,
+    /// Metrics exposition configuration.
+    pub metrics: MetricsConfig,
     /// Mattermost webhook URL.
     pub mattermost_webhook: Option<SecretString>,
 }
 
 /// Compiled alert rule with pre-compiled regex.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledRule {
     /// Unique name of the rule.
     pub name: String,
@@ -220,7 +249,7 @@ pub struct CompiledRule {
 }
 
 /// Parser with pre-compiled regex pattern.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledParser {
     /// Pre-compiled regex pattern (FR15).
     pub regex: Option<Regex>,
@@ -229,7 +258,7 @@ pub struct CompiledParser {
 }
 
 /// Throttle configuration with template key.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledThrottle {
     /// Template key for grouping alerts.
     pub key_template: Option<String>,
@@ -457,6 +486,7 @@ impl Config {
             defaults: self.defaults,
             templates,
             rules,
+            metrics: self.metrics,
             mattermost_webhook: self.mattermost_webhook,
         })
     }
@@ -768,6 +798,7 @@ mod tests {
                     notify: None,
                 },
             ],
+            metrics: MetricsConfig::default(),
             mattermost_webhook: None,
         };
 
@@ -906,6 +937,7 @@ mod tests {
                 }),
                 notify: None,
             }],
+            metrics: MetricsConfig::default(),
             mattermost_webhook: None,
         };
 
@@ -1011,6 +1043,7 @@ mod tests {
                     channel: None,
                 }),
             }],
+            metrics: MetricsConfig::default(),
             mattermost_webhook: None,
         };
 
@@ -1053,6 +1086,7 @@ mod tests {
             },
             templates: HashMap::new(), // No templates defined!
             rules: vec![],
+            metrics: MetricsConfig::default(),
             mattermost_webhook: None,
         };
 
