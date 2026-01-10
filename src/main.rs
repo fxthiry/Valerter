@@ -7,6 +7,9 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
 use valerter::cli::{Cli, LogFormat};
 use valerter::config::Config;
 use valerter::{
@@ -39,6 +42,35 @@ fn init_logging(format: LogFormat) {
                 .init();
         }
     }
+}
+
+/// Wait for a shutdown signal (SIGINT or SIGTERM on Unix, ctrl_c on other platforms).
+///
+/// On Unix systems, listens for both SIGINT (Ctrl+C) and SIGTERM (systemd stop).
+/// On other platforms, only listens for ctrl_c.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            info!("Received SIGINT (Ctrl+C)");
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM");
+        }
+    }
+}
+
+/// Wait for a shutdown signal (ctrl_c only on non-Unix platforms).
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        error!(error = %e, "Failed to listen for ctrl-c signal");
+        return;
+    }
+    info!("Received shutdown signal (Ctrl+C)");
 }
 
 fn main() -> Result<()> {
@@ -141,14 +173,11 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create rule engine
     let engine = RuleEngine::new(runtime_config, http_client, queue.clone());
 
-    // Setup signal handler for graceful shutdown
+    // Setup signal handler for graceful shutdown (FR46: SIGTERM support for systemd)
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!(error = %e, "Failed to listen for ctrl-c signal");
-            return;
-        }
-        info!("Received shutdown signal, initiating graceful shutdown");
+        shutdown_signal().await;
+        info!("Initiating graceful shutdown");
         cancel_clone.cancel();
     });
 
@@ -180,5 +209,110 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
             error!(error = %e, "Engine error");
             Err(anyhow::anyhow!("Engine error: {}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that cancellation token triggers proper shutdown behavior.
+    /// This validates the core shutdown mechanism used by signal handlers.
+    #[tokio::test]
+    async fn shutdown_cancellation_token_works() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Spawn a task that simulates receiving a shutdown signal
+        let handle = tokio::spawn(async move {
+            // Small delay to simulate async signal arrival
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_clone.cancel();
+        });
+
+        // Wait for cancellation
+        cancel.cancelled().await;
+        handle.await.unwrap();
+
+        assert!(cancel.is_cancelled());
+    }
+
+    /// Test that multiple cancellation clones all see the cancellation.
+    #[tokio::test]
+    async fn cancellation_propagates_to_all_clones() {
+        let cancel = CancellationToken::new();
+        let cancel1 = cancel.clone();
+        let cancel2 = cancel.clone();
+        let cancel3 = cancel.clone();
+
+        // Cancel the original
+        cancel.cancel();
+
+        // All clones should see the cancellation
+        assert!(cancel1.is_cancelled());
+        assert!(cancel2.is_cancelled());
+        assert!(cancel3.is_cancelled());
+    }
+
+    /// Test that SIGTERM signal handler is properly configured.
+    /// This test validates the signal handler setup by verifying that
+    /// tokio::signal::unix::signal can create handlers for both SIGINT and SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_handlers_can_be_created() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // Verify we can create SIGTERM handler (same as shutdown_signal uses)
+        let sigterm_result = signal(SignalKind::terminate());
+        assert!(
+            sigterm_result.is_ok(),
+            "Should be able to create SIGTERM handler"
+        );
+
+        // Verify we can create SIGINT handler (same as shutdown_signal uses)
+        let sigint_result = signal(SignalKind::interrupt());
+        assert!(
+            sigint_result.is_ok(),
+            "Should be able to create SIGINT handler"
+        );
+    }
+
+    /// Test the full shutdown flow with cancellation token integration.
+    /// This validates that when shutdown_signal would complete, the cancel
+    /// token is properly triggered (simulated via direct cancellation).
+    #[tokio::test]
+    async fn shutdown_flow_cancels_all_tasks() {
+        use tokio::time::timeout;
+
+        let cancel = CancellationToken::new();
+
+        // Simulate multiple running tasks
+        let cancel1 = cancel.clone();
+        let task1 = tokio::spawn(async move {
+            cancel1.cancelled().await;
+            "task1_done"
+        });
+
+        let cancel2 = cancel.clone();
+        let task2 = tokio::spawn(async move {
+            cancel2.cancelled().await;
+            "task2_done"
+        });
+
+        // Simulate signal handler triggering cancellation
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_trigger.cancel();
+        });
+
+        // All tasks should complete after cancellation
+        let result1 = timeout(Duration::from_secs(1), task1).await;
+        let result2 = timeout(Duration::from_secs(1), task2).await;
+
+        assert!(result1.is_ok(), "task1 should complete after cancel");
+        assert!(result2.is_ok(), "task2 should complete after cancel");
+        assert_eq!(result1.unwrap().unwrap(), "task1_done");
+        assert_eq!(result2.unwrap().unwrap(), "task2_done");
     }
 }

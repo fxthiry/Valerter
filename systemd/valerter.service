@@ -1,0 +1,32 @@
+[Unit]
+Description=Valerter - Real-time alerting from VictoriaLogs to Mattermost
+Documentation=https://github.com/fxthiry/valerter
+After=network.target
+
+[Service]
+Type=simple
+User=valerter
+Group=valerter
+ExecStart=/usr/local/bin/valerter -c /etc/valerter/config.yaml
+
+# Environment - webhook from file for security
+EnvironmentFile=-/etc/valerter/environment
+
+# Restart on failure with backoff
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown (FR46)
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Note: Logs go to stderr -> journald, no ReadWritePaths needed
+
+[Install]
+WantedBy=multi-user.target

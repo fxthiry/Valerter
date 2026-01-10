@@ -66,7 +66,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cli_log_format_default() {
+        // SAFETY: Test marked #[serial] to prevent parallel execution with other env var tests
+        // Clear env var to test true default
+        unsafe { std::env::remove_var("LOG_FORMAT") };
+
         let cli = Cli::try_parse_from(["valerter"]).unwrap();
         assert!(matches!(cli.log_format, LogFormat::Text));
     }
