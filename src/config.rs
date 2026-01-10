@@ -1108,4 +1108,91 @@ mod tests {
             errors
         );
     }
+
+    // ===================================================================
+    // Story 4.3 Task 4.4: Security audit test - no secrets in logs
+    // ===================================================================
+
+    /// Test that sensitive patterns (webhook URLs, tokens) are never exposed
+    /// when SecretString values are formatted via Debug or Display.
+    /// This is a regression test for AC#4 (NFR9).
+    #[test]
+    fn security_audit_no_secrets_leaked_in_any_format() {
+        // Create secrets with recognizable patterns
+        let webhook_secret = SecretString::new("https://mattermost.example.com/hooks/abc123xyz".to_string());
+        let token_secret = SecretString::new("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string());
+
+        // Collect all possible string representations
+        let representations = vec![
+            format!("{:?}", webhook_secret),
+            format!("{}", webhook_secret),
+            format!("{:?}", token_secret),
+            format!("{}", token_secret),
+            // Also test in struct context
+            format!("{:?}", Some(&webhook_secret)),
+            format!("{:?}", vec![&webhook_secret]),
+        ];
+
+        // Sensitive patterns that must NEVER appear
+        let forbidden_patterns = [
+            "hooks/",
+            "abc123xyz",
+            "Bearer",
+            "eyJ",  // JWT prefix
+            "mattermost.example.com",
+        ];
+
+        for repr in &representations {
+            for pattern in &forbidden_patterns {
+                assert!(
+                    !repr.contains(pattern),
+                    "SECURITY VIOLATION: Secret leaked! Found '{}' in output: {}",
+                    pattern,
+                    repr
+                );
+            }
+            // Must contain redacted marker
+            assert!(
+                repr.contains("[REDACTED]") || repr.contains("Some") || repr.contains("["),
+                "Output should contain [REDACTED] or be a wrapper: {}",
+                repr
+            );
+        }
+    }
+
+    /// Test that a config with webhook can be fully debug-printed without leaks.
+    /// Simulates what would happen if someone accidentally logs the entire config.
+    #[test]
+    fn security_audit_full_config_debug_safe() {
+        let config = Config::load_with_webhook(
+            &fixture_path("config_valid.yaml"),
+            Some("https://secret.webhook.url/hooks/supersecret123".to_string()),
+        )
+        .unwrap();
+
+        // Simulate accidental full config logging
+        let debug_output = format!("{:?}", config);
+
+        // These patterns must NEVER appear
+        let forbidden = [
+            "secret.webhook.url",
+            "supersecret123",
+            "hooks/",
+        ];
+
+        for pattern in &forbidden {
+            assert!(
+                !debug_output.contains(pattern),
+                "SECURITY VIOLATION: Config debug leaked '{}' - full output: {}",
+                pattern,
+                &debug_output[..debug_output.len().min(500)]
+            );
+        }
+
+        // Verify redaction is present
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Config debug should show [REDACTED] for webhook"
+        );
+    }
 }

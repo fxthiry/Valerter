@@ -7,23 +7,45 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use valerter::cli::Cli;
+use valerter::cli::{Cli, LogFormat};
 use valerter::config::Config;
 use valerter::{
     MetricsServer, NotificationQueue, NotificationWorker, RuleEngine, DEFAULT_QUEUE_CAPACITY,
 };
 
+/// Initialize the tracing subscriber with the specified log format.
+///
+/// - `LogFormat::Text`: Human-readable format for journalctl (AD-10)
+/// - `LogFormat::Json`: Structured JSON format for log aggregation (FR42)
+fn init_logging(format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    match format {
+        LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter)
+                .init();
+        }
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .flatten_event(true)
+                .with_env_filter(filter)
+                .init();
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing subscriber for logging (output to stderr)
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // Initialize tracing subscriber with configured log format (AD-10, FR42)
+    init_logging(cli.log_format);
 
     info!(config_path = %cli.config.display(), "Loading configuration");
 

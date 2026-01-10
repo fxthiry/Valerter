@@ -32,13 +32,14 @@ pub struct Cli {
     pub validate: bool,
 
     /// Log format: text or json.
-    #[arg(long = "log-format", value_enum, default_value_t = LogFormat::Text)]
+    #[arg(long = "log-format", value_enum, default_value_t = LogFormat::Text, env = "LOG_FORMAT")]
     pub log_format: LogFormat,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn cli_default_config_path() {
@@ -80,5 +81,33 @@ mod tests {
     fn cli_log_format_invalid_rejected() {
         let result = Cli::try_parse_from(["valerter", "--log-format", "invalid"]);
         assert!(result.is_err(), "Invalid log format should be rejected");
+    }
+
+    #[test]
+    #[serial]
+    fn cli_log_format_from_env() {
+        // Set env var (unsafe in Rust 2024 edition)
+        // SAFETY: Test marked #[serial] to prevent parallel execution with other env var tests
+        unsafe { std::env::set_var("LOG_FORMAT", "json") };
+
+        // Parse without explicit flag - should use env
+        let cli = Cli::try_parse_from(["valerter"]).unwrap();
+        assert!(matches!(cli.log_format, LogFormat::Json));
+
+        // Clean up
+        unsafe { std::env::remove_var("LOG_FORMAT") };
+    }
+
+    #[test]
+    #[serial]
+    fn cli_log_format_flag_overrides_env() {
+        // SAFETY: Test marked #[serial] to prevent parallel execution with other env var tests
+        unsafe { std::env::set_var("LOG_FORMAT", "json") };
+
+        // Flag should override env
+        let cli = Cli::try_parse_from(["valerter", "--log-format", "text"]).unwrap();
+        assert!(matches!(cli.log_format, LogFormat::Text));
+
+        unsafe { std::env::remove_var("LOG_FORMAT") };
     }
 }
