@@ -3,6 +3,7 @@
 
 # Local config (secrets)
 config/config.yaml
+config/config.test.yaml
 
 # IDE
 .idea/
