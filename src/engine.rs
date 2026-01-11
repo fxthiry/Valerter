@@ -40,7 +40,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{CompiledRule, CompiledThrottle, RuntimeConfig};
+use crate::config::{BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig};
 use crate::error::RuleError;
 use crate::notify::{AlertPayload, NotificationQueue};
 use crate::parser::{RuleParser, record_parse_error};
@@ -57,6 +57,9 @@ const PANIC_RESTART_DELAY: Duration = Duration::from_secs(5);
 struct RuleSpawnContext {
     rule: CompiledRule,
     vl_url: String,
+    vl_basic_auth: Option<BasicAuthConfig>,
+    vl_headers: Option<HashMap<String, SecretString>>,
+    vl_tls: Option<TlsConfig>,
     queue: NotificationQueue,
     template_engine: Arc<TemplateEngine>,
     default_template: String,
@@ -177,6 +180,9 @@ impl RuleEngine {
             let ctx = RuleSpawnContext {
                 rule: rule.clone(),
                 vl_url: self.runtime_config.victorialogs.url.clone(),
+                vl_basic_auth: self.runtime_config.victorialogs.basic_auth.clone(),
+                vl_headers: self.runtime_config.victorialogs.headers.clone(),
+                vl_tls: self.runtime_config.victorialogs.tls.clone(),
                 queue: self.queue.clone(),
                 template_engine: Arc::clone(&template_engine),
                 default_template: default_template.clone(),
@@ -406,6 +412,9 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         base_url: ctx.vl_url.clone(),
         query: ctx.rule.query.clone(),
         start: None,
+        basic_auth: ctx.vl_basic_auth.clone(),
+        headers: ctx.vl_headers.clone(),
+        tls: ctx.vl_tls.clone(),
     };
 
     let mut tail_client = TailClient::new(tail_config).map_err(RuleError::Stream)?;
@@ -580,6 +589,9 @@ mod tests {
         RuntimeConfig {
             victorialogs: VictoriaLogsConfig {
                 url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
             },
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {

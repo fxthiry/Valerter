@@ -1,10 +1,42 @@
 # Valerter Configuration Example
 # Copy to /etc/valerter/config.yaml and customize
+#
+# Quick Start Authentication Examples (uncomment ONE):
+#
+# 1. Basic Auth:
+#    basic_auth:
+#      username: "${VL_USER}"
+#      password: "${VL_PASS}"
+#
+# 2. Bearer Token:
+#    headers:
+#      Authorization: "Bearer ${VL_TOKEN}"
+#
+# 3. Self-signed certificate:
+#    tls:
+#      verify: false
 
 # VictoriaLogs connection settings
 victorialogs:
   url: "http://victorialogs:9428"
-  # auth_token loaded from $VL_AUTH_TOKEN if needed
+
+  # ===== OPTIONAL: Authentication Options =====
+
+  # Basic Auth (optional) - generates Authorization header automatically
+  # Recommended: use environment variables for credentials
+  # basic_auth:
+  #   username: "${VL_USER}"
+  #   password: "${VL_PASS}"
+
+  # Custom headers (optional) - for tokens, API keys, etc.
+  # Values should use environment variables for security
+  # headers:
+  #   Authorization: "Bearer ${VL_TOKEN}"
+  #   X-API-Key: "${VL_API_KEY}"
+
+  # TLS configuration (optional)
+  # tls:
+  #   verify: true    # Set to false for self-signed certificates (like curl -k)
 
 # Metrics exposition settings
 metrics:
@@ -67,7 +99,10 @@ rules:
 
 # Environment variables:
 # - MATTERMOST_WEBHOOK: Webhook URL for notifications (required in production)
-# - VL_AUTH_TOKEN: VictoriaLogs authentication token (optional)
+# - VL_USER: VictoriaLogs Basic Auth username (optional)
+# - VL_PASS: VictoriaLogs Basic Auth password (optional)
+# - VL_TOKEN: VictoriaLogs Bearer token (optional, use in headers section)
+# - VL_API_KEY: VictoriaLogs API key (optional, use in headers section)
 # - RUST_LOG: Log level (default: info)
 # - LOG_FORMAT: Log output format - "text" (default) or "json"
 #               Use "json" for log aggregation systems (Loki, ELK, etc.)

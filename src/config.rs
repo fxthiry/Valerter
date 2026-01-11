@@ -26,6 +26,7 @@ use std::time::Duration;
 /// assert_eq!(format!("{:?}", secret), "[REDACTED]");
 /// assert_eq!(secret.expose(), "my-secret-webhook");
 /// ```
+#[derive(Clone)]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -57,6 +58,16 @@ impl std::fmt::Debug for SecretString {
 impl std::fmt::Display for SecretString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[REDACTED]")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(SecretString::new(s))
     }
 }
 
@@ -108,6 +119,64 @@ pub struct Config {
 pub struct VictoriaLogsConfig {
     /// URL of the VictoriaLogs instance.
     pub url: String,
+    /// Optional Basic Auth credentials.
+    #[serde(default)]
+    pub basic_auth: Option<BasicAuthConfig>,
+    /// Optional custom headers (for tokens, API keys, etc.).
+    #[serde(default)]
+    pub headers: Option<HashMap<String, SecretString>>,
+    /// Optional TLS configuration.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// Basic Auth configuration for VictoriaLogs connection.
+///
+/// Both `username` and `password` are required when Basic Auth is configured.
+/// The password is stored as a `SecretString` to prevent accidental exposure.
+#[derive(Clone)]
+pub struct BasicAuthConfig {
+    /// Username for Basic Auth.
+    pub username: String,
+    /// Password for Basic Auth (never exposed in logs).
+    pub password: SecretString,
+}
+
+impl std::fmt::Debug for BasicAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuthConfig")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BasicAuthConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawBasicAuth {
+            username: String,
+            password: String,
+        }
+
+        let raw = RawBasicAuth::deserialize(deserializer)?;
+        Ok(BasicAuthConfig {
+            username: raw.username,
+            password: SecretString::new(raw.password),
+        })
+    }
+}
+
+/// TLS configuration for VictoriaLogs connection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// Whether to verify TLS certificates (default: true).
+    /// Set to false for self-signed certificates.
+    #[serde(default = "default_true")]
+    pub verify: bool,
 }
 
 /// Default configuration values applied to rules when not specified.
@@ -749,6 +818,9 @@ mod tests {
         let config = Config {
             victorialogs: VictoriaLogsConfig {
                 url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
             },
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {
@@ -910,6 +982,9 @@ mod tests {
         let config = Config {
             victorialogs: VictoriaLogsConfig {
                 url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
             },
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {
@@ -1005,6 +1080,9 @@ mod tests {
         let config = Config {
             victorialogs: VictoriaLogsConfig {
                 url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
             },
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {
@@ -1073,6 +1151,9 @@ mod tests {
         let config = Config {
             victorialogs: VictoriaLogsConfig {
                 url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
             },
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {
@@ -1191,6 +1272,170 @@ mod tests {
         assert!(
             debug_output.contains("[REDACTED]"),
             "Config debug should show [REDACTED] for webhook"
+        );
+    }
+
+    // ===================================================================
+    // Story 5.4: VictoriaLogs Connection Options Tests
+    // ===================================================================
+
+    // Task 1: Test parsing config with basic_auth, headers, and tls
+
+    #[test]
+    fn load_config_with_basic_auth() {
+        let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
+
+        // Basic Auth should be parsed
+        assert!(config.victorialogs.basic_auth.is_some());
+        let basic_auth = config.victorialogs.basic_auth.as_ref().unwrap();
+        assert_eq!(basic_auth.username, "testuser");
+        assert_eq!(basic_auth.password.expose(), "testpassword");
+    }
+
+    #[test]
+    fn load_config_with_headers() {
+        let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
+
+        // Headers should be parsed
+        assert!(config.victorialogs.headers.is_some());
+        let headers = config.victorialogs.headers.as_ref().unwrap();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers.get("X-API-Key").unwrap().expose(),
+            "secret-api-key-12345"
+        );
+        assert_eq!(
+            headers.get("X-Custom-Header").unwrap().expose(),
+            "custom-value"
+        );
+    }
+
+    #[test]
+    fn load_config_with_tls_verify_false() {
+        let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
+
+        // TLS config should be parsed with verify: false
+        assert!(config.victorialogs.tls.is_some());
+        let tls = config.victorialogs.tls.as_ref().unwrap();
+        assert!(!tls.verify);
+    }
+
+    #[test]
+    fn load_config_without_auth_options() {
+        // Existing config should still work with new optional fields
+        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+
+        assert!(config.victorialogs.basic_auth.is_none());
+        assert!(config.victorialogs.headers.is_none());
+        assert!(config.victorialogs.tls.is_none());
+    }
+
+    // Task 2: Test SecretString protection for basic_auth and headers
+
+    #[test]
+    fn basic_auth_debug_redacts_password() {
+        let basic_auth = BasicAuthConfig {
+            username: "admin".to_string(),
+            password: SecretString::new("super-secret-password".to_string()),
+        };
+
+        let debug_output = format!("{:?}", basic_auth);
+
+        // Username should be visible
+        assert!(debug_output.contains("admin"));
+        // Password must be redacted
+        assert!(!debug_output.contains("super-secret-password"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn headers_with_secret_values_are_redacted_in_debug() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            SecretString::new("Bearer secret-token".to_string()),
+        );
+        headers.insert(
+            "X-API-Key".to_string(),
+            SecretString::new("api-key-12345".to_string()),
+        );
+
+        let debug_output = format!("{:?}", headers);
+
+        // Secret values must not appear
+        assert!(!debug_output.contains("secret-token"));
+        assert!(!debug_output.contains("Bearer"));
+        assert!(!debug_output.contains("api-key-12345"));
+        // Keys are fine to show
+        assert!(debug_output.contains("Authorization"));
+        assert!(debug_output.contains("X-API-Key"));
+    }
+
+    #[test]
+    fn full_config_with_auth_debug_redacts_all_secrets() {
+        let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
+
+        let debug_output = format!("{:?}", config);
+
+        // These secrets must NEVER appear
+        assert!(
+            !debug_output.contains("testpassword"),
+            "Password leaked in debug"
+        );
+        assert!(
+            !debug_output.contains("secret-api-key-12345"),
+            "API key leaked in debug"
+        );
+
+        // But username and header keys are OK
+        assert!(debug_output.contains("testuser"));
+    }
+
+    // Task 3: Test TLS verify defaults to true
+
+    #[test]
+    fn tls_verify_defaults_to_true() {
+        let tls: TlsConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(tls.verify, "TLS verify should default to true");
+    }
+
+    #[test]
+    fn tls_verify_can_be_set_to_false() {
+        let tls: TlsConfig = serde_yaml::from_str("verify: false").unwrap();
+        assert!(!tls.verify);
+    }
+
+    // Task 3: Validation for incomplete basic_auth
+
+    #[test]
+    fn load_config_with_incomplete_basic_auth_fails() {
+        let result = Config::load(&fixture_path("config_invalid_basic_auth.yaml"));
+
+        assert!(result.is_err(), "Should fail when basic_auth is incomplete");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                // Serde should report missing 'password' field
+                assert!(
+                    msg.contains("password") || msg.contains("missing"),
+                    "Error should mention missing password field: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected ValidationError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn validate_config_with_auth_passes() {
+        let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
+
+        // Validation should pass for valid config with auth options
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Valid config with auth should pass validation: {:?}",
+            result.err()
         );
     }
 }

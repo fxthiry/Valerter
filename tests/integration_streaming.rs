@@ -20,6 +20,9 @@ fn create_config(mock_server: &MockServer, query: &str) -> TailConfig {
         base_url: mock_server.uri(),
         query: query.to_string(),
         start: None,
+        basic_auth: None,
+        headers: None,
+        tls: None,
     }
 }
 
@@ -186,6 +189,9 @@ async fn test_connection_error_server_down() {
         base_url: "http://127.0.0.1:59999".to_string(), // Unlikely port
         query: "_stream:test".to_string(),
         start: None,
+        basic_auth: None,
+        headers: None,
+        tls: None,
     };
 
     let mut client = TailClient::new(config).unwrap();
@@ -275,6 +281,9 @@ async fn test_url_construction_is_correct() {
         base_url: mock_server.uri(),
         query: r#"_stream:{app="myapp"}"#.to_string(),
         start: None,
+        basic_auth: None,
+        headers: None,
+        tls: None,
     };
 
     let mut client = TailClient::new(config).unwrap();
@@ -300,6 +309,9 @@ async fn test_url_with_start_param() {
         base_url: mock_server.uri(),
         query: "_stream:test".to_string(),
         start: Some("now-1h".to_string()),
+        basic_auth: None,
+        headers: None,
+        tls: None,
     };
 
     let mut client = TailClient::new(config).unwrap();
@@ -514,4 +526,226 @@ fn test_reconnect_callback_trait() {
 
     callback.on_reconnect("rule2");
     assert_eq!(callback.reconnect_count(), 2);
+}
+
+// =============================================================================
+// Story 5.4: Basic Auth and Custom Headers Integration Tests
+// =============================================================================
+//
+// Note on TLS testing (AC #6, #7):
+// - AC #6 (verify: false with self-signed cert): Code implemented in tail.rs:90-93
+//   via danger_accept_invalid_certs(true). Not testable with wiremock as it
+//   doesn't support TLS configuration in tests.
+// - AC #7 (verify: true rejects self-signed): Default behavior from reqwest.
+//   Not testable without a real TLS server with self-signed certificate.
+//   The default value (verify: true) is tested in config.rs unit tests.
+// =============================================================================
+
+use valerter::config::{BasicAuthConfig, SecretString};
+use std::collections::HashMap;
+use wiremock::matchers::header_exists;
+
+/// Helper to create a TailConfig with Basic Auth
+fn create_config_with_basic_auth(mock_server: &MockServer, username: &str, password: &str) -> TailConfig {
+    TailConfig {
+        base_url: mock_server.uri(),
+        query: "_stream:auth".to_string(),
+        start: None,
+        basic_auth: Some(BasicAuthConfig {
+            username: username.to_string(),
+            password: SecretString::new(password.to_string()),
+        }),
+        headers: None,
+        tls: None,
+    }
+}
+
+/// Helper to create a TailConfig with custom headers
+fn create_config_with_headers(mock_server: &MockServer, headers: HashMap<String, SecretString>) -> TailConfig {
+    TailConfig {
+        base_url: mock_server.uri(),
+        query: "_stream:headers".to_string(),
+        start: None,
+        basic_auth: None,
+        headers: Some(headers),
+        tls: None,
+    }
+}
+
+#[tokio::test]
+async fn test_basic_auth_header_is_sent() {
+    let mock_server = MockServer::start().await;
+
+    // Expected Basic Auth header for "testuser:testpass" is "dGVzdHVzZXI6dGVzdHBhc3M="
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"authenticated\"}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config_with_basic_auth(&mock_server, "testuser", "testpass");
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client.connect_and_receive("test_rule").await.unwrap();
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("authenticated"));
+}
+
+#[tokio::test]
+async fn test_custom_headers_are_sent() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .and(header("X-API-Key", "secret-key-123"))
+        .and(header("X-Custom", "custom-value"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"headers received\"}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = HashMap::new();
+    headers.insert("X-API-Key".to_string(), SecretString::new("secret-key-123".to_string()));
+    headers.insert("X-Custom".to_string(), SecretString::new("custom-value".to_string()));
+
+    let config = create_config_with_headers(&mock_server, headers);
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client.connect_and_receive("test_rule").await.unwrap();
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("headers received"));
+}
+
+#[tokio::test]
+async fn test_bearer_token_in_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .and(header("Authorization", "Bearer my-jwt-token-here"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"bearer auth ok\"}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        SecretString::new("Bearer my-jwt-token-here".to_string()),
+    );
+
+    let config = create_config_with_headers(&mock_server, headers);
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client.connect_and_receive("test_rule").await.unwrap();
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("bearer auth ok"));
+}
+
+#[tokio::test]
+async fn test_basic_auth_with_custom_headers_combined() {
+    let mock_server = MockServer::start().await;
+
+    // Both Basic Auth and custom headers should be sent
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .and(header_exists("Authorization")) // Basic auth header
+        .and(header("X-Tenant-ID", "tenant-abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"combined auth ok\"}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = HashMap::new();
+    headers.insert("X-Tenant-ID".to_string(), SecretString::new("tenant-abc".to_string()));
+
+    let config = TailConfig {
+        base_url: mock_server.uri(),
+        query: "_stream:combined".to_string(),
+        start: None,
+        basic_auth: Some(BasicAuthConfig {
+            username: "admin".to_string(),
+            password: SecretString::new("secret".to_string()),
+        }),
+        headers: Some(headers),
+        tls: None,
+    };
+
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client.connect_and_receive("test_rule").await.unwrap();
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("combined auth ok"));
+}
+
+// =============================================================================
+// Test 401 on wrong credentials (AC #1 edge case)
+// =============================================================================
+
+#[tokio::test]
+async fn test_basic_auth_401_on_wrong_credentials() {
+    let mock_server = MockServer::start().await;
+
+    // Server expects correct credentials, returns 401 for wrong ones
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .and(header("Authorization", "Basic d3JvbmdfdXNlcjp3cm9uZ19wYXNz")) // wrong_user:wrong_pass
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config_with_basic_auth(&mock_server, "wrong_user", "wrong_pass");
+    let mut client = TailClient::new(config).unwrap();
+
+    let result = client.connect_and_receive("test_rule").await;
+
+    assert!(result.is_err());
+    match result {
+        Err(StreamError::ConnectionFailed(msg)) => {
+            assert!(msg.contains("401"), "Should mention 401 status: {}", msg);
+        }
+        _ => panic!("Expected ConnectionFailed error with 401"),
+    }
+}
+
+#[tokio::test]
+async fn test_without_auth_no_authorization_header() {
+    let mock_server = MockServer::start().await;
+
+    // This mock will FAIL if Authorization header is present
+    Mock::given(method("POST"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"_msg\":\"no auth\"}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:noauth");
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client.connect_and_receive("test_rule").await.unwrap();
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("no auth"));
 }

@@ -18,6 +18,9 @@
 //!     base_url: "http://localhost:9428".to_string(),
 //!     query: "_stream:myapp".to_string(),
 //!     start: None,
+//!     basic_auth: None,
+//!     headers: None,
+//!     tls: None,
 //! };
 //!
 //! let mut client = TailClient::new(config)?;
@@ -25,6 +28,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -32,6 +36,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tracing::{info, warn};
 
+use crate::config::{BasicAuthConfig, SecretString, TlsConfig};
 use crate::error::StreamError;
 use crate::stream_buffer::StreamBuffer;
 
@@ -54,6 +59,12 @@ pub struct TailConfig {
     pub query: String,
     /// Optional start timestamp (e.g., "now-1h").
     pub start: Option<String>,
+    /// Optional Basic Auth credentials.
+    pub basic_auth: Option<BasicAuthConfig>,
+    /// Optional custom headers (for tokens, API keys, etc.).
+    pub headers: Option<HashMap<String, SecretString>>,
+    /// Optional TLS configuration.
+    pub tls: Option<TlsConfig>,
 }
 
 /// Client for streaming logs from VictoriaLogs tail endpoint.
@@ -73,7 +84,16 @@ impl TailClient {
     ///
     /// Returns `StreamError::ConnectionFailed` if the HTTP client cannot be built.
     pub fn new(config: TailConfig) -> Result<Self, StreamError> {
-        let client = Client::builder()
+        let mut builder = Client::builder();
+
+        // Configure TLS verification (AC #6, #7)
+        if let Some(ref tls) = config.tls {
+            if !tls.verify {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+        }
+
+        let client = builder
             .build()
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
@@ -82,6 +102,29 @@ impl TailClient {
             client,
             buffer: StreamBuffer::new(),
         })
+    }
+
+    /// Build a request with all configured auth and headers.
+    fn build_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Accept", "application/x-ndjson")
+            .header("Connection", "keep-alive");
+
+        // Add Basic Auth if configured (AC #1)
+        if let Some(ref auth) = self.config.basic_auth {
+            request = request.basic_auth(&auth.username, Some(auth.password.expose()));
+        }
+
+        // Add custom headers if configured (AC #3, #5)
+        if let Some(ref headers) = self.config.headers {
+            for (name, value) in headers {
+                request = request.header(name, value.expose());
+            }
+        }
+
+        request
     }
 
     /// Build the full URL for the VictoriaLogs tail endpoint.
@@ -127,10 +170,7 @@ impl TailClient {
         let url = self.build_url();
 
         let response = self
-            .client
-            .post(&url)
-            .header("Accept", "application/x-ndjson")
-            .header("Connection", "keep-alive")
+            .build_request(&url)
             .send()
             .await
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
@@ -200,6 +240,9 @@ impl TailClient {
     ///     base_url: "http://localhost:9428".to_string(),
     ///     query: "_stream:myapp".to_string(),
     ///     start: None,
+    ///     basic_auth: None,
+    ///     headers: None,
+    ///     tls: None,
     /// };
     ///
     /// let mut client = TailClient::new(config)?;
@@ -232,13 +275,7 @@ impl TailClient {
         loop {
             let url = self.build_url();
 
-            let connect_result = self
-                .client
-                .post(&url)
-                .header("Accept", "application/x-ndjson")
-                .header("Connection", "keep-alive")
-                .send()
-                .await;
+            let connect_result = self.build_request(&url).send().await;
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
@@ -390,17 +427,25 @@ pub fn log_reconnection_success(rule_name: &str) {
 mod tests {
     use super::*;
 
+    /// Helper to create a simple TailConfig for testing
+    fn test_config(base_url: &str, query: &str, start: Option<&str>) -> TailConfig {
+        TailConfig {
+            base_url: base_url.to_string(),
+            query: query.to_string(),
+            start: start.map(|s| s.to_string()),
+            basic_auth: None,
+            headers: None,
+            tls: None,
+        }
+    }
+
     // ==========================================================================
     // Task 7.1: Test URL construction with LogsQL query
     // ==========================================================================
 
     #[test]
     fn test_build_url_basic() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "_stream:myapp".to_string(),
-            start: None,
-        };
+        let config = test_config("http://localhost:9428", "_stream:myapp", None);
 
         let client = TailClient::new(config).unwrap();
         let url = client.build_url();
@@ -413,11 +458,7 @@ mod tests {
 
     #[test]
     fn test_build_url_with_start() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "_stream:myapp".to_string(),
-            start: Some("now-1h".to_string()),
-        };
+        let config = test_config("http://localhost:9428", "_stream:myapp", Some("now-1h"));
 
         let client = TailClient::new(config).unwrap();
         let url = client.build_url();
@@ -430,11 +471,11 @@ mod tests {
 
     #[test]
     fn test_build_url_complex_query() {
-        let config = TailConfig {
-            base_url: "http://vlogs.local:9428".to_string(),
-            query: r#"_stream:{app="myapp"} | level:error"#.to_string(),
-            start: None,
-        };
+        let config = test_config(
+            "http://vlogs.local:9428",
+            r#"_stream:{app="myapp"} | level:error"#,
+            None,
+        );
 
         let client = TailClient::new(config).unwrap();
         let url = client.build_url();
@@ -451,11 +492,11 @@ mod tests {
 
     #[test]
     fn test_build_url_with_spaces_in_query() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "level:error message contains test".to_string(),
-            start: None,
-        };
+        let config = test_config(
+            "http://localhost:9428",
+            "level:error message contains test",
+            None,
+        );
 
         let client = TailClient::new(config).unwrap();
         let url = client.build_url();
@@ -576,11 +617,7 @@ mod tests {
 
     #[test]
     fn test_client_has_buffer() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "_stream:test".to_string(),
-            start: None,
-        };
+        let config = test_config("http://localhost:9428", "_stream:test", None);
 
         let client = TailClient::new(config).unwrap();
 
@@ -590,11 +627,7 @@ mod tests {
 
     #[test]
     fn test_tail_config_clone() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "_stream:test".to_string(),
-            start: Some("now-1h".to_string()),
-        };
+        let config = test_config("http://localhost:9428", "_stream:test", Some("now-1h"));
 
         let cloned = config.clone();
 
@@ -605,11 +638,7 @@ mod tests {
 
     #[test]
     fn test_tail_config_debug() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "_stream:test".to_string(),
-            start: None,
-        };
+        let config = test_config("http://localhost:9428", "_stream:test", None);
 
         let debug_str = format!("{:?}", config);
 
@@ -630,11 +659,7 @@ mod tests {
 
     #[test]
     fn test_client_creation_success() {
-        let config = TailConfig {
-            base_url: "http://localhost:9428".to_string(),
-            query: "test".to_string(),
-            start: None,
-        };
+        let config = test_config("http://localhost:9428", "test", None);
 
         let result = TailClient::new(config);
         assert!(result.is_ok());

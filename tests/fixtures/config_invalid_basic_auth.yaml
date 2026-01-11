@@ -1,0 +1,20 @@
+# Configuration fixture with incomplete Basic Auth (missing password)
+victorialogs:
+  url: "https://victorialogs.secure.local:9428"
+  basic_auth:
+    username: "testuser"
+    # password is missing - this should fail to parse
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title }}"
+    body: "{{ body }}"
+
+rules: []
