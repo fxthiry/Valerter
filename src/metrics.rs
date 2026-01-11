@@ -30,6 +30,10 @@ pub fn register_metric_descriptions() {
         "Total number of alerts blocked by throttling"
     );
     describe_counter!(
+        "valerter_alerts_passed_total",
+        "Total number of alerts that passed throttling (not blocked)"
+    );
+    describe_counter!(
         "valerter_alerts_dropped_total",
         "Total number of alerts dropped due to full queue"
     );

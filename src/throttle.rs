@@ -30,8 +30,8 @@ use crate::config::CompiledThrottle;
 use minijinja::Environment;
 use moka::sync::Cache;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Default maximum capacity for throttle cache to prevent OOM (FR25).

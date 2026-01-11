@@ -23,8 +23,6 @@ pub enum ConfigError {
 pub enum StreamError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
-    #[error("stream timeout after {0} seconds")]
-    Timeout(u64),
     #[error("invalid UTF-8 in stream: {0}")]
     Utf8Error(String),
 }
@@ -114,8 +112,8 @@ mod tests {
         let err = StreamError::ConnectionFailed("timeout".to_string());
         assert_eq!(err.to_string(), "connection failed: timeout");
 
-        let err = StreamError::Timeout(30);
-        assert_eq!(err.to_string(), "stream timeout after 30 seconds");
+        let err = StreamError::Utf8Error("invalid sequence".to_string());
+        assert_eq!(err.to_string(), "invalid UTF-8 in stream: invalid sequence");
     }
 
     #[test]
@@ -166,8 +164,11 @@ mod tests {
         let err = RuleError::Panic;
         assert_eq!(err.to_string(), "rule panicked");
 
-        let err = RuleError::Stream(StreamError::Timeout(30));
-        assert_eq!(err.to_string(), "stream error: stream timeout after 30 seconds");
+        let err = RuleError::Stream(StreamError::ConnectionFailed("network error".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "stream error: connection failed: network error"
+        );
 
         let err = RuleError::Parse(ParseError::NoMatch);
         assert_eq!(err.to_string(), "parse error: regex did not match");

@@ -1119,8 +1119,10 @@ mod tests {
     #[test]
     fn security_audit_no_secrets_leaked_in_any_format() {
         // Create secrets with recognizable patterns
-        let webhook_secret = SecretString::new("https://mattermost.example.com/hooks/abc123xyz".to_string());
-        let token_secret = SecretString::new("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string());
+        let webhook_secret =
+            SecretString::new("https://mattermost.example.com/hooks/abc123xyz".to_string());
+        let token_secret =
+            SecretString::new("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string());
 
         // Collect all possible string representations
         let representations = vec![
@@ -1138,7 +1140,7 @@ mod tests {
             "hooks/",
             "abc123xyz",
             "Bearer",
-            "eyJ",  // JWT prefix
+            "eyJ", // JWT prefix
             "mattermost.example.com",
         ];
 
@@ -1174,11 +1176,7 @@ mod tests {
         let debug_output = format!("{:?}", config);
 
         // These patterns must NEVER appear
-        let forbidden = [
-            "secret.webhook.url",
-            "supersecret123",
-            "hooks/",
-        ];
+        let forbidden = ["secret.webhook.url", "supersecret123", "hooks/"];
 
         for pattern in &forbidden {
             assert!(

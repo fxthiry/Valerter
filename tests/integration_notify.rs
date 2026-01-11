@@ -74,8 +74,8 @@ async fn test_send_success_first_attempt() {
 
 #[tokio::test]
 async fn test_retry_on_server_error_then_success() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     let mock_server = MockServer::start().await;
 

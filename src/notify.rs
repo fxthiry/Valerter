@@ -396,10 +396,7 @@ async fn send_to_mattermost(
                     "rule_name" => payload.rule_name.clone()
                 )
                 .increment(1);
-                return Err(NotifyError::SendFailed(format!(
-                    "client error: {}",
-                    status
-                )));
+                return Err(NotifyError::SendFailed(format!("client error: {}", status)));
             }
             Ok(response) => {
                 // 5xx errors: retry

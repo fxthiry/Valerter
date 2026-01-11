@@ -8,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 use valerter::cli::{Cli, LogFormat};
 use valerter::config::Config;
 use valerter::{
-    MetricsServer, NotificationQueue, NotificationWorker, RuleEngine, DEFAULT_QUEUE_CAPACITY,
+    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, RuleEngine,
 };
 
 /// Initialize the tracing subscriber with the specified log format.
@@ -159,7 +159,10 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     let metrics_handle = if runtime_config.metrics.enabled {
         let server = MetricsServer::new(runtime_config.metrics.port);
         let cancel_metrics = cancel.clone();
-        info!(port = runtime_config.metrics.port, "Starting metrics server");
+        info!(
+            port = runtime_config.metrics.port,
+            "Starting metrics server"
+        );
         Some(tokio::spawn(async move {
             if let Err(e) = server.run(cancel_metrics).await {
                 error!(error = %e, "Metrics server error");
@@ -260,7 +263,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signal_handlers_can_be_created() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         // Verify we can create SIGTERM handler (same as shutdown_signal uses)
         let sigterm_result = signal(SignalKind::terminate());

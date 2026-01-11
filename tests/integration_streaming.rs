@@ -195,8 +195,7 @@ async fn test_connection_error_server_down() {
     assert!(result.is_err());
     match result {
         Err(StreamError::ConnectionFailed(_)) => {}
-        Err(StreamError::Timeout(_)) => {} // May timeout instead
-        _ => panic!("Expected ConnectionFailed or Timeout error"),
+        _ => panic!("Expected ConnectionFailed error"),
     }
 }
 
@@ -241,7 +240,7 @@ async fn test_timeout_detection() {
 #[test]
 fn test_backoff_sequence() {
     // Verify the full backoff sequence: 1, 2, 4, 8, 16, 32, 60, 60, 60...
-    let expected_delays = vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60];
+    let expected_delays = [1, 2, 4, 8, 16, 32, 60, 60, 60, 60];
 
     for (attempt, expected_secs) in expected_delays.iter().enumerate() {
         let delay = backoff_delay(attempt as u32, BACKOFF_BASE, BACKOFF_MAX);

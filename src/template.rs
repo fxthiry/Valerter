@@ -112,11 +112,12 @@ impl TemplateEngine {
         fields: &Value,
     ) -> Result<RenderedMessage, TemplateError> {
         // Look up template
-        let template = self.templates.get(template_name).ok_or_else(|| {
-            TemplateError::NotFound {
-                name: template_name.to_string(),
-            }
-        })?;
+        let template =
+            self.templates
+                .get(template_name)
+                .ok_or_else(|| TemplateError::NotFound {
+                    name: template_name.to_string(),
+                })?;
 
         // Render each field
         let title = self.render_string(&template.title, fields)?;
@@ -177,10 +178,7 @@ impl TemplateEngine {
                 // sensitive data (tokens, credentials) that might be in extracted logs
                 RenderedMessage {
                     title: format!("[{}] Alert", rule_name),
-                    body: format!(
-                        "Template render failed: {}\n\nCheck logs for details.",
-                        e
-                    ),
+                    body: format!("Template render failed: {}\n\nCheck logs for details.", e),
                     color: Some("#ff0000".to_string()), // Red for error
                     icon: None,
                 }
@@ -235,7 +233,10 @@ mod tests {
         let mut templates = HashMap::new();
         templates.insert(
             "alert".to_string(),
-            make_template("Alert: {{ host }}", "Host {{ host }} reported: {{ message }}"),
+            make_template(
+                "Alert: {{ host }}",
+                "Host {{ host }} reported: {{ message }}",
+            ),
         );
 
         let engine = TemplateEngine::new(templates);

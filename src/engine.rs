@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{CompiledRule, CompiledThrottle, RuntimeConfig};
 use crate::error::RuleError;
 use crate::notify::{AlertPayload, NotificationQueue};
-use crate::parser::{record_parse_error, RuleParser};
+use crate::parser::{RuleParser, record_parse_error};
 use crate::tail::{ReconnectCallback, TailClient, TailConfig};
 use crate::template::TemplateEngine;
 use crate::throttle::{ThrottleResult, Throttler};
@@ -364,10 +364,7 @@ impl ReconnectCallback for ThrottleResetCallback {
 ///
 /// The function runs until cancelled or a fatal error occurs.
 /// All recoverable errors are logged and the loop continues (Log+Continue pattern).
-async fn run_rule(
-    ctx: RuleSpawnContext,
-    cancel: CancellationToken,
-) -> Result<(), RuleError> {
+async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<(), RuleError> {
     let span = tracing::info_span!("run_rule", rule_name = %ctx.rule.name);
     let _guard = span.enter();
 
@@ -738,7 +735,10 @@ mod tests {
         // Should exit immediately since no rules are enabled
         let result = engine.run(cancel).await;
 
-        assert!(result.is_ok(), "Engine should return Ok with no enabled rules");
+        assert!(
+            result.is_ok(),
+            "Engine should return Ok with no enabled rules"
+        );
     }
 
     // ===================================================================
@@ -779,7 +779,10 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = engine.run(cancel).await;
-        assert!(result.is_ok(), "Engine should handle empty rules gracefully");
+        assert!(
+            result.is_ok(),
+            "Engine should handle empty rules gracefully"
+        );
     }
 
     // ===================================================================
