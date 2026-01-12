@@ -35,26 +35,26 @@ jobs:
 
       - name: Create archive
         run: |
-          mkdir -p release/valerter-${{ steps.version.outputs.VERSION }}
-          cp target/x86_64-unknown-linux-musl/release/valerter release/valerter-${{ steps.version.outputs.VERSION }}/
-          cp systemd/valerter.service release/valerter-${{ steps.version.outputs.VERSION }}/
-          cp scripts/install.sh release/valerter-${{ steps.version.outputs.VERSION }}/
-          cp scripts/uninstall.sh release/valerter-${{ steps.version.outputs.VERSION }}/
-          cp config/config.example.yaml release/valerter-${{ steps.version.outputs.VERSION }}/
+          mkdir -p release/valerter-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/valerter release/valerter-linux-x86_64/
+          cp systemd/valerter.service release/valerter-linux-x86_64/
+          cp scripts/install.sh release/valerter-linux-x86_64/
+          cp scripts/uninstall.sh release/valerter-linux-x86_64/
+          cp config/config.example.yaml release/valerter-linux-x86_64/
           cd release
-          tar -czvf valerter-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz valerter-${{ steps.version.outputs.VERSION }}
+          tar -czvf valerter-linux-x86_64.tar.gz valerter-linux-x86_64
 
       - name: Generate checksums
         run: |
           cd release
-          sha256sum valerter-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz > checksums-sha256.txt
-          sha256sum valerter-${{ steps.version.outputs.VERSION }}/valerter >> checksums-sha256.txt
+          sha256sum valerter-linux-x86_64.tar.gz > checksums-sha256.txt
+          sha256sum valerter-linux-x86_64/valerter >> checksums-sha256.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            release/valerter-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz
-            release/valerter-${{ steps.version.outputs.VERSION }}/valerter
+            release/valerter-linux-x86_64.tar.gz
+            release/valerter-linux-x86_64/valerter
             release/checksums-sha256.txt
           generate_release_notes: true
