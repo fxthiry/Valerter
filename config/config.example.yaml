@@ -43,6 +43,36 @@ metrics:
   enabled: true       # Enable Prometheus metrics endpoint
   port: 9090          # Port for /metrics endpoint
 
+# ============================================================
+# Notifiers Configuration (Story 6.2)
+# ============================================================
+# Define named notifiers for sending alerts.
+# Each notifier has a unique name and type-specific configuration.
+#
+# Currently supported types:
+#   - mattermost: Send alerts to Mattermost via incoming webhook
+#
+# If this section is omitted, valerter falls back to MATTERMOST_WEBHOOK
+# environment variable for backward compatibility.
+
+# notifiers:
+#   mattermost-infra:
+#     type: mattermost
+#     webhook_url: "${MATTERMOST_WEBHOOK_INFRA}"  # Use env vars for secrets!
+#     channel: infra-alerts                        # Optional: override channel
+#     username: valerter-infra                     # Optional: webhook username
+#     icon_url: "https://example.com/icon.png"    # Optional: webhook icon
+#
+#   mattermost-ops:
+#     type: mattermost
+#     webhook_url: "${MATTERMOST_WEBHOOK_OPS}"
+#     channel: ops-alerts
+#
+#   # Minimal config - only webhook_url is required
+#   mattermost-default:
+#     type: mattermost
+#     webhook_url: "${MATTERMOST_WEBHOOK}"
+
 # Default values applied to rules when not specified
 defaults:
   throttle:
@@ -98,11 +128,23 @@ rules:
         fields: ["message"]
 
 # Environment variables:
-# - MATTERMOST_WEBHOOK: Webhook URL for notifications (required in production)
-# - VL_USER: VictoriaLogs Basic Auth username (optional)
-# - VL_PASS: VictoriaLogs Basic Auth password (optional)
-# - VL_TOKEN: VictoriaLogs Bearer token (optional, use in headers section)
-# - VL_API_KEY: VictoriaLogs API key (optional, use in headers section)
+#
+# Notification (pick ONE method):
+# - notifiers: section in config (recommended - supports multiple notifiers)
+# - MATTERMOST_WEBHOOK: Legacy webhook URL (backward compatible fallback)
+#
+# VictoriaLogs Authentication (optional):
+# - VL_USER: VictoriaLogs Basic Auth username
+# - VL_PASS: VictoriaLogs Basic Auth password
+# - VL_TOKEN: VictoriaLogs Bearer token (use in headers section)
+# - VL_API_KEY: VictoriaLogs API key (use in headers section)
+#
+# Notifier Webhooks (for use in notifiers: section):
+# - MATTERMOST_WEBHOOK_INFRA: Webhook URL for infra alerts
+# - MATTERMOST_WEBHOOK_OPS: Webhook URL for ops alerts
+# - etc. (use ${VAR_NAME} syntax in webhook_url field)
+#
+# Logging:
 # - RUST_LOG: Log level (default: info)
 # - LOG_FORMAT: Log output format - "text" (default) or "json"
 #               Use "json" for log aggregation systems (Loki, ELK, etc.)

@@ -1,5 +1,6 @@
 //! Valerter - Real-time alerting from VictoriaLogs to Mattermost.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -10,10 +11,8 @@ use tracing::{error, info};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-use std::sync::Arc;
-
 use valerter::cli::{Cli, LogFormat};
-use valerter::config::Config;
+use valerter::config::{Config, RuntimeConfig};
 use valerter::{
     DEFAULT_QUEUE_CAPACITY, MattermostNotifier, MetricsServer, NotificationQueue,
     NotificationWorker, NotifierRegistry, RuleEngine,
@@ -74,6 +73,87 @@ async fn shutdown_signal() {
         return;
     }
     info!("Received shutdown signal (Ctrl+C)");
+}
+
+/// Create notifier registry from configuration (Story 6.2).
+///
+/// Supports two modes with backward compatibility:
+/// 1. New: `notifiers:` section in YAML configuration
+/// 2. Legacy: `MATTERMOST_WEBHOOK` environment variable
+///
+/// # Priority
+///
+/// If both are present, `notifiers:` takes precedence and `MATTERMOST_WEBHOOK`
+/// is ignored (with a warning logged).
+///
+/// # Returns
+///
+/// * `Ok((registry, default_notifier_name))` - Registry and the name of the first notifier
+/// * `Err` - No notifiers configured
+fn create_notifier_registry(
+    config: &RuntimeConfig,
+    http_client: reqwest::Client,
+) -> Result<(NotifierRegistry, String)> {
+    // Priority 1: Check for notifiers: section in config
+    if let Some(notifiers_config) = &config.notifiers
+        && !notifiers_config.is_empty()
+    {
+        // Warn if legacy MATTERMOST_WEBHOOK is also set
+        if config.mattermost_webhook.is_some() {
+            tracing::warn!(
+                "Both 'notifiers:' section and MATTERMOST_WEBHOOK are configured. \
+                 Using 'notifiers:' section, MATTERMOST_WEBHOOK is ignored."
+            );
+        }
+
+        // Create registry from config
+        let registry = NotifierRegistry::from_config(notifiers_config, http_client).map_err(
+            |errors| {
+                for e in &errors {
+                    error!(error = %e, "Notifier configuration error");
+                }
+                anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
+            },
+        )?;
+
+        // Use first notifier alphabetically as default for deterministic behavior (Fix L3)
+        let default_name = registry
+            .names()
+            .min()
+            .expect("notifiers_config is not empty")
+            .to_string();
+
+        info!(
+            notifier_count = registry.len(),
+            default_notifier = %default_name,
+            "Created notifiers from config"
+        );
+
+        return Ok((registry, default_name));
+    }
+
+    // Priority 2: Fallback to legacy MATTERMOST_WEBHOOK
+    if let Some(webhook_url) = &config.mattermost_webhook {
+        let mut registry = NotifierRegistry::new();
+        let mattermost = MattermostNotifier::new(
+            "default".to_string(),
+            webhook_url.clone(),
+            http_client,
+        );
+        registry
+            .register(Arc::new(mattermost))
+            .expect("Failed to register default notifier");
+        info!("Registered default Mattermost notifier from MATTERMOST_WEBHOOK");
+        return Ok((registry, "default".to_string()));
+    }
+
+    // No notifiers configured
+    error!(
+        "No notifiers configured. Either:\n\
+         - Add a 'notifiers:' section to your config file, or\n\
+         - Set the MATTERMOST_WEBHOOK environment variable"
+    );
+    Err(anyhow::anyhow!("No notifiers configured"))
 }
 
 fn main() -> Result<()> {
@@ -152,25 +232,15 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create notification queue (FR32: capacity 100)
     let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
 
-    // Create notifier registry with default Mattermost notifier (AC5: backward compatibility)
-    let mut registry = NotifierRegistry::new();
-    if runtime_config.mattermost_webhook.is_some() {
-        let mattermost = MattermostNotifier::new("default".to_string(), http_client.clone());
-        registry
-            .register(Arc::new(mattermost))
-            .expect("Failed to register default notifier");
-        info!("Registered default Mattermost notifier");
-    }
-
-    // Fail-fast validation: ensure at least one notifier is registered (AC4)
-    if registry.is_empty() {
-        error!("No notifiers configured. Set MATTERMOST_WEBHOOK environment variable.");
-        std::process::exit(1);
-    }
+    // Create notifier registry (Story 6.2: named notifiers with backward compatibility)
+    let (registry, default_notifier) = create_notifier_registry(
+        &runtime_config,
+        http_client.clone(),
+    )?;
     let registry = Arc::new(registry);
 
     // Create notification worker with registry
-    let mut worker = NotificationWorker::new(&queue, registry.clone(), "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry.clone(), default_notifier);
 
     // Create cancellation token for graceful shutdown
     let cancel = CancellationToken::new();

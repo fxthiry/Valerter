@@ -16,6 +16,9 @@ pub enum ConfigError {
     InvalidRegex { rule: String, message: String },
     #[error("invalid template in rule '{rule}': {message}")]
     InvalidTemplate { rule: String, message: String },
+    /// Story 6.2: Error for invalid notifier configuration.
+    #[error("invalid notifier '{name}': {message}")]
+    InvalidNotifier { name: String, message: String },
 }
 
 /// Errors related to VictoriaLogs streaming connection.
@@ -104,6 +107,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid regex pattern in rule 'my_rule': unclosed group"
+        );
+    }
+
+    #[test]
+    fn config_error_invalid_notifier_display() {
+        let err = ConfigError::InvalidNotifier {
+            name: "mattermost-infra".to_string(),
+            message: "missing webhook_url".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid notifier 'mattermost-infra': missing webhook_url"
         );
     }
 

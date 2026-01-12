@@ -109,6 +109,10 @@ pub struct Config {
     /// Metrics exposition configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Named notifier configurations (Story 6.2).
+    /// If None, falls back to MATTERMOST_WEBHOOK env var for backward compatibility.
+    #[serde(default)]
+    pub notifiers: Option<NotifiersConfig>,
     /// Mattermost webhook URL (loaded from environment).
     #[serde(skip)]
     pub mattermost_webhook: Option<SecretString>,
@@ -272,8 +276,117 @@ pub struct NotifyConfig {
     pub channel: Option<String>,
 }
 
+// ============================================================
+// Notifiers Configuration (Story 6.2)
+// ============================================================
+
+/// Map of named notifier configurations.
+pub type NotifiersConfig = HashMap<String, NotifierConfig>;
+
+/// Notifier configuration with type tag for deserialization.
+///
+/// Uses serde's internally tagged enum to support multiple notifier types.
+/// Currently only `mattermost` is supported, with more types planned.
+///
+/// # Example YAML
+///
+/// ```yaml
+/// notifiers:
+///   mattermost-infra:
+///     type: mattermost
+///     webhook_url: ${MATTERMOST_WEBHOOK_INFRA}
+///     channel: infra-alerts
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum NotifierConfig {
+    /// Mattermost notifier configuration.
+    #[serde(rename = "mattermost")]
+    Mattermost(MattermostNotifierConfig),
+}
+
+/// Configuration for a Mattermost notifier instance.
+///
+/// The `webhook_url` field supports environment variable substitution
+/// using the `${VAR_NAME}` syntax.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MattermostNotifierConfig {
+    /// Webhook URL for the Mattermost incoming webhook.
+    /// Supports `${ENV_VAR}` substitution for secrets.
+    pub webhook_url: String,
+    /// Optional channel override (e.g., "infra-alerts").
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional username override for the webhook.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional icon URL for the webhook messages.
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
 fn default_true() -> bool {
     true
+}
+
+// ============================================================
+// Environment Variable Substitution (Story 6.2)
+// ============================================================
+
+/// Resolve environment variable references in a string.
+///
+/// Supports the `${VAR_NAME}` syntax for environment variable substitution.
+/// Variable names must match `[A-Z_][A-Z0-9_]*` pattern.
+///
+/// # Arguments
+///
+/// * `value` - The string that may contain `${VAR_NAME}` patterns
+///
+/// # Returns
+///
+/// * `Ok(String)` - The string with all variables resolved
+/// * `Err(ConfigError)` - If a referenced variable is not defined
+///
+/// # Examples
+///
+/// ```ignore
+/// // With WEBHOOK_URL set to "https://example.com"
+/// let result = resolve_env_vars("${WEBHOOK_URL}/path");
+/// assert_eq!(result.unwrap(), "https://example.com/path");
+/// ```
+pub fn resolve_env_vars(value: &str) -> Result<String, ConfigError> {
+    // Regex to match ${VAR_NAME} where VAR_NAME is a valid env var name
+    let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("Invalid regex");
+
+    let mut result = value.to_string();
+    let mut errors = Vec::new();
+
+    // Find all matches and collect them first (to avoid borrowing issues)
+    let matches: Vec<_> = re.captures_iter(value).collect();
+
+    for cap in matches {
+        let full_match = cap.get(0).unwrap().as_str();
+        let var_name = &cap[1];
+
+        match std::env::var(var_name) {
+            Ok(var_value) => {
+                result = result.replace(full_match, &var_value);
+            }
+            Err(_) => {
+                errors.push(var_name.to_string());
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(result)
+    } else {
+        Err(ConfigError::ValidationError(format!(
+            "undefined environment variable{}: {}",
+            if errors.len() > 1 { "s" } else { "" },
+            errors.join(", ")
+        )))
+    }
 }
 
 // ============================================================
@@ -296,7 +409,9 @@ pub struct RuntimeConfig {
     pub rules: Vec<CompiledRule>,
     /// Metrics exposition configuration.
     pub metrics: MetricsConfig,
-    /// Mattermost webhook URL.
+    /// Named notifiers configuration (Story 6.2).
+    pub notifiers: Option<NotifiersConfig>,
+    /// Mattermost webhook URL (legacy - for backward compatibility).
     pub mattermost_webhook: Option<SecretString>,
 }
 
@@ -556,6 +671,7 @@ impl Config {
             templates,
             rules,
             metrics: self.metrics,
+            notifiers: self.notifiers,
             mattermost_webhook: self.mattermost_webhook,
         })
     }
@@ -871,6 +987,7 @@ mod tests {
                 },
             ],
             metrics: MetricsConfig::default(),
+            notifiers: None,
             mattermost_webhook: None,
         };
 
@@ -1013,6 +1130,7 @@ mod tests {
                 notify: None,
             }],
             metrics: MetricsConfig::default(),
+            notifiers: None,
             mattermost_webhook: None,
         };
 
@@ -1033,24 +1151,16 @@ mod tests {
     // Fix M2: Test env var MATTERMOST_WEBHOOK is loaded via Config::load()
     #[test]
     fn load_webhook_from_environment_variable() {
-        // SAFETY: Tests run single-threaded with --test-threads=1 or we accept
-        // the race condition risk for this specific env var test.
-        unsafe {
-            std::env::set_var("MATTERMOST_WEBHOOK", "https://test.webhook.url/hook");
-        }
+        // Use temp_env for safe env var handling (Fix M3)
+        temp_env::with_var("MATTERMOST_WEBHOOK", Some("https://test.webhook.url/hook"), || {
+            let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
 
-        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
-
-        // Clean up before assertions to ensure cleanup happens
-        unsafe {
-            std::env::remove_var("MATTERMOST_WEBHOOK");
-        }
-
-        assert!(config.mattermost_webhook.is_some());
-        assert_eq!(
-            config.mattermost_webhook.as_ref().unwrap().expose(),
-            "https://test.webhook.url/hook"
-        );
+            assert!(config.mattermost_webhook.is_some());
+            assert_eq!(
+                config.mattermost_webhook.as_ref().unwrap().expose(),
+                "https://test.webhook.url/hook"
+            );
+        });
     }
 
     // Fix M3: Test that config.example.yaml is valid and parseable
@@ -1122,6 +1232,7 @@ mod tests {
                 }),
             }],
             metrics: MetricsConfig::default(),
+            notifiers: None,
             mattermost_webhook: None,
         };
 
@@ -1168,6 +1279,7 @@ mod tests {
             templates: HashMap::new(), // No templates defined!
             rules: vec![],
             metrics: MetricsConfig::default(),
+            notifiers: None,
             mattermost_webhook: None,
         };
 
@@ -1437,5 +1549,227 @@ mod tests {
             "Valid config with auth should pass validation: {:?}",
             result.err()
         );
+    }
+
+    // ===================================================================
+    // Story 6.2: Notifiers Configuration Tests
+    // ===================================================================
+
+    // Task 1: Test parsing config with notifiers section
+
+    #[test]
+    fn load_config_with_notifiers_section() {
+        let config = Config::load(&fixture_path("config_with_notifiers.yaml")).unwrap();
+
+        // Notifiers should be parsed
+        assert!(config.notifiers.is_some());
+        let notifiers = config.notifiers.as_ref().unwrap();
+        assert_eq!(notifiers.len(), 3);
+
+        // Check mattermost-infra notifier with all fields
+        let infra = notifiers.get("mattermost-infra").expect("mattermost-infra should exist");
+        match infra {
+            NotifierConfig::Mattermost(cfg) => {
+                assert_eq!(cfg.webhook_url, "https://mattermost.example.com/hooks/infra123");
+                assert_eq!(cfg.channel, Some("infra-alerts".to_string()));
+                assert_eq!(cfg.username, Some("valerter-infra".to_string()));
+                assert_eq!(cfg.icon_url, Some("https://example.com/infra-icon.png".to_string()));
+            }
+        }
+
+        // Check mattermost-ops notifier with only required field
+        let ops = notifiers.get("mattermost-ops").expect("mattermost-ops should exist");
+        match ops {
+            NotifierConfig::Mattermost(cfg) => {
+                assert_eq!(cfg.webhook_url, "https://mattermost.example.com/hooks/ops456");
+                assert!(cfg.channel.is_none());
+                assert!(cfg.username.is_none());
+                assert!(cfg.icon_url.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn load_config_without_notifiers_section_is_valid() {
+        // Existing configs without notifiers: should still work (backward compatibility)
+        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        assert!(config.notifiers.is_none());
+    }
+
+    #[test]
+    fn load_config_with_unknown_notifier_type_fails() {
+        let result = Config::load(&fixture_path("config_invalid_notifier_type.yaml"));
+
+        assert!(result.is_err(), "Unknown notifier type should fail to parse");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                // Serde should report unknown variant
+                assert!(
+                    msg.contains("unknown") || msg.contains("variant") || msg.contains("type"),
+                    "Error should mention unknown type: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected ValidationError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn mattermost_notifier_config_requires_webhook_url() {
+        // Test that webhook_url is required
+        let yaml = r#"
+            type: mattermost
+            channel: "test"
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "Missing webhook_url should fail");
+    }
+
+    #[test]
+    fn mattermost_notifier_config_optional_fields_default() {
+        let yaml = r#"
+            type: mattermost
+            webhook_url: "https://example.com/hooks/test"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Mattermost(cfg) => {
+                assert_eq!(cfg.webhook_url, "https://example.com/hooks/test");
+                assert!(cfg.channel.is_none());
+                assert!(cfg.username.is_none());
+                assert!(cfg.icon_url.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn notifiers_config_is_hashmap() {
+        let yaml = r#"
+            notifier-a:
+              type: mattermost
+              webhook_url: "https://a.example.com"
+            notifier-b:
+              type: mattermost
+              webhook_url: "https://b.example.com"
+        "#;
+        let config: NotifiersConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.len(), 2);
+        assert!(config.contains_key("notifier-a"));
+        assert!(config.contains_key("notifier-b"));
+    }
+
+    // Task 2: Environment variable substitution tests
+    // All tests use temp_env for safe env var handling (Fix M3)
+
+    #[test]
+    fn resolve_env_vars_substitutes_single_variable() {
+        temp_env::with_var("TEST_WEBHOOK_VAR", Some("https://example.com/hooks/abc"), || {
+            let result = resolve_env_vars("${TEST_WEBHOOK_VAR}");
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "https://example.com/hooks/abc");
+        });
+    }
+
+    #[test]
+    fn resolve_env_vars_substitutes_multiple_variables() {
+        temp_env::with_vars(
+            [
+                ("TEST_HOST", Some("mattermost.example.com")),
+                ("TEST_TOKEN", Some("secret123")),
+            ],
+            || {
+                let result = resolve_env_vars("https://${TEST_HOST}/hooks/${TEST_TOKEN}");
+                assert!(result.is_ok());
+                assert_eq!(
+                    result.unwrap(),
+                    "https://mattermost.example.com/hooks/secret123"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_env_vars_returns_unchanged_without_pattern() {
+        let input = "https://example.com/static/path";
+        let result = resolve_env_vars(input);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn resolve_env_vars_error_on_undefined_variable() {
+        temp_env::with_var("UNDEFINED_VAR_XYZ_123", None::<&str>, || {
+            let result = resolve_env_vars("https://${UNDEFINED_VAR_XYZ_123}/path");
+            assert!(result.is_err());
+
+            let err = result.unwrap_err();
+            match err {
+                ConfigError::ValidationError(msg) => {
+                    assert!(
+                        msg.contains("UNDEFINED_VAR_XYZ_123"),
+                        "Error should mention the undefined variable: {}",
+                        msg
+                    );
+                    assert!(
+                        msg.contains("undefined") || msg.contains("environment"),
+                        "Error should mention it's undefined: {}",
+                        msg
+                    );
+                }
+                _ => panic!("Expected ValidationError, got {:?}", err),
+            }
+        });
+    }
+
+    #[test]
+    fn resolve_env_vars_error_lists_all_undefined_variables() {
+        temp_env::with_vars(
+            [
+                ("UNDEFINED_A", None::<&str>),
+                ("UNDEFINED_B", None::<&str>),
+            ],
+            || {
+                let result = resolve_env_vars("${UNDEFINED_A} and ${UNDEFINED_B}");
+                assert!(result.is_err());
+
+                let err = result.unwrap_err();
+                match err {
+                    ConfigError::ValidationError(msg) => {
+                        assert!(msg.contains("UNDEFINED_A"), "Should mention UNDEFINED_A: {}", msg);
+                        assert!(msg.contains("UNDEFINED_B"), "Should mention UNDEFINED_B: {}", msg);
+                    }
+                    _ => panic!("Expected ValidationError, got {:?}", err),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_env_vars_preserves_text_around_variables() {
+        temp_env::with_var("TEST_MIDDLE", Some("REPLACED"), || {
+            let result = resolve_env_vars("prefix_${TEST_MIDDLE}_suffix");
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "prefix_REPLACED_suffix");
+        });
+    }
+
+    #[test]
+    fn resolve_env_vars_handles_empty_env_value() {
+        temp_env::with_var("TEST_EMPTY_VAR", Some(""), || {
+            let result = resolve_env_vars("before${TEST_EMPTY_VAR}after");
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "beforeafter");
+        });
+    }
+
+    #[test]
+    fn resolve_env_vars_supports_lowercase_variables() {
+        // Some systems allow lowercase env vars
+        temp_env::with_var("test_lowercase_var", Some("lowercase_value"), || {
+            let result = resolve_env_vars("${test_lowercase_var}");
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "lowercase_value");
+        });
     }
 }

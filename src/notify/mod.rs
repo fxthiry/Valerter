@@ -23,6 +23,7 @@
 
 pub mod mattermost;
 
+use crate::config::{NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError, QueueError};
 use crate::template::RenderedMessage;
 use async_trait::async_trait;
@@ -178,6 +179,98 @@ impl NotifierRegistry {
                     .collect::<Vec<_>>()
                     .join(", ")
             )))
+        }
+    }
+
+    /// Create a registry from configuration (Story 6.2).
+    ///
+    /// Parses the `notifiers` section from config and instantiates
+    /// all configured notifiers with environment variable substitution.
+    ///
+    /// # Arguments
+    ///
+    /// * `notifiers_config` - Map of named notifier configurations
+    /// * `http_client` - Shared HTTP client for all notifiers
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(NotifierRegistry)` - Registry with all configured notifiers
+    /// * `Err(Vec<ConfigError>)` - All errors encountered during instantiation
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = Config::load("config.yaml")?;
+    /// if let Some(notifiers_config) = config.notifiers {
+    ///     let registry = NotifierRegistry::from_config(&notifiers_config, http_client)?;
+    /// }
+    /// ```
+    pub fn from_config(
+        notifiers_config: &NotifiersConfig,
+        http_client: reqwest::Client,
+    ) -> Result<Self, Vec<ConfigError>> {
+        let mut registry = NotifierRegistry::new();
+        let mut errors = Vec::new();
+
+        for (name, config) in notifiers_config {
+            match Self::create_notifier(name, config, &http_client) {
+                Ok(notifier) => {
+                    if let Err(e) = registry.register(notifier) {
+                        errors.push(e);
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(registry)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Create a single notifier from configuration.
+    fn create_notifier(
+        name: &str,
+        config: &NotifierConfig,
+        http_client: &reqwest::Client,
+    ) -> Result<Arc<dyn Notifier>, ConfigError> {
+        match config {
+            NotifierConfig::Mattermost(mm_config) => {
+                // Resolve environment variables in webhook_url
+                let resolved_url = resolve_env_vars(&mm_config.webhook_url).map_err(|e| {
+                    // Track env var resolution failures for monitoring (Fix M1)
+                    metrics::counter!(
+                        "valerter_notifier_config_errors_total",
+                        "notifier" => name.to_string(),
+                        "error_type" => "env_var_resolution"
+                    )
+                    .increment(1);
+                    ConfigError::InvalidNotifier {
+                        name: name.to_string(),
+                        message: format!("webhook_url: {}", e),
+                    }
+                })?;
+
+                let notifier = MattermostNotifier::with_options(
+                    name.to_string(),
+                    SecretString::new(resolved_url),
+                    mm_config.channel.clone(),
+                    mm_config.username.clone(),
+                    mm_config.icon_url.clone(),
+                    http_client.clone(),
+                );
+
+                tracing::info!(
+                    notifier_name = %name,
+                    notifier_type = "mattermost",
+                    channel = ?mm_config.channel,
+                    "Registered notifier from config"
+                );
+
+                Ok(Arc::new(notifier))
+            }
         }
     }
 }
@@ -621,6 +714,139 @@ mod tests {
 
         assert!(!registry.is_empty());
         assert_eq!(registry.len(), 1);
+    }
+
+    // ===================================================================
+    // Story 6.2: from_config tests
+    // ===================================================================
+
+    #[test]
+    fn registry_from_config_creates_mattermost_notifiers() {
+        use crate::config::{MattermostNotifierConfig, NotifierConfig};
+
+        // Use temp_env for safe env var handling (Fix M3)
+        temp_env::with_var("TEST_MM_WEBHOOK", Some("https://mm.example.com/hooks/test123"), || {
+            let mut notifiers_config = HashMap::new();
+            notifiers_config.insert(
+                "mattermost-infra".to_string(),
+                NotifierConfig::Mattermost(MattermostNotifierConfig {
+                    webhook_url: "${TEST_MM_WEBHOOK}".to_string(),
+                    channel: Some("infra-alerts".to_string()),
+                    username: Some("valerter".to_string()),
+                    icon_url: None,
+                }),
+            );
+            notifiers_config.insert(
+                "mattermost-ops".to_string(),
+                NotifierConfig::Mattermost(MattermostNotifierConfig {
+                    webhook_url: "https://static.example.com/hooks/static".to_string(),
+                    channel: None,
+                    username: None,
+                    icon_url: None,
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_ok(), "from_config should succeed: {:?}", result.err());
+            let registry = result.unwrap();
+
+            assert_eq!(registry.len(), 2);
+            assert!(registry.get("mattermost-infra").is_some());
+            assert!(registry.get("mattermost-ops").is_some());
+
+            // Check types
+            let infra = registry.get("mattermost-infra").unwrap();
+            assert_eq!(infra.name(), "mattermost-infra");
+            assert_eq!(infra.notifier_type(), "mattermost");
+        });
+    }
+
+    #[test]
+    fn registry_from_config_fails_on_undefined_env_var() {
+        use crate::config::{MattermostNotifierConfig, NotifierConfig};
+
+        // Use temp_env to ensure env var doesn't exist (Fix M3)
+        temp_env::with_var("UNDEFINED_WEBHOOK_VAR", None::<&str>, || {
+            let mut notifiers_config = HashMap::new();
+            notifiers_config.insert(
+                "bad-notifier".to_string(),
+                NotifierConfig::Mattermost(MattermostNotifierConfig {
+                    webhook_url: "${UNDEFINED_WEBHOOK_VAR}".to_string(),
+                    channel: None,
+                    username: None,
+                    icon_url: None,
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert_eq!(errors.len(), 1);
+
+            match &errors[0] {
+                ConfigError::InvalidNotifier { name, message } => {
+                    assert_eq!(name, "bad-notifier");
+                    assert!(message.contains("UNDEFINED_WEBHOOK_VAR"), "Error should mention the undefined var: {}", message);
+                }
+                other => panic!("Expected InvalidNotifier, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn registry_from_config_collects_all_errors() {
+        use crate::config::{MattermostNotifierConfig, NotifierConfig};
+
+        // Use temp_env to ensure env vars don't exist (Fix M3)
+        temp_env::with_vars(
+            [
+                ("UNDEFINED_VAR_1", None::<&str>),
+                ("UNDEFINED_VAR_2", None::<&str>),
+            ],
+            || {
+                let mut notifiers_config = HashMap::new();
+                notifiers_config.insert(
+                    "bad-notifier-1".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "${UNDEFINED_VAR_1}".to_string(),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                    }),
+                );
+                notifiers_config.insert(
+                    "bad-notifier-2".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "${UNDEFINED_VAR_2}".to_string(),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                    }),
+                );
+
+                let client = reqwest::Client::new();
+                let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+                assert!(result.is_err());
+                let errors = result.unwrap_err();
+                assert_eq!(errors.len(), 2, "Should collect all errors, not stop at first");
+            },
+        );
+    }
+
+    #[test]
+    fn registry_from_config_empty_config_returns_empty_registry() {
+        let notifiers_config = HashMap::new();
+        let client = reqwest::Client::new();
+        let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+        assert!(result.is_ok());
+        let registry = result.unwrap();
+        assert!(registry.is_empty());
     }
 
     // ===================================================================

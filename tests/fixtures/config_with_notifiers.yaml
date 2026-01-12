@@ -1,0 +1,42 @@
+# Configuration fixture with notifiers section (Story 6.2)
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+    color: "#ff0000"
+
+# Story 6.2: Named notifiers configuration
+notifiers:
+  mattermost-infra:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/infra123"
+    channel: infra-alerts
+    username: valerter-infra
+    icon_url: "https://example.com/infra-icon.png"
+
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/ops456"
+    # Only required field, optionals not specified
+
+  mattermost-minimal:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/minimal"
+
+rules:
+  - name: "test_rule"
+    enabled: true
+    query: '_stream:{app="test"}'
+    parser:
+      json:
+        fields: ["message"]

@@ -3,6 +3,7 @@
 //! Implements the `Notifier` trait for sending alerts to Mattermost
 //! via incoming webhooks with exponential backoff retry.
 
+use crate::config::SecretString;
 use crate::error::NotifyError;
 use crate::notify::{backoff_delay, AlertPayload, Notifier};
 use async_trait::async_trait;
@@ -34,6 +35,12 @@ struct MattermostAttachment {
 /// Mattermost webhook payload structure.
 #[derive(Debug, Clone, Serialize)]
 struct MattermostPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_url: Option<String>,
     attachments: Vec<MattermostAttachment>,
 }
 
@@ -41,8 +48,14 @@ struct MattermostPayload {
 fn build_mattermost_payload(
     message: &crate::template::RenderedMessage,
     rule_name: &str,
+    channel: Option<&str>,
+    username: Option<&str>,
+    icon_url: Option<&str>,
 ) -> MattermostPayload {
     MattermostPayload {
+        channel: channel.map(String::from),
+        username: username.map(String::from),
+        icon_url: icon_url.map(String::from),
         attachments: vec![MattermostAttachment {
             fallback: message.title.clone(),
             color: message.color.clone(),
@@ -69,6 +82,7 @@ fn build_mattermost_payload(
 /// ```ignore
 /// let notifier = MattermostNotifier::new(
 ///     "default".to_string(),
+///     SecretString::new("https://mattermost.example.com/hooks/xxx".to_string()),
 ///     client,
 /// );
 /// notifier.send(&alert_payload).await?;
@@ -76,6 +90,14 @@ fn build_mattermost_payload(
 pub struct MattermostNotifier {
     /// Unique name for this notifier instance.
     name: String,
+    /// Webhook URL for sending notifications (stored as SecretString for NFR9).
+    webhook_url: SecretString,
+    /// Optional channel override.
+    channel: Option<String>,
+    /// Optional username override.
+    username: Option<String>,
+    /// Optional icon URL override.
+    icon_url: Option<String>,
     /// HTTP client for Mattermost requests (shared, connection pooling).
     client: reqwest::Client,
 }
@@ -86,9 +108,45 @@ impl MattermostNotifier {
     /// # Arguments
     ///
     /// * `name` - Unique name for this notifier instance
+    /// * `webhook_url` - Webhook URL (wrapped in SecretString for security)
     /// * `client` - HTTP client (shared for connection pooling)
-    pub fn new(name: String, client: reqwest::Client) -> Self {
-        Self { name, client }
+    pub fn new(name: String, webhook_url: SecretString, client: reqwest::Client) -> Self {
+        Self {
+            name,
+            webhook_url,
+            channel: None,
+            username: None,
+            icon_url: None,
+            client,
+        }
+    }
+
+    /// Create a new Mattermost notifier with all optional fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Unique name for this notifier instance
+    /// * `webhook_url` - Webhook URL (wrapped in SecretString for security)
+    /// * `channel` - Optional channel override
+    /// * `username` - Optional username override
+    /// * `icon_url` - Optional icon URL override
+    /// * `client` - HTTP client (shared for connection pooling)
+    pub fn with_options(
+        name: String,
+        webhook_url: SecretString,
+        channel: Option<String>,
+        username: Option<String>,
+        icon_url: Option<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            name,
+            webhook_url,
+            channel,
+            username,
+            icon_url,
+            client,
+        }
     }
 }
 
@@ -110,12 +168,21 @@ impl Notifier for MattermostNotifier {
         );
         let _guard = span.enter();
 
-        let mattermost_payload = build_mattermost_payload(&alert.message, &alert.rule_name);
+        let mattermost_payload = build_mattermost_payload(
+            &alert.message,
+            &alert.rule_name,
+            self.channel.as_deref(),
+            self.username.as_deref(),
+            self.icon_url.as_deref(),
+        );
+
+        // Use the notifier's own webhook_url (Story 6.2)
+        let webhook_url = self.webhook_url.expose();
 
         for attempt in 0..MATTERMOST_MAX_RETRIES {
             match self
                 .client
-                .post(&alert.webhook_url)
+                .post(webhook_url)
                 .json(&mattermost_payload)
                 .send()
                 .await
@@ -211,7 +278,7 @@ mod tests {
             icon: Some(":warning:".to_string()),
         };
 
-        let payload = build_mattermost_payload(&message, "test_rule");
+        let payload = build_mattermost_payload(&message, "test_rule", None, None, None);
 
         assert_eq!(payload.attachments.len(), 1);
         let attachment = &payload.attachments[0];
@@ -221,6 +288,10 @@ mod tests {
         assert_eq!(attachment.color, Some("#ff0000".to_string()));
         assert_eq!(attachment.footer, "valerter | test_rule");
         assert_eq!(attachment.footer_icon, Some(":warning:".to_string()));
+        // Optional fields should be None
+        assert!(payload.channel.is_none());
+        assert!(payload.username.is_none());
+        assert!(payload.icon_url.is_none());
     }
 
     #[test]
@@ -232,11 +303,33 @@ mod tests {
             icon: None,
         };
 
-        let payload = build_mattermost_payload(&message, "simple_rule");
+        let payload = build_mattermost_payload(&message, "simple_rule", None, None, None);
 
         let attachment = &payload.attachments[0];
         assert_eq!(attachment.color, None);
         assert_eq!(attachment.footer_icon, None);
+    }
+
+    #[test]
+    fn build_mattermost_payload_with_optional_fields() {
+        let message = RenderedMessage {
+            title: "Test".to_string(),
+            body: "Body".to_string(),
+            color: None,
+            icon: None,
+        };
+
+        let payload = build_mattermost_payload(
+            &message,
+            "rule",
+            Some("infra-alerts"),
+            Some("valerter-bot"),
+            Some("https://example.com/icon.png"),
+        );
+
+        assert_eq!(payload.channel, Some("infra-alerts".to_string()));
+        assert_eq!(payload.username, Some("valerter-bot".to_string()));
+        assert_eq!(payload.icon_url, Some("https://example.com/icon.png".to_string()));
     }
 
     #[test]
@@ -248,7 +341,7 @@ mod tests {
             icon: None,
         };
 
-        let payload = build_mattermost_payload(&message, "rule");
+        let payload = build_mattermost_payload(&message, "rule", None, None, None);
         let json = serde_json::to_string(&payload).unwrap();
 
         assert!(json.contains("\"attachments\""));
@@ -257,14 +350,44 @@ mod tests {
         assert!(json.contains("\"text\":\"Body\""));
         assert!(json.contains("\"color\":\"#00ff00\""));
         assert!(json.contains("\"footer\":\"valerter | rule\""));
-        // footer_icon should be omitted when None
+        // Optional fields should be omitted when None
         assert!(!json.contains("footer_icon"));
+        assert!(!json.contains("channel"));
+        assert!(!json.contains("username"));
+        assert!(!json.contains("icon_url"));
+    }
+
+    #[test]
+    fn mattermost_payload_serializes_with_optional_fields() {
+        let message = RenderedMessage {
+            title: "Test".to_string(),
+            body: "Body".to_string(),
+            color: None,
+            icon: None,
+        };
+
+        let payload = build_mattermost_payload(
+            &message,
+            "rule",
+            Some("alerts"),
+            Some("bot"),
+            None,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+
+        assert!(json.contains("\"channel\":\"alerts\""));
+        assert!(json.contains("\"username\":\"bot\""));
+        assert!(!json.contains("icon_url")); // Still None
     }
 
     #[test]
     fn mattermost_notifier_properties() {
         let client = reqwest::Client::new();
-        let notifier = MattermostNotifier::new("test-mattermost".to_string(), client);
+        let notifier = MattermostNotifier::new(
+            "test-mattermost".to_string(),
+            SecretString::new("https://example.com/hooks/test".to_string()),
+            client,
+        );
 
         assert_eq!(notifier.name(), "test-mattermost");
         assert_eq!(notifier.notifier_type(), "mattermost");
@@ -273,20 +396,48 @@ mod tests {
     #[test]
     fn mattermost_notifier_debug() {
         let client = reqwest::Client::new();
-        let notifier = MattermostNotifier::new("test".to_string(), client);
+        let notifier = MattermostNotifier::new(
+            "test".to_string(),
+            SecretString::new("https://example.com/hooks/test".to_string()),
+            client,
+        );
         let debug = format!("{:?}", notifier);
         assert!(debug.contains("MattermostNotifier"));
         assert!(debug.contains("test"));
+        // Webhook URL should NOT appear in debug output (NFR9)
+        assert!(!debug.contains("hooks/test"));
     }
 
     #[tokio::test]
     async fn notifier_trait_is_object_safe() {
         // Verify we can use MattermostNotifier as dyn Notifier
         let client = reqwest::Client::new();
-        let notifier: Box<dyn Notifier> =
-            Box::new(MattermostNotifier::new("test".to_string(), client));
+        let notifier: Box<dyn Notifier> = Box::new(MattermostNotifier::new(
+            "test".to_string(),
+            SecretString::new("https://example.com/hooks/test".to_string()),
+            client,
+        ));
 
         assert_eq!(notifier.name(), "test");
         assert_eq!(notifier.notifier_type(), "mattermost");
+    }
+
+    #[test]
+    fn mattermost_notifier_with_options() {
+        let client = reqwest::Client::new();
+        let notifier = MattermostNotifier::with_options(
+            "infra".to_string(),
+            SecretString::new("https://mm.example.com/hooks/xxx".to_string()),
+            Some("infra-alerts".to_string()),
+            Some("valerter-bot".to_string()),
+            Some("https://example.com/icon.png".to_string()),
+            client,
+        );
+
+        assert_eq!(notifier.name(), "infra");
+        assert_eq!(notifier.notifier_type(), "mattermost");
+        assert_eq!(notifier.channel, Some("infra-alerts".to_string()));
+        assert_eq!(notifier.username, Some("valerter-bot".to_string()));
+        assert_eq!(notifier.icon_url, Some("https://example.com/icon.png".to_string()));
     }
 }

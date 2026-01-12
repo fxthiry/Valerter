@@ -4,12 +4,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use valerter::config::SecretString;
 use valerter::notify::{AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry};
 use valerter::template::RenderedMessage;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn make_payload(rule_name: &str, webhook_url: &str) -> AlertPayload {
+fn make_payload(rule_name: &str) -> AlertPayload {
     AlertPayload {
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
@@ -18,7 +19,7 @@ fn make_payload(rule_name: &str, webhook_url: &str) -> AlertPayload {
             icon: None,
         },
         rule_name: rule_name.to_string(),
-        webhook_url: webhook_url.to_string(),
+        webhook_url: "unused".to_string(), // Webhook URL is now in the notifier
     }
 }
 
@@ -29,10 +30,14 @@ fn make_client() -> reqwest::Client {
         .expect("Failed to create client")
 }
 
-/// Create a test registry with a default Mattermost notifier.
-fn make_test_registry(client: reqwest::Client) -> Arc<NotifierRegistry> {
+/// Create a test registry with a default Mattermost notifier pointing to the mock server.
+fn make_test_registry(client: reqwest::Client, webhook_url: &str) -> Arc<NotifierRegistry> {
     let mut registry = NotifierRegistry::new();
-    let notifier = MattermostNotifier::new("default".to_string(), client);
+    let notifier = MattermostNotifier::new(
+        "default".to_string(),
+        SecretString::new(webhook_url.to_string()),
+        client,
+    );
     registry.register(Arc::new(notifier)).unwrap();
     Arc::new(registry)
 }
@@ -52,13 +57,13 @@ async fn test_send_success_first_attempt() {
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/test-webhook", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/test-webhook", mock_server.uri());
-    let payload = make_payload("test_rule", &webhook_url);
+    let payload = make_payload("test_rule");
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -108,13 +113,13 @@ async fn test_retry_on_server_error_then_success() {
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/retry-test", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/retry-test", mock_server.uri());
-    let payload = make_payload("retry_rule", &webhook_url);
+    let payload = make_payload("retry_rule");
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -150,13 +155,13 @@ async fn test_failure_after_max_retries() {
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/always-fail", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/always-fail", mock_server.uri());
-    let payload = make_payload("fail_rule", &webhook_url);
+    let payload = make_payload("fail_rule");
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -200,13 +205,13 @@ async fn test_mattermost_payload_format() {
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/format-test", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/format-test", mock_server.uri());
-    let payload = make_payload("format_rule", &webhook_url);
+    let payload = make_payload("format_rule");
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -241,13 +246,13 @@ async fn test_client_error_no_retry() {
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/bad-request", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/bad-request", mock_server.uri());
-    let payload = make_payload("bad_rule", &webhook_url);
+    let payload = make_payload("bad_rule");
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -267,71 +272,30 @@ async fn test_client_error_no_retry() {
 }
 
 // ============================================================================
-// Test 403 Forbidden (invalid webhook) is NOT retried
+// Test multiple messages processed in sequence
 // ============================================================================
 
 #[tokio::test]
-async fn test_forbidden_no_retry() {
+async fn test_multiple_messages_in_sequence() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/hooks/forbidden"))
-        .respond_with(ResponseTemplate::new(403))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let queue = NotificationQueue::new(10);
-    let client = make_client();
-    let registry = make_test_registry(client);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
-
-    let webhook_url = format!("{}/hooks/forbidden", mock_server.uri());
-    let payload = make_payload("forbidden_rule", &webhook_url);
-    queue.send(payload).unwrap();
-
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    let worker_handle = tokio::spawn(async move {
-        worker.run(cancel_clone).await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    cancel.cancel();
-
-    worker_handle.await.unwrap();
-
-    mock_server.verify().await;
-}
-
-// ============================================================================
-// Test multiple alerts processed sequentially
-// ============================================================================
-
-#[tokio::test]
-async fn test_multiple_alerts_processed() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/hooks/multi"))
+        .and(path("/hooks/multi-test"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(3) // 3 alerts
+        .expect(3) // Expect 3 messages
         .mount(&mock_server)
         .await;
 
+    let webhook_url = format!("{}/hooks/multi-test", mock_server.uri());
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let registry = make_test_registry(client);
+    let registry = make_test_registry(client, &webhook_url);
     let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
-    let webhook_url = format!("{}/hooks/multi", mock_server.uri());
-
-    // Send 3 alerts
-    for i in 0..3 {
-        let payload = make_payload(&format!("rule_{}", i), &webhook_url);
-        queue.send(payload).unwrap();
-    }
+    // Send 3 messages
+    queue.send(make_payload("rule_1")).unwrap();
+    queue.send(make_payload("rule_2")).unwrap();
+    queue.send(make_payload("rule_3")).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
