@@ -2,6 +2,12 @@
 //!
 //! Implements the `Notifier` trait for sending alerts via SMTP
 //! with exponential backoff retry.
+//!
+//! # Testability (Story 7.2)
+//!
+//! The `EmailNotifier` supports transport injection for testing:
+//! - Production: Uses `AsyncSmtpTransport<Tokio1Executor>`
+//! - Testing: Uses `MockEmailTransport` for unit tests without SMTP server
 
 use crate::config::{BodyFormat, EmailNotifierConfig, TlsMode, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError};
@@ -13,6 +19,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use minijinja::{Environment, context};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Backoff base delay for email retries (AD-07).
@@ -24,6 +31,54 @@ const EMAIL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Maximum number of retry attempts for email (AD-07).
 const EMAIL_MAX_RETRIES: u32 = 3;
+
+// =============================================================================
+// EmailTransport Trait (Story 7.2)
+// =============================================================================
+
+/// Async email transport abstraction for testability (Story 7.2).
+///
+/// This trait allows injecting mock transports in tests while using
+/// the real `AsyncSmtpTransport` in production.
+#[async_trait]
+pub trait EmailTransport: Send + Sync {
+    /// Send an email message.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The email message to send
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Email sent successfully
+    /// * `Err(String)` - Error message describing the failure
+    async fn send_email(&self, message: Message) -> Result<(), String>;
+}
+
+/// Real SMTP transport wrapper implementing `EmailTransport`.
+///
+/// Wraps `AsyncSmtpTransport<Tokio1Executor>` for production use.
+pub struct SmtpTransport {
+    inner: AsyncSmtpTransport<Tokio1Executor>,
+}
+
+impl SmtpTransport {
+    /// Create a new SMTP transport wrapper.
+    pub fn new(transport: AsyncSmtpTransport<Tokio1Executor>) -> Self {
+        Self { inner: transport }
+    }
+}
+
+#[async_trait]
+impl EmailTransport for SmtpTransport {
+    async fn send_email(&self, message: Message) -> Result<(), String> {
+        self.inner
+            .send(message)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// Email notifier implementation (Story 6.6).
 ///
@@ -40,11 +95,19 @@ const EMAIL_MAX_RETRIES: u32 = 3;
 /// - **Authentication errors**: Do NOT retry (invalid credentials)
 /// - **Transient SMTP errors**: Retry (4xx responses)
 /// - **Permanent SMTP errors**: Do NOT retry (5xx responses)
+///
+/// # Testability (Story 7.2)
+///
+/// The transport can be injected via `with_transport()` for testing:
+/// ```ignore
+/// let mock = Arc::new(MockEmailTransport::new());
+/// let notifier = EmailNotifier::with_transport(name, mock, from, to, subject, format);
+/// ```
 pub struct EmailNotifier {
     /// Unique name for this notifier instance.
     name: String,
-    /// SMTP transport for sending emails.
-    transport: AsyncSmtpTransport<Tokio1Executor>,
+    /// Email transport for sending emails (abstracted for testability).
+    transport: Arc<dyn EmailTransport>,
     /// Sender email address.
     from: Mailbox,
     /// Recipient email addresses.
@@ -132,12 +195,59 @@ impl EmailNotifier {
 
         Ok(Self {
             name: name.to_string(),
-            transport,
+            transport: Arc::new(SmtpTransport::new(transport)),
             from,
             to,
             subject_template_source: config.subject_template.clone(),
             body_format: config.body_format,
         })
+    }
+
+    /// Create an EmailNotifier with a custom transport (Story 7.2).
+    ///
+    /// This constructor enables dependency injection for testing.
+    /// In production, use `from_config()` instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Unique name for this notifier instance
+    /// * `transport` - The email transport implementation
+    /// * `from` - Sender email address
+    /// * `to` - Recipient email addresses
+    /// * `subject_template_source` - Subject line template
+    /// * `body_format` - Body format (text or html)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // For testing with mock transport
+    /// let mock = Arc::new(MockEmailTransport::new());
+    /// let notifier = EmailNotifier::with_transport(
+    ///     "test-email",
+    ///     mock,
+    ///     "sender@test.com".parse().unwrap(),
+    ///     vec!["dest@test.com".parse().unwrap()],
+    ///     "[{{ rule_name }}] {{ title }}",
+    ///     BodyFormat::Text,
+    /// );
+    /// ```
+    #[cfg(test)]
+    pub fn with_transport(
+        name: &str,
+        transport: Arc<dyn EmailTransport>,
+        from: Mailbox,
+        to: Vec<Mailbox>,
+        subject_template_source: &str,
+        body_format: BodyFormat,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            transport,
+            from,
+            to,
+            subject_template_source: subject_template_source.to_string(),
+            body_format,
+        }
     }
 
     /// Build SMTP transport based on TLS mode, credentials, and tls_verify setting.
@@ -284,34 +394,32 @@ impl EmailNotifier {
         let message = self.build_message_for_recipient(alert, subject, recipient)?;
 
         for attempt in 0..EMAIL_MAX_RETRIES {
-            match self.transport.send(message.clone()).await {
-                Ok(_) => {
+            match self.transport.send_email(message.clone()).await {
+                Ok(()) => {
                     tracing::debug!(
                         recipient = %recipient,
                         "Email sent to recipient"
                     );
                     return Ok(());
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-
+                Err(error_str) => {
                     // Check for permanent errors (don't retry)
                     if Self::is_permanent_error(&error_str) {
                         tracing::warn!(
                             recipient = %recipient,
-                            error = %e,
+                            error = %error_str,
                             "Permanent SMTP error, not retrying for this recipient"
                         );
                         return Err(NotifyError::SendFailed(format!(
                             "permanent error for {}: {}",
-                            recipient, e
+                            recipient, error_str
                         )));
                     }
 
                     tracing::debug!(
                         attempt = attempt,
                         recipient = %recipient,
-                        error = %e,
+                        error = %error_str,
                         "Failed to send email, retrying"
                     );
 
@@ -327,17 +435,27 @@ impl EmailNotifier {
     }
 
     /// Check if an SMTP error is permanent and should not be retried.
+    ///
+    /// Uses word boundary matching to avoid false positives when SMTP codes
+    /// appear in email addresses or other contexts.
     fn is_permanent_error(error_str: &str) -> bool {
-        // Authentication failures (535)
-        error_str.contains("authentication")
-            || error_str.contains("535")
-            || error_str.contains("Invalid credentials")
+        // Helper to check if a code appears as a word boundary (not part of email/text)
+        let contains_smtp_code = |code: &str| {
+            error_str
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|segment| segment == code)
+        };
+
+        // Authentication failures
+        error_str.to_lowercase().contains("authentication")
+            || contains_smtp_code("535")
+            || error_str.to_lowercase().contains("invalid credentials")
             // Mailbox/recipient permanent errors (5xx)
-            || error_str.contains("550")  // Mailbox unavailable
-            || error_str.contains("551")  // User not local
-            || error_str.contains("552")  // Message size exceeded
-            || error_str.contains("553")  // Mailbox name invalid
-            || error_str.contains("554") // Transaction failed
+            || contains_smtp_code("550") // Mailbox unavailable
+            || contains_smtp_code("551") // User not local
+            || contains_smtp_code("552") // Message size exceeded
+            || contains_smtp_code("553") // Mailbox name invalid
+            || contains_smtp_code("554") // Transaction failed
     }
 }
 
@@ -451,6 +569,115 @@ mod tests {
     use super::*;
     use crate::config::{BodyFormat, EmailNotifierConfig, SmtpConfig, TlsMode};
     use crate::template::RenderedMessage;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ===================================================================
+    // MockEmailTransport for testing (Story 7.2)
+    // ===================================================================
+
+    /// Mock email transport for unit testing without SMTP server.
+    ///
+    /// Records all sent emails and can be configured to succeed or fail.
+    pub struct MockEmailTransport {
+        /// Sent messages (thread-safe for async tests).
+        sent_messages: Mutex<Vec<SentEmail>>,
+        /// Number of times send was called.
+        send_count: AtomicU32,
+        /// If Some, returns this error on next send.
+        fail_next_n: AtomicU32,
+        /// Error message to return when failing.
+        error_message: Mutex<String>,
+    }
+
+    /// Captured email for verification.
+    #[derive(Debug, Clone)]
+    pub struct SentEmail {
+        pub from: String,
+        pub to: String,
+        pub subject: String,
+        pub body: String,
+    }
+
+    impl MockEmailTransport {
+        /// Create a new mock transport that succeeds by default.
+        pub fn new() -> Self {
+            Self {
+                sent_messages: Mutex::new(Vec::new()),
+                send_count: AtomicU32::new(0),
+                fail_next_n: AtomicU32::new(0),
+                error_message: Mutex::new("mock failure".to_string()),
+            }
+        }
+
+        /// Configure the mock to fail the next n sends.
+        pub fn fail_next(&self, count: u32, error: &str) {
+            self.fail_next_n.store(count, Ordering::SeqCst);
+            *self.error_message.lock().unwrap() = error.to_string();
+        }
+
+        /// Get the number of times send was called.
+        pub fn send_count(&self) -> u32 {
+            self.send_count.load(Ordering::SeqCst)
+        }
+
+        /// Get all sent emails.
+        pub fn sent_emails(&self) -> Vec<SentEmail> {
+            self.sent_messages.lock().unwrap().clone()
+        }
+
+        /// Clear sent emails.
+        #[allow(dead_code)]
+        pub fn clear(&self) {
+            self.sent_messages.lock().unwrap().clear();
+            self.send_count.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl EmailTransport for MockEmailTransport {
+        async fn send_email(&self, message: Message) -> Result<(), String> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+
+            // Check if we should fail
+            let fail_count = self.fail_next_n.load(Ordering::SeqCst);
+            if fail_count > 0 {
+                self.fail_next_n.fetch_sub(1, Ordering::SeqCst);
+                return Err(self.error_message.lock().unwrap().clone());
+            }
+
+            // Extract email details from the message
+            let from = message
+                .headers()
+                .get_raw("From")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            let to = message
+                .headers()
+                .get_raw("To")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            let subject = message
+                .headers()
+                .get_raw("Subject")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            // Get body from message (simplified extraction)
+            let body = String::from_utf8_lossy(&message.formatted()).to_string();
+
+            self.sent_messages.lock().unwrap().push(SentEmail {
+                from,
+                to,
+                subject,
+                body,
+            });
+
+            Ok(())
+        }
+    }
 
     fn make_test_config() -> EmailNotifierConfig {
         EmailNotifierConfig {
@@ -847,5 +1074,297 @@ mod tests {
                 assert!(!debug.contains("secretpassword"));
             },
         );
+    }
+
+    // ===================================================================
+    // MockTransport tests (Story 7.2 - AC #1, #2)
+    // ===================================================================
+
+    /// Helper to create a notifier with mock transport.
+    fn make_notifier_with_mock(mock: Arc<MockEmailTransport>) -> EmailNotifier {
+        EmailNotifier::with_transport(
+            "test-mock",
+            mock,
+            "sender@test.com".parse().unwrap(),
+            vec!["dest@test.com".parse().unwrap()],
+            "[{{ rule_name }}] {{ title }}",
+            BodyFormat::Text,
+        )
+    }
+
+    #[tokio::test]
+    async fn mock_transport_records_sent_email() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        let alert = make_alert_payload("test_rule");
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_ok(), "Send should succeed with mock transport");
+        assert_eq!(mock.send_count(), 1, "Should have called send once");
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1, "Should have recorded one email");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_validates_email_from_address() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        let alert = make_alert_payload("test_rule");
+        notifier.send(&alert).await.unwrap();
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1);
+        assert!(
+            emails[0].from.contains("sender@test.com"),
+            "From should contain sender address, got: {}",
+            emails[0].from
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_transport_validates_email_to_address() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        let alert = make_alert_payload("test_rule");
+        notifier.send(&alert).await.unwrap();
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1);
+        assert!(
+            emails[0].to.contains("dest@test.com"),
+            "To should contain destination address, got: {}",
+            emails[0].to
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_transport_validates_email_subject() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        let alert = make_alert_payload("cpu_alert");
+        notifier.send(&alert).await.unwrap();
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1);
+        // Subject template is "[{{ rule_name }}] {{ title }}"
+        assert!(
+            emails[0].subject.contains("cpu_alert"),
+            "Subject should contain rule_name, got: {}",
+            emails[0].subject
+        );
+        assert!(
+            emails[0].subject.contains("Test Alert"),
+            "Subject should contain title, got: {}",
+            emails[0].subject
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_transport_validates_email_body() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        let alert = make_alert_payload("test_rule");
+        notifier.send(&alert).await.unwrap();
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1);
+        // Body from make_alert_payload is "Something happened"
+        assert!(
+            emails[0].body.contains("Something happened"),
+            "Body should contain alert body, got: {}",
+            emails[0].body
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_transport_sends_to_multiple_recipients() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = EmailNotifier::with_transport(
+            "multi-recipient",
+            mock.clone(),
+            "sender@test.com".parse().unwrap(),
+            vec![
+                "alice@test.com".parse().unwrap(),
+                "bob@test.com".parse().unwrap(),
+                "charlie@test.com".parse().unwrap(),
+            ],
+            "{{ title }}",
+            BodyFormat::Text,
+        );
+
+        let alert = make_alert_payload("test_rule");
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_ok());
+        assert_eq!(mock.send_count(), 3, "Should send to each recipient");
+
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 3, "Should record 3 emails");
+
+        // Verify each recipient received an email
+        let recipients: Vec<&str> = emails.iter().map(|e| e.to.as_str()).collect();
+        assert!(recipients.iter().any(|r| r.contains("alice@test.com")));
+        assert!(recipients.iter().any(|r| r.contains("bob@test.com")));
+        assert!(recipients.iter().any(|r| r.contains("charlie@test.com")));
+    }
+
+    #[tokio::test]
+    async fn mock_transport_html_format_sends_correctly() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = EmailNotifier::with_transport(
+            "html-test",
+            mock.clone(),
+            "sender@test.com".parse().unwrap(),
+            vec!["dest@test.com".parse().unwrap()],
+            "{{ title }}",
+            BodyFormat::Html,
+        );
+
+        let mut alert = make_alert_payload("html_test");
+        alert.message.body = "<h1>Alert!</h1><p>Something happened</p>".to_string();
+
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_ok());
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 1);
+        assert!(
+            emails[0].body.contains("<h1>Alert!</h1>"),
+            "HTML body should be preserved"
+        );
+    }
+
+    // ===================================================================
+    // Retry behavior tests with mock (Story 7.2 - AC #1)
+    // ===================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_retry_on_transient_error() {
+        // start_paused = true: Time is paused, tokio::time::sleep completes instantly
+        // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
+        let mock = Arc::new(MockEmailTransport::new());
+        // Fail first 2 attempts with transient error, succeed on 3rd
+        mock.fail_next(2, "connection timeout");
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let alert = make_alert_payload("retry_test");
+
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_ok(), "Should succeed after retries");
+        assert_eq!(mock.send_count(), 3, "Should have tried 3 times");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_fails_after_max_retries() {
+        // start_paused = true: Time is paused, tokio::time::sleep completes instantly
+        // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
+        let mock = Arc::new(MockEmailTransport::new());
+        // Fail all 3 attempts
+        mock.fail_next(3, "connection timeout");
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let alert = make_alert_payload("fail_test");
+
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_err(), "Should fail after max retries");
+        assert_eq!(
+            mock.send_count(),
+            3,
+            "Should have tried EMAIL_MAX_RETRIES times"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_transport_no_retry_on_permanent_error() {
+        let mock = Arc::new(MockEmailTransport::new());
+        // Fail with authentication error (permanent)
+        mock.fail_next(1, "535 authentication failed");
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let alert = make_alert_payload("auth_fail_test");
+
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_err(), "Should fail immediately");
+        assert_eq!(mock.send_count(), 1, "Should NOT retry on permanent error");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_no_retry_on_550_mailbox_unavailable() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(1, "550 mailbox unavailable");
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let alert = make_alert_payload("mailbox_fail");
+
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_err());
+        assert_eq!(mock.send_count(), 1, "Should NOT retry on 550 error");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_partial_success_with_multiple_recipients() {
+        // Test that if one recipient fails permanently, others still succeed
+        let mock = Arc::new(MockEmailTransport::new());
+        // First send fails permanently, others succeed
+        mock.fail_next(1, "550 mailbox unavailable");
+
+        let notifier = EmailNotifier::with_transport(
+            "partial-success",
+            mock.clone(),
+            "sender@test.com".parse().unwrap(),
+            vec![
+                "bad@test.com".parse().unwrap(),
+                "good1@test.com".parse().unwrap(),
+                "good2@test.com".parse().unwrap(),
+            ],
+            "{{ title }}",
+            BodyFormat::Text,
+        );
+
+        let alert = make_alert_payload("partial_test");
+        let result = notifier.send(&alert).await;
+
+        // Should succeed overall because at least one recipient succeeded
+        assert!(result.is_ok(), "Should succeed with partial delivery");
+        assert_eq!(mock.send_count(), 3, "Should have tried all 3 recipients");
+
+        // 2 successful, 1 failed
+        let emails = mock.sent_emails();
+        assert_eq!(emails.len(), 2, "Should have recorded 2 successful emails");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_all_recipients_fail_returns_error() {
+        let mock = Arc::new(MockEmailTransport::new());
+        // All sends fail permanently
+        mock.fail_next(3, "550 all mailboxes unavailable");
+
+        let notifier = EmailNotifier::with_transport(
+            "all-fail",
+            mock.clone(),
+            "sender@test.com".parse().unwrap(),
+            vec![
+                "bad1@test.com".parse().unwrap(),
+                "bad2@test.com".parse().unwrap(),
+                "bad3@test.com".parse().unwrap(),
+            ],
+            "{{ title }}",
+            BodyFormat::Text,
+        );
+
+        let alert = make_alert_payload("all_fail_test");
+        let result = notifier.send(&alert).await;
+
+        assert!(result.is_err(), "Should fail when all recipients fail");
     }
 }
