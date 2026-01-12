@@ -56,15 +56,6 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    services:
-      mailhog:
-        image: mailhog/mailhog
-        ports:
-          - 1025:1025
-          - 8025:8025
-    env:
-      TEST_SMTP_HOST: localhost
-      TEST_SMTP_PORT: 1025
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -72,8 +63,8 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Generate coverage report
-        # Run with --test-threads=1 to avoid race conditions on shared Mailhog inbox
-        run: cargo tarpaulin --out xml --output-dir coverage -- --include-ignored --test-threads=1
+        # Exclude SMTP integration tests (tested in 'test' job) to avoid tarpaulin timeout
+        run: cargo tarpaulin --out xml --output-dir coverage --exclude-files 'tests/smtp_integration.rs'
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
