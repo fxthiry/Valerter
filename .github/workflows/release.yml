@@ -33,9 +33,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           if [ "${{ matrix.arch }}" = "aarch64" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-            # Install aarch64 musl cross toolchain
-            wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            # Install aarch64 musl cross toolchain with retry
+            for i in 1 2 3; do
+              wget --timeout=60 -q https://musl.cc/aarch64-linux-musl-cross.tgz && break
+              echo "Retry $i..."
+              sleep 5
+            done
             tar -xzf aarch64-linux-musl-cross.tgz
             echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
           fi
