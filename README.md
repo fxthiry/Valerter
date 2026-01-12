@@ -35,10 +35,13 @@ Real-time log alerting for VictoriaLogs with full log context in notifications.
 The easiest way to install on Debian-based systems:
 
 ```bash
-# Download the latest .deb package (adjust version as needed)
-# Find latest version at: https://github.com/fxthiry/valerter/releases/latest
-VERSION="0.1.0"  # Replace with latest version
-curl -LO "https://github.com/fxthiry/valerter/releases/download/v${VERSION}/valerter_${VERSION}-1_amd64.deb"
+# Download from GitHub Releases page:
+# https://github.com/fxthiry/valerter/releases/latest
+
+# Or use curl (replace TAG and VERSION as needed):
+TAG="v1.0.0-alpha.1"      # Git tag (check releases page)
+VERSION="1.0.0~alpha.1"   # Package version (~ for Debian pre-release)
+curl -LO "https://github.com/fxthiry/valerter/releases/download/${TAG}/valerter_${VERSION}-1_amd64.deb"
 sudo dpkg -i "valerter_${VERSION}-1_amd64.deb"
 ```
 
