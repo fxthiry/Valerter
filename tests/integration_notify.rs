@@ -1,13 +1,14 @@
-//! Integration tests for Mattermost notification sending.
+//! Integration tests for notification sending.
 //!
-//! Uses wiremock to simulate Mattermost webhook endpoints.
+//! Uses wiremock to simulate webhook endpoints for Mattermost and generic webhooks.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use valerter::config::SecretString;
-use valerter::notify::{AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry};
+use valerter::config::{SecretString, WebhookNotifierConfig};
+use valerter::notify::{AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry, WebhookNotifier};
 use valerter::template::RenderedMessage;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_payload(rule_name: &str) -> AlertPayload {
@@ -466,4 +467,276 @@ async fn test_fanout_partial_failure_continues() {
     // Both servers should have been called - failure on one doesn't stop the other
     mock_server_success.verify().await;
     mock_server_fail.verify().await;
+}
+
+// ============================================================================
+// Story 6.5: WebhookNotifier Integration Tests
+// ============================================================================
+
+/// Create a WebhookNotifier for testing with the given configuration.
+fn make_webhook_notifier(
+    name: &str,
+    url: &str,
+    method_str: &str,
+    headers: HashMap<String, String>,
+    body_template: Option<String>,
+) -> WebhookNotifier {
+    let config = WebhookNotifierConfig {
+        url: url.to_string(),
+        method: method_str.to_string(),
+        headers,
+        body_template,
+    };
+    let client = make_client();
+    WebhookNotifier::from_config(name, &config, client).unwrap()
+}
+
+/// Create a test registry with a WebhookNotifier.
+fn make_webhook_registry(
+    name: &str,
+    url: &str,
+    method_str: &str,
+    headers: HashMap<String, String>,
+    body_template: Option<String>,
+) -> Arc<NotifierRegistry> {
+    let mut registry = NotifierRegistry::new();
+    let notifier = make_webhook_notifier(name, url, method_str, headers, body_template);
+    registry.register(Arc::new(notifier)).unwrap();
+    Arc::new(registry)
+}
+
+#[tokio::test]
+async fn test_webhook_send_with_body_template() {
+    let mock_server = MockServer::start().await;
+
+    // Expect custom JSON body from template
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .and(body_string_contains("\"alert_title\": \"Alert from template_rule\""))
+        .and(body_string_contains("\"alert_body\": \"Test body content\""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+    let body_template = Some(r#"{"alert_title": "{{ title }}", "alert_body": "{{ body }}", "rule": "{{ rule_name }}"}"#.to_string());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry("test-webhook", &webhook_url, "POST", HashMap::new(), body_template);
+    let mut worker = NotificationWorker::new(&queue, registry, "test-webhook".to_string());
+
+    let payload = make_payload("template_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn test_webhook_send_with_default_body() {
+    let mock_server = MockServer::start().await;
+
+    // Expect default JSON payload structure (DefaultWebhookPayload)
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .and(body_partial_json(serde_json::json!({
+            "alert_name": "default-webhook",
+            "rule_name": "default_rule",
+            "title": "Alert from default_rule",
+            "body": "Test body content"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+
+    let queue = NotificationQueue::new(10);
+    // No body_template = uses DefaultWebhookPayload
+    let registry = make_webhook_registry("default-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let mut worker = NotificationWorker::new(&queue, registry, "default-webhook".to_string());
+
+    let payload = make_payload("default_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn test_webhook_with_custom_headers() {
+    let mock_server = MockServer::start().await;
+
+    // Expect custom headers
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .and(header("Authorization", "Bearer test-token-123"))
+        .and(header("X-Custom-Header", "custom-value"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+    let mut headers = HashMap::new();
+    headers.insert("Authorization".to_string(), "Bearer test-token-123".to_string());
+    headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry("header-webhook", &webhook_url, "POST", headers, None);
+    let mut worker = NotificationWorker::new(&queue, registry, "header-webhook".to_string());
+
+    let payload = make_payload("header_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn test_webhook_retry_on_500_then_success() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let mock_server = MockServer::start().await;
+    let request_count = Arc::new(AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                ResponseTemplate::new(500) // First: fail
+            } else {
+                ResponseTemplate::new(200) // Second: success
+            }
+        })
+        .expect(2) // 1 fail + 1 success
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry("retry-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let mut worker = NotificationWorker::new(&queue, registry, "retry-webhook".to_string());
+
+    let payload = make_payload("retry_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    // Wait for retry (500ms backoff + processing)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn test_webhook_no_retry_on_400() {
+    let mock_server = MockServer::start().await;
+
+    // 400 should NOT be retried
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1) // Only 1 attempt
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry("no-retry-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let mut worker = NotificationWorker::new(&queue, registry, "no-retry-webhook".to_string());
+
+    let payload = make_payload("no_retry_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn test_webhook_put_method() {
+    let mock_server = MockServer::start().await;
+
+    // Expect PUT method
+    Mock::given(method("PUT"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry("put-webhook", &webhook_url, "PUT", HashMap::new(), None);
+    let mut worker = NotificationWorker::new(&queue, registry, "put-webhook".to_string());
+
+    let payload = make_payload("put_rule");
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
 }

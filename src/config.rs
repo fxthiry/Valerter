@@ -307,6 +307,9 @@ pub enum NotifierConfig {
     /// Mattermost notifier configuration.
     #[serde(rename = "mattermost")]
     Mattermost(MattermostNotifierConfig),
+    /// Webhook notifier configuration (Story 6.5).
+    #[serde(rename = "webhook")]
+    Webhook(WebhookNotifierConfig),
 }
 
 /// Configuration for a Mattermost notifier instance.
@@ -327,6 +330,47 @@ pub struct MattermostNotifierConfig {
     /// Optional icon URL for the webhook messages.
     #[serde(default)]
     pub icon_url: Option<String>,
+}
+
+/// Configuration for a generic webhook notifier (Story 6.5).
+///
+/// Supports custom HTTP endpoints with templated body and custom headers.
+/// Headers support `${ENV_VAR}` substitution for secrets.
+///
+/// # Example YAML
+///
+/// ```yaml
+/// notifiers:
+///   my-webhook:
+///     type: webhook
+///     url: https://api.example.com/alerts
+///     method: POST  # optional, defaults to POST
+///     headers:
+///       Authorization: Bearer ${WEBHOOK_TOKEN}
+///       Content-Type: application/json
+///     body_template: |
+///       {"alert": "{{ title }}", "message": "{{ body }}"}
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookNotifierConfig {
+    /// Target URL for the webhook.
+    /// Supports `${ENV_VAR}` substitution for secrets.
+    pub url: String,
+    /// HTTP method to use (default: POST).
+    #[serde(default = "default_post")]
+    pub method: String,
+    /// Custom headers to include in the request.
+    /// Values support `${ENV_VAR}` substitution for secrets (e.g., Authorization).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional body template (minijinja).
+    /// If not provided, a default JSON payload is used.
+    #[serde(default)]
+    pub body_template: Option<String>,
+}
+
+fn default_post() -> String {
+    "POST".to_string()
 }
 
 fn default_true() -> bool {
@@ -1650,10 +1694,10 @@ mod tests {
     fn load_config_with_notifiers_section() {
         let config = Config::load(&fixture_path("config_with_notifiers.yaml")).unwrap();
 
-        // Notifiers should be parsed
+        // Notifiers should be parsed (3 mattermost + 2 webhook = 5)
         assert!(config.notifiers.is_some());
         let notifiers = config.notifiers.as_ref().unwrap();
-        assert_eq!(notifiers.len(), 3);
+        assert_eq!(notifiers.len(), 5);
 
         // Check mattermost-infra notifier with all fields
         let infra = notifiers.get("mattermost-infra").expect("mattermost-infra should exist");
@@ -1664,6 +1708,7 @@ mod tests {
                 assert_eq!(cfg.username, Some("valerter-infra".to_string()));
                 assert_eq!(cfg.icon_url, Some("https://example.com/infra-icon.png".to_string()));
             }
+            _ => panic!("Expected Mattermost variant"),
         }
 
         // Check mattermost-ops notifier with only required field
@@ -1675,6 +1720,31 @@ mod tests {
                 assert!(cfg.username.is_none());
                 assert!(cfg.icon_url.is_none());
             }
+            _ => panic!("Expected Mattermost variant"),
+        }
+
+        // Story 6.5: Check webhook-pagerduty notifier
+        let pagerduty = notifiers.get("webhook-pagerduty").expect("webhook-pagerduty should exist");
+        match pagerduty {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.url, "https://events.pagerduty.com/v2/enqueue");
+                assert_eq!(cfg.method, "POST");
+                assert_eq!(cfg.headers.len(), 2);
+                assert!(cfg.body_template.is_some());
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
+
+        // Story 6.5: Check webhook-simple notifier (defaults)
+        let simple = notifiers.get("webhook-simple").expect("webhook-simple should exist");
+        match simple {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.url, "https://api.example.com/alerts");
+                assert_eq!(cfg.method, "POST"); // default
+                assert!(cfg.headers.is_empty()); // default
+                assert!(cfg.body_template.is_none()); // default
+            }
+            _ => panic!("Expected Webhook variant"),
         }
     }
 
@@ -1729,6 +1799,7 @@ mod tests {
                 assert!(cfg.username.is_none());
                 assert!(cfg.icon_url.is_none());
             }
+            _ => panic!("Expected Mattermost variant"),
         }
     }
 
@@ -2149,5 +2220,116 @@ mod tests {
         let errors = result.unwrap_err();
         // Should have 2 errors - one for each rule with unknown destination
         assert_eq!(errors.len(), 2, "Should collect all destination errors");
+    }
+
+    // ===================================================================
+    // Story 6.5: WebhookNotifierConfig Tests
+    // ===================================================================
+
+    #[test]
+    fn webhook_notifier_config_parses_with_all_fields() {
+        let yaml = r#"
+            type: webhook
+            url: https://api.example.com/alerts
+            method: PUT
+            headers:
+              Authorization: Bearer token123
+              Content-Type: application/json
+            body_template: |
+              {"alert": "{{ title }}", "message": "{{ body }}"}
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.url, "https://api.example.com/alerts");
+                assert_eq!(cfg.method, "PUT");
+                assert_eq!(cfg.headers.len(), 2);
+                assert_eq!(cfg.headers.get("Authorization").unwrap(), "Bearer token123");
+                assert_eq!(cfg.headers.get("Content-Type").unwrap(), "application/json");
+                assert!(cfg.body_template.is_some());
+                assert!(cfg.body_template.unwrap().contains("{{ title }}"));
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
+    }
+
+    #[test]
+    fn webhook_notifier_config_parses_with_defaults() {
+        let yaml = r#"
+            type: webhook
+            url: https://api.example.com/alerts
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.url, "https://api.example.com/alerts");
+                assert_eq!(cfg.method, "POST"); // default
+                assert!(cfg.headers.is_empty()); // default
+                assert!(cfg.body_template.is_none()); // default
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
+    }
+
+    #[test]
+    fn webhook_notifier_config_requires_url() {
+        let yaml = r#"
+            type: webhook
+            method: POST
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "Missing url should fail");
+    }
+
+    #[test]
+    fn webhook_notifier_config_method_defaults_to_post() {
+        let yaml = r#"
+            type: webhook
+            url: https://example.com/hook
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.method, "POST");
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
+    }
+
+    #[test]
+    fn webhook_notifier_config_headers_with_env_var_pattern() {
+        let yaml = r#"
+            type: webhook
+            url: https://api.example.com/alerts
+            headers:
+              Authorization: Bearer ${WEBHOOK_TOKEN}
+              X-API-Key: ${API_KEY}
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Webhook(cfg) => {
+                assert_eq!(cfg.headers.len(), 2);
+                // Headers are stored as-is, env var resolution happens at notifier creation
+                assert_eq!(cfg.headers.get("Authorization").unwrap(), "Bearer ${WEBHOOK_TOKEN}");
+                assert_eq!(cfg.headers.get("X-API-Key").unwrap(), "${API_KEY}");
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
+    }
+
+    #[test]
+    fn webhook_notifier_config_empty_headers_is_valid() {
+        let yaml = r#"
+            type: webhook
+            url: https://example.com/hook
+            headers: {}
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Webhook(cfg) => {
+                assert!(cfg.headers.is_empty());
+            }
+            _ => panic!("Expected Webhook variant"),
+        }
     }
 }

@@ -22,6 +22,7 @@
 //! - **Graceful shutdown**: Worker supports cancellation token
 
 pub mod mattermost;
+pub mod webhook;
 
 use crate::config::{NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError, QueueError};
@@ -33,8 +34,9 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-// Re-export MattermostNotifier for convenience
+// Re-export notifiers for convenience
 pub use mattermost::MattermostNotifier;
+pub use webhook::WebhookNotifier;
 
 /// Default queue capacity (FR32).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 100;
@@ -267,6 +269,18 @@ impl NotifierRegistry {
                     notifier_type = "mattermost",
                     channel = ?mm_config.channel,
                     "Registered notifier from config"
+                );
+
+                Ok(Arc::new(notifier))
+            }
+            NotifierConfig::Webhook(wh_config) => {
+                let notifier = WebhookNotifier::from_config(name, wh_config, http_client.clone())?;
+
+                tracing::info!(
+                    notifier_name = %name,
+                    notifier_type = "webhook",
+                    method = %wh_config.method,
+                    "Registered webhook notifier from config"
                 );
 
                 Ok(Arc::new(notifier))
@@ -914,6 +928,163 @@ mod tests {
         assert!(result.is_ok());
         let registry = result.unwrap();
         assert!(registry.is_empty());
+    }
+
+    // ===================================================================
+    // Story 6.5: Webhook notifier integration tests
+    // ===================================================================
+
+    #[test]
+    fn registry_from_config_creates_webhook_notifiers() {
+        use crate::config::{NotifierConfig, WebhookNotifierConfig};
+
+        temp_env::with_var("TEST_WEBHOOK_TOKEN", Some("secret-token-abc123"), || {
+            let mut notifiers_config = HashMap::new();
+            notifiers_config.insert(
+                "webhook-alerts".to_string(),
+                NotifierConfig::Webhook(WebhookNotifierConfig {
+                    url: "https://api.example.com/alerts".to_string(),
+                    method: "POST".to_string(),
+                    headers: {
+                        let mut h = std::collections::HashMap::new();
+                        h.insert("Authorization".to_string(), "Bearer ${TEST_WEBHOOK_TOKEN}".to_string());
+                        h.insert("Content-Type".to_string(), "application/json".to_string());
+                        h
+                    },
+                    body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_ok(), "Should successfully create webhook notifier: {:?}", result);
+            let registry = result.unwrap();
+            assert_eq!(registry.len(), 1);
+
+            let notifier = registry.get("webhook-alerts");
+            assert!(notifier.is_some());
+            let notifier = notifier.unwrap();
+            assert_eq!(notifier.name(), "webhook-alerts");
+            assert_eq!(notifier.notifier_type(), "webhook");
+        });
+    }
+
+    #[test]
+    fn registry_from_config_webhook_with_defaults() {
+        use crate::config::{NotifierConfig, WebhookNotifierConfig};
+
+        let mut notifiers_config = HashMap::new();
+        notifiers_config.insert(
+            "simple-webhook".to_string(),
+            NotifierConfig::Webhook(WebhookNotifierConfig {
+                url: "https://api.example.com/hook".to_string(),
+                method: "POST".to_string(),
+                headers: std::collections::HashMap::new(),
+                body_template: None,
+            }),
+        );
+
+        let client = reqwest::Client::new();
+        let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+        assert!(result.is_ok());
+        let registry = result.unwrap();
+        assert_eq!(registry.len(), 1);
+
+        let notifier = registry.get("simple-webhook");
+        assert!(notifier.is_some());
+        assert_eq!(notifier.unwrap().notifier_type(), "webhook");
+    }
+
+    #[test]
+    fn registry_from_config_webhook_fails_on_undefined_env_var() {
+        use crate::config::{NotifierConfig, WebhookNotifierConfig};
+
+        temp_env::with_var("UNDEFINED_WEBHOOK_TOKEN", None::<&str>, || {
+            let mut notifiers_config = HashMap::new();
+            notifiers_config.insert(
+                "bad-webhook".to_string(),
+                NotifierConfig::Webhook(WebhookNotifierConfig {
+                    url: "https://api.example.com/alerts".to_string(),
+                    method: "POST".to_string(),
+                    headers: {
+                        let mut h = std::collections::HashMap::new();
+                        h.insert("Authorization".to_string(), "Bearer ${UNDEFINED_WEBHOOK_TOKEN}".to_string());
+                        h
+                    },
+                    body_template: None,
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert_eq!(errors.len(), 1);
+
+            match &errors[0] {
+                ConfigError::InvalidNotifier { name, message } => {
+                    assert_eq!(name, "bad-webhook");
+                    assert!(message.contains("Authorization"));
+                    assert!(message.contains("UNDEFINED_WEBHOOK_TOKEN"));
+                }
+                other => panic!("Expected InvalidNotifier, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn registry_from_config_mixed_notifiers() {
+        use crate::config::{MattermostNotifierConfig, NotifierConfig, WebhookNotifierConfig};
+
+        temp_env::with_vars(
+            [
+                ("TEST_MM_WEBHOOK_MIXED", Some("https://mm.example.com/hooks/abc")),
+                ("TEST_WH_TOKEN_MIXED", Some("token-xyz")),
+            ],
+            || {
+                let mut notifiers_config = HashMap::new();
+                notifiers_config.insert(
+                    "mattermost-1".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "${TEST_MM_WEBHOOK_MIXED}".to_string(),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                    }),
+                );
+                notifiers_config.insert(
+                    "webhook-1".to_string(),
+                    NotifierConfig::Webhook(WebhookNotifierConfig {
+                        url: "https://api.example.com/alerts".to_string(),
+                        method: "POST".to_string(),
+                        headers: {
+                            let mut h = std::collections::HashMap::new();
+                            h.insert("X-API-Key".to_string(), "${TEST_WH_TOKEN_MIXED}".to_string());
+                            h
+                        },
+                        body_template: None,
+                    }),
+                );
+
+                let client = reqwest::Client::new();
+                let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+                assert!(result.is_ok(), "Should create mixed notifiers: {:?}", result);
+                let registry = result.unwrap();
+                assert_eq!(registry.len(), 2);
+
+                let mm = registry.get("mattermost-1");
+                assert!(mm.is_some());
+                assert_eq!(mm.unwrap().notifier_type(), "mattermost");
+
+                let wh = registry.get("webhook-1");
+                assert!(wh.is_some());
+                assert_eq!(wh.unwrap().notifier_type(), "webhook");
+            },
+        );
     }
 
     // ===================================================================

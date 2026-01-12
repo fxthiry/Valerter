@@ -46,6 +46,7 @@ anyhow = "1.0"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
+chrono = { version = "0.4.42", features = ["serde"] }
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -33,6 +33,22 @@ notifiers:
     type: mattermost
     webhook_url: "https://mattermost.example.com/hooks/minimal"
 
+  # Story 6.5: Generic webhook notifier
+  webhook-pagerduty:
+    type: webhook
+    url: "https://events.pagerduty.com/v2/enqueue"
+    method: POST
+    headers:
+      Authorization: "Token token=test-token"
+      Content-Type: "application/json"
+    body_template: |
+      {"summary": "{{ title }}", "source": "valerter"}
+
+  webhook-simple:
+    type: webhook
+    url: "https://api.example.com/alerts"
+    # Uses defaults: method=POST, no headers, default JSON body
+
 rules:
   - name: "test_rule"
     enabled: true
