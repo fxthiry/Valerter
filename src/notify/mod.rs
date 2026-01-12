@@ -21,6 +21,7 @@
 //! - **Metrics**: Queue size and dropped alerts are tracked (AD-05)
 //! - **Graceful shutdown**: Worker supports cancellation token
 
+pub mod email;
 pub mod mattermost;
 pub mod webhook;
 
@@ -35,6 +36,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 // Re-export notifiers for convenience
+pub use email::EmailNotifier;
 pub use mattermost::MattermostNotifier;
 pub use webhook::WebhookNotifier;
 
@@ -281,6 +283,19 @@ impl NotifierRegistry {
                     notifier_type = "webhook",
                     method = %wh_config.method,
                     "Registered webhook notifier from config"
+                );
+
+                Ok(Arc::new(notifier))
+            }
+            NotifierConfig::Email(email_config) => {
+                let notifier = EmailNotifier::from_config(name, email_config)?;
+
+                tracing::info!(
+                    notifier_name = %name,
+                    notifier_type = "email",
+                    from = %email_config.from,
+                    to_count = email_config.to.len(),
+                    "Registered email notifier from config"
                 );
 
                 Ok(Arc::new(notifier))
@@ -1267,5 +1282,229 @@ mod tests {
         assert_eq!(payload.destinations.len(), 2);
         assert_eq!(payload.destinations[0], "dest-a");
         assert_eq!(payload.destinations[1], "dest-b");
+    }
+
+    // ===================================================================
+    // Story 6.6: Email notifier integration tests
+    // ===================================================================
+
+    #[test]
+    fn registry_from_config_creates_email_notifiers() {
+        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+
+        let mut notifiers_config = HashMap::new();
+        notifiers_config.insert(
+            "email-ops".to_string(),
+            NotifierConfig::Email(EmailNotifierConfig {
+                smtp: SmtpConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 587,
+                    username: None,
+                    password: None,
+                    tls: TlsMode::Starttls,
+                    tls_verify: true,
+                },
+                from: "valerter@example.com".to_string(),
+                to: vec!["ops@example.com".to_string()],
+                subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
+                body_format: BodyFormat::Text,
+            }),
+        );
+
+        let client = reqwest::Client::new();
+        let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+        assert!(result.is_ok(), "Should create email notifier: {:?}", result);
+        let registry = result.unwrap();
+        assert_eq!(registry.len(), 1);
+
+        let notifier = registry.get("email-ops");
+        assert!(notifier.is_some());
+        let notifier = notifier.unwrap();
+        assert_eq!(notifier.name(), "email-ops");
+        assert_eq!(notifier.notifier_type(), "email");
+    }
+
+    #[test]
+    fn registry_from_config_email_with_auth() {
+        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+
+        temp_env::with_vars(
+            [
+                ("TEST_SMTP_USER_REG", Some("testuser")),
+                ("TEST_SMTP_PASS_REG", Some("testpass")),
+            ],
+            || {
+                let mut notifiers_config = HashMap::new();
+                notifiers_config.insert(
+                    "email-auth".to_string(),
+                    NotifierConfig::Email(EmailNotifierConfig {
+                        smtp: SmtpConfig {
+                            host: "smtp.example.com".to_string(),
+                            port: 587,
+                            username: Some("${TEST_SMTP_USER_REG}".to_string()),
+                            password: Some("${TEST_SMTP_PASS_REG}".to_string()),
+                            tls: TlsMode::Starttls,
+                            tls_verify: true,
+                        },
+                        from: "valerter@example.com".to_string(),
+                        to: vec!["ops@example.com".to_string()],
+                        subject_template: "{{ title }}".to_string(),
+                        body_format: BodyFormat::Text,
+                    }),
+                );
+
+                let client = reqwest::Client::new();
+                let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+                assert!(result.is_ok(), "Should resolve env vars for email auth: {:?}", result);
+                let registry = result.unwrap();
+                assert_eq!(registry.get("email-auth").unwrap().notifier_type(), "email");
+            },
+        );
+    }
+
+    #[test]
+    fn registry_from_config_email_fails_on_undefined_env_var() {
+        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+
+        temp_env::with_var("UNDEFINED_SMTP_VAR_REG", None::<&str>, || {
+            let mut notifiers_config = HashMap::new();
+            notifiers_config.insert(
+                "bad-email".to_string(),
+                NotifierConfig::Email(EmailNotifierConfig {
+                    smtp: SmtpConfig {
+                        host: "smtp.example.com".to_string(),
+                        port: 587,
+                        username: Some("${UNDEFINED_SMTP_VAR_REG}".to_string()),
+                        password: Some("somepass".to_string()),
+                        tls: TlsMode::Starttls,
+                        tls_verify: true,
+                    },
+                    from: "valerter@example.com".to_string(),
+                    to: vec!["ops@example.com".to_string()],
+                    subject_template: "{{ title }}".to_string(),
+                    body_format: BodyFormat::Text,
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert_eq!(errors.len(), 1);
+
+            match &errors[0] {
+                ConfigError::InvalidNotifier { name, message } => {
+                    assert_eq!(name, "bad-email");
+                    assert!(message.contains("UNDEFINED_SMTP_VAR_REG"));
+                }
+                other => panic!("Expected InvalidNotifier, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn registry_from_config_email_fails_on_invalid_from_address() {
+        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+
+        let mut notifiers_config = HashMap::new();
+        notifiers_config.insert(
+            "bad-from-email".to_string(),
+            NotifierConfig::Email(EmailNotifierConfig {
+                smtp: SmtpConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 587,
+                    username: None,
+                    password: None,
+                    tls: TlsMode::Starttls,
+                    tls_verify: true,
+                },
+                from: "not-an-email".to_string(),
+                to: vec!["ops@example.com".to_string()],
+                subject_template: "{{ title }}".to_string(),
+                body_format: BodyFormat::Text,
+            }),
+        );
+
+        let client = reqwest::Client::new();
+        let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+
+        match &errors[0] {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-from-email");
+                assert!(message.contains("from"));
+            }
+            other => panic!("Expected InvalidNotifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn registry_from_config_all_three_notifier_types() {
+        use crate::config::{
+            BodyFormat, EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig,
+            TlsMode, WebhookNotifierConfig,
+        };
+
+        temp_env::with_var("TEST_MM_ALL_TYPES", Some("https://mm.example.com/hooks/abc"), || {
+            let mut notifiers_config = HashMap::new();
+
+            // Mattermost
+            notifiers_config.insert(
+                "mattermost".to_string(),
+                NotifierConfig::Mattermost(MattermostNotifierConfig {
+                    webhook_url: "${TEST_MM_ALL_TYPES}".to_string(),
+                    channel: None,
+                    username: None,
+                    icon_url: None,
+                }),
+            );
+
+            // Webhook
+            notifiers_config.insert(
+                "webhook".to_string(),
+                NotifierConfig::Webhook(WebhookNotifierConfig {
+                    url: "https://api.example.com/alerts".to_string(),
+                    method: "POST".to_string(),
+                    headers: std::collections::HashMap::new(),
+                    body_template: None,
+                }),
+            );
+
+            // Email
+            notifiers_config.insert(
+                "email".to_string(),
+                NotifierConfig::Email(EmailNotifierConfig {
+                    smtp: SmtpConfig {
+                        host: "smtp.example.com".to_string(),
+                        port: 587,
+                        username: None,
+                        password: None,
+                        tls: TlsMode::Starttls,
+                        tls_verify: true,
+                    },
+                    from: "valerter@example.com".to_string(),
+                    to: vec!["ops@example.com".to_string()],
+                    subject_template: "{{ title }}".to_string(),
+                    body_format: BodyFormat::Text,
+                }),
+            );
+
+            let client = reqwest::Client::new();
+            let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+            assert!(result.is_ok(), "Should create all three notifier types: {:?}", result);
+            let registry = result.unwrap();
+            assert_eq!(registry.len(), 3);
+
+            assert_eq!(registry.get("mattermost").unwrap().notifier_type(), "mattermost");
+            assert_eq!(registry.get("webhook").unwrap().notifier_type(), "webhook");
+            assert_eq!(registry.get("email").unwrap().notifier_type(), "email");
+        });
     }
 }

@@ -310,6 +310,9 @@ pub enum NotifierConfig {
     /// Webhook notifier configuration (Story 6.5).
     #[serde(rename = "webhook")]
     Webhook(WebhookNotifierConfig),
+    /// Email notifier configuration (Story 6.6).
+    #[serde(rename = "email")]
+    Email(EmailNotifierConfig),
 }
 
 /// Configuration for a Mattermost notifier instance.
@@ -367,6 +370,95 @@ pub struct WebhookNotifierConfig {
     /// If not provided, a default JSON payload is used.
     #[serde(default)]
     pub body_template: Option<String>,
+}
+
+/// Configuration for an email notifier (Story 6.6).
+///
+/// Supports sending alerts via SMTP with:
+/// - TLS modes (none, starttls, tls)
+/// - Certificate verification options
+/// - Environment variable substitution for credentials
+/// - Custom subject templates
+///
+/// # Example YAML
+///
+/// ```yaml
+/// notifiers:
+///   email-ops:
+///     type: email
+///     smtp:
+///       host: smtp.example.com
+///       port: 587
+///       username: ${SMTP_USER}
+///       password: ${SMTP_PASSWORD}
+///       tls: starttls
+///       tls_verify: true
+///     from: valerter@example.com
+///     to: [ops@example.com, admin@example.com]
+///     subject_template: "[{{ rule_name | upper }}] {{ title }}"
+///     body_format: text
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailNotifierConfig {
+    /// SMTP server configuration.
+    pub smtp: SmtpConfig,
+    /// Sender email address.
+    pub from: String,
+    /// Recipient email addresses.
+    pub to: Vec<String>,
+    /// Subject line template (minijinja).
+    /// Available variables: title, body, rule_name, color, icon.
+    pub subject_template: String,
+    /// Body format (text or html). Defaults to text.
+    #[serde(default)]
+    pub body_format: BodyFormat,
+}
+
+/// SMTP server configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmtpConfig {
+    /// SMTP server hostname.
+    pub host: String,
+    /// SMTP server port (typically 25, 465, or 587).
+    pub port: u16,
+    /// SMTP username for authentication.
+    /// Supports `${ENV_VAR}` substitution for secrets.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// SMTP password for authentication.
+    /// Supports `${ENV_VAR}` substitution for secrets.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// TLS mode for the connection.
+    #[serde(default)]
+    pub tls: TlsMode,
+    /// Whether to verify TLS certificates (default: true).
+    #[serde(default = "default_true")]
+    pub tls_verify: bool,
+}
+
+/// TLS mode for SMTP connections.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// No encryption (port 25, not recommended).
+    None,
+    /// STARTTLS upgrade (port 587).
+    #[default]
+    Starttls,
+    /// Direct TLS connection (port 465).
+    Tls,
+}
+
+/// Body format for email messages.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyFormat {
+    /// Plain text body.
+    #[default]
+    Text,
+    /// HTML body.
+    Html,
 }
 
 fn default_post() -> String {
@@ -2331,5 +2423,239 @@ mod tests {
             }
             _ => panic!("Expected Webhook variant"),
         }
+    }
+
+    // ===================================================================
+    // Story 6.6: EmailNotifierConfig Tests
+    // ===================================================================
+
+    #[test]
+    fn email_notifier_config_parses_with_all_fields() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+              username: "${SMTP_USER}"
+              password: "${SMTP_PASSWORD}"
+              tls: starttls
+              tls_verify: true
+            from: valerter@example.com
+            to:
+              - ops@example.com
+              - admin@example.com
+            subject_template: "[{{ rule_name | upper }}] {{ title }}"
+            body_format: text
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.smtp.host, "smtp.example.com");
+                assert_eq!(cfg.smtp.port, 587);
+                assert_eq!(cfg.smtp.username, Some("${SMTP_USER}".to_string()));
+                assert_eq!(cfg.smtp.password, Some("${SMTP_PASSWORD}".to_string()));
+                assert_eq!(cfg.smtp.tls, TlsMode::Starttls);
+                assert!(cfg.smtp.tls_verify);
+                assert_eq!(cfg.from, "valerter@example.com");
+                assert_eq!(cfg.to.len(), 2);
+                assert_eq!(cfg.to[0], "ops@example.com");
+                assert_eq!(cfg.to[1], "admin@example.com");
+                assert!(cfg.subject_template.contains("{{ rule_name"));
+                assert_eq!(cfg.body_format, BodyFormat::Text);
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_parses_with_defaults() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 465
+            from: alerts@example.com
+            to:
+              - team@example.com
+            subject_template: "Alert: {{ title }}"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.smtp.host, "smtp.example.com");
+                assert_eq!(cfg.smtp.port, 465);
+                assert!(cfg.smtp.username.is_none());
+                assert!(cfg.smtp.password.is_none());
+                assert_eq!(cfg.smtp.tls, TlsMode::Starttls); // default
+                assert!(cfg.smtp.tls_verify); // default true
+                assert_eq!(cfg.body_format, BodyFormat::Text); // default
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_tls_mode_none() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: localhost
+              port: 25
+              tls: none
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.smtp.tls, TlsMode::None);
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_tls_mode_tls() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 465
+              tls: tls
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.smtp.tls, TlsMode::Tls);
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_tls_verify_false() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: internal.smtp
+              port: 587
+              tls: starttls
+              tls_verify: false
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert!(!cfg.smtp.tls_verify);
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_body_format_html() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+            body_format: html
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.body_format, BodyFormat::Html);
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_notifier_config_requires_from() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "Missing 'from' should fail");
+    }
+
+    #[test]
+    fn email_notifier_config_requires_to() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            subject_template: "{{ title }}"
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "Missing 'to' should fail");
+    }
+
+    #[test]
+    fn email_notifier_config_requires_subject_template() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            to: [dest@example.com]
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "Missing 'subject_template' should fail");
+    }
+
+    #[test]
+    fn email_notifier_config_multi_recipients() {
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            to:
+              - alice@example.com
+              - bob@example.com
+              - charlie@example.com
+            subject_template: "{{ title }}"
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert_eq!(cfg.to.len(), 3);
+                assert_eq!(cfg.to[0], "alice@example.com");
+                assert_eq!(cfg.to[1], "bob@example.com");
+                assert_eq!(cfg.to[2], "charlie@example.com");
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn tls_mode_defaults_to_starttls() {
+        let tls: TlsMode = serde_yaml::from_str("~").unwrap_or_default();
+        assert_eq!(tls, TlsMode::Starttls);
+    }
+
+    #[test]
+    fn body_format_defaults_to_text() {
+        let format: BodyFormat = serde_yaml::from_str("~").unwrap_or_default();
+        assert_eq!(format, BodyFormat::Text);
     }
 }

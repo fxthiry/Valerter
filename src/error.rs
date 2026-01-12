@@ -39,13 +39,16 @@ pub enum ParseError {
     InvalidJson(String),
 }
 
-/// Errors related to Mattermost notification sending.
+/// Errors related to notification sending.
 #[derive(Error, Debug)]
 pub enum NotifyError {
     #[error("failed to send notification: {0}")]
     SendFailed(String),
     #[error("max retries exceeded")]
     MaxRetriesExceeded,
+    /// Story 6.6: Template rendering error for email subject.
+    #[error("template error: {0}")]
+    TemplateError(String),
 }
 
 /// Errors related to template rendering.

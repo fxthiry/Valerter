@@ -52,6 +52,7 @@ metrics:
 # Supported types:
 #   - mattermost: Send alerts to Mattermost via incoming webhook
 #   - webhook: Send alerts to any HTTP endpoint (Story 6.5)
+#   - email: Send alerts via SMTP (Story 6.6)
 #
 # If this section is omitted, valerter falls back to MATTERMOST_WEBHOOK
 # environment variable for backward compatibility.
@@ -126,6 +127,39 @@ metrics:
 #       X-Custom-Header: "valerter"
 #     body_template: |
 #       {"alert": "{{ title }}", "details": "{{ body }}"}
+#
+#   # ===== Email Notifier (Story 6.6) =====
+#   # Send alerts via SMTP with TLS support
+#
+#   # Example: Email to ops team
+#   email-ops:
+#     type: email
+#     smtp:
+#       host: smtp.example.com
+#       port: 587                           # 587=STARTTLS, 465=direct TLS, 25=none
+#       username: "${SMTP_USER}"            # Optional: SMTP auth username
+#       password: "${SMTP_PASSWORD}"        # Optional: SMTP auth password
+#       tls: starttls                       # none, starttls (default), tls
+#       tls_verify: true                    # Verify TLS certificates (default: true)
+#     from: "valerter@example.com"
+#     to:
+#       - "ops@example.com"
+#       - "admin@example.com"
+#     subject_template: "[{{ rule_name | upper }}] {{ title }}"
+#     body_format: text                     # text (default) or html
+#
+#   # Example: Minimal email config (no auth, STARTTLS)
+#   email-internal:
+#     type: email
+#     smtp:
+#       host: internal-smtp.local
+#       port: 25
+#       tls: none                           # Internal network, no encryption
+#       tls_verify: false
+#     from: "alerts@internal.local"
+#     to:
+#       - "team@internal.local"
+#     subject_template: "Alert: {{ title }}"
 
 # Default values applied to rules when not specified
 defaults:
@@ -215,6 +249,10 @@ rules:
 # - MATTERMOST_WEBHOOK_INFRA: Webhook URL for infra alerts
 # - MATTERMOST_WEBHOOK_OPS: Webhook URL for ops alerts
 # - etc. (use ${VAR_NAME} syntax in webhook_url field)
+#
+# Email/SMTP (for use in email notifiers):
+# - SMTP_USER: SMTP authentication username
+# - SMTP_PASSWORD: SMTP authentication password
 #
 # Logging:
 # - RUST_LOG: Log level (default: info)
