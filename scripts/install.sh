@@ -39,10 +39,16 @@ fi
 
 # 2. Copy binary
 echo "Installing binary to $BINARY_PATH..."
-if [[ -f "$PROJECT_DIR/target/release/valerter" ]]; then
-    cp "$PROJECT_DIR/target/release/valerter" "$BINARY_PATH"
+# Check multiple locations: release archive (same dir), or cargo build outputs
+if [[ -f "$SCRIPT_DIR/valerter" ]]; then
+    # Release archive: binary is in same directory as install.sh
+    cp "$SCRIPT_DIR/valerter" "$BINARY_PATH"
 elif [[ -f "$PROJECT_DIR/target/x86_64-unknown-linux-musl/release/valerter" ]]; then
+    # Musl build from cargo
     cp "$PROJECT_DIR/target/x86_64-unknown-linux-musl/release/valerter" "$BINARY_PATH"
+elif [[ -f "$PROJECT_DIR/target/release/valerter" ]]; then
+    # Standard release build from cargo
+    cp "$PROJECT_DIR/target/release/valerter" "$BINARY_PATH"
 else
     printf "${RED}Error: Binary not found. Run 'cargo build --release' first.${NC}\n"
     exit 1
@@ -57,7 +63,15 @@ chmod 750 "$CONFIG_DIR"
 
 # 4. Copy example config if needed
 if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
-    if [[ -f "$PROJECT_DIR/config/config.example.yaml" ]]; then
+    # Check multiple locations: release archive (same dir), or project structure
+    if [[ -f "$SCRIPT_DIR/config.example.yaml" ]]; then
+        # Release archive: config is in same directory as install.sh
+        echo "Copying example configuration..."
+        cp "$SCRIPT_DIR/config.example.yaml" "$CONFIG_DIR/config.yaml"
+        chown "$USER:$GROUP" "$CONFIG_DIR/config.yaml"
+        chmod 640 "$CONFIG_DIR/config.yaml"
+    elif [[ -f "$PROJECT_DIR/config/config.example.yaml" ]]; then
+        # Development: config is in project config/ directory
         echo "Copying example configuration..."
         cp "$PROJECT_DIR/config/config.example.yaml" "$CONFIG_DIR/config.yaml"
         chown "$USER:$GROUP" "$CONFIG_DIR/config.yaml"
@@ -90,7 +104,15 @@ fi
 
 # 6. Install systemd unit
 echo "Installing systemd unit..."
-cp "$PROJECT_DIR/systemd/valerter.service" "$SYSTEMD_DIR/"
+# Check multiple locations: release archive (same dir), or project structure
+if [[ -f "$SCRIPT_DIR/valerter.service" ]]; then
+    cp "$SCRIPT_DIR/valerter.service" "$SYSTEMD_DIR/"
+elif [[ -f "$PROJECT_DIR/systemd/valerter.service" ]]; then
+    cp "$PROJECT_DIR/systemd/valerter.service" "$SYSTEMD_DIR/"
+else
+    printf "${RED}Error: valerter.service not found${NC}\n"
+    exit 1
+fi
 systemctl daemon-reload
 
 # 7. Enable service
