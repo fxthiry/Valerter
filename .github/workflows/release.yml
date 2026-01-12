@@ -29,6 +29,12 @@ jobs:
       - name: Build release
         run: cargo build --release --target x86_64-unknown-linux-musl
 
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb --no-build --target x86_64-unknown-linux-musl
+
       - name: Get version
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
@@ -44,11 +50,15 @@ jobs:
           cd release
           tar -czvf valerter-linux-x86_64.tar.gz valerter-linux-x86_64
 
+      - name: Copy Debian package to release
+        run: cp target/x86_64-unknown-linux-musl/debian/*.deb release/
+
       - name: Generate checksums
         run: |
           cd release
           sha256sum valerter-linux-x86_64.tar.gz > checksums-sha256.txt
           sha256sum valerter-linux-x86_64/valerter >> checksums-sha256.txt
+          sha256sum *.deb >> checksums-sha256.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -56,5 +66,6 @@ jobs:
           files: |
             release/valerter-linux-x86_64.tar.gz
             release/valerter-linux-x86_64/valerter
+            release/*.deb
             release/checksums-sha256.txt
           generate_release_notes: true

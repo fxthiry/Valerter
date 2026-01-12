@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and group only on purge
+        if id valerter >/dev/null 2>&1; then
+            userdel valerter || true
+        fi
+        if getent group valerter >/dev/null; then
+            groupdel valerter || true
+        fi
+        # Remove config directory
+        rm -rf /etc/valerter || true
+        # Reload systemd (if available)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+    remove)
+        # Disable service on remove (but keep user for potential reinstall)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable valerter 2>/dev/null || true
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

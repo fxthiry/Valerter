@@ -3,7 +3,7 @@ name = "valerter"
 version = "0.1.0"
 edition = "2024"
 description = "Real-time alerting from VictoriaLogs to Mattermost"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 # Async & Runtime
@@ -41,7 +41,7 @@ metrics-exporter-prometheus = "0.18"
 async-trait = "0.1"
 
 # Email (Story 6.6)
-lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "builder", "smtp-transport"] }
 
 # Error Handling
 thiserror = "2.0"
@@ -57,3 +57,23 @@ tokio-test = "0.4"
 portpicker = "0.1"
 serial_test = "3.2"
 temp-env = "0.3"
+
+# Debian packaging configuration
+[package.metadata.deb]
+maintainer = "François-Xavier THIRY <fx@fxthiry.com>"
+copyright = "2026, François-Xavier THIRY"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Real-time alerting daemon that monitors VictoriaLogs streams
+and sends notifications to Mattermost, Email, or any webhook endpoint.
+Features: regex/JSON parsing, throttling, templating, multi-destination routing."""
+depends = ""
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/valerter", "usr/bin/", "755"],
+    ["systemd/valerter.service", "lib/systemd/system/", "644"],
+    ["config/config.example.yaml", "etc/valerter/config.yaml", "600"],
+]
+conf-files = ["/etc/valerter/config.yaml"]
+maintainer-scripts = "debian/"

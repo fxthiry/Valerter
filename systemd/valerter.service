@@ -7,7 +7,7 @@ After=network.target
 Type=simple
 User=valerter
 Group=valerter
-ExecStart=/usr/local/bin/valerter -c /etc/valerter/config.yaml
+ExecStart=/usr/bin/valerter -c /etc/valerter/config.yaml
 
 # Restart on failure with backoff
 Restart=on-failure

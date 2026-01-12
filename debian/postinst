@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create system group if not exists
+        if ! getent group valerter >/dev/null; then
+            groupadd --system valerter
+        fi
+        # Create system user if not exists
+        if ! id valerter >/dev/null 2>&1; then
+            useradd --system --no-create-home --shell /usr/sbin/nologin --gid valerter valerter
+        fi
+        # Set ownership and permissions on config directory
+        if [ -d /etc/valerter ]; then
+            chown root:valerter /etc/valerter
+            chmod 750 /etc/valerter
+        fi
+        # Set permissions on config file (contains secrets)
+        if [ -f /etc/valerter/config.yaml ]; then
+            chown root:valerter /etc/valerter/config.yaml
+            chmod 640 /etc/valerter/config.yaml
+        fi
+        # Reload systemd (if available)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop service before removal (if systemd available)
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemctl is-active --quiet valerter 2>/dev/null; then
+                systemctl stop valerter || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

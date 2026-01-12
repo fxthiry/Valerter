@@ -18,6 +18,9 @@ Real-time log alerting for VictoriaLogs with full log context in notifications.
 ## Table of Contents
 
 - [Installation](#installation)
+  - [Debian/Ubuntu (.deb)](#debianubuntu-deb)
+  - [From GitHub Releases (Tarball)](#from-github-releases-tarball)
+  - [From Sources](#from-sources)
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Prometheus Metrics](#prometheus-metrics)
@@ -27,7 +30,33 @@ Real-time log alerting for VictoriaLogs with full log context in notifications.
 
 ## Installation
 
-### From GitHub Releases
+### Debian/Ubuntu (.deb)
+
+The easiest way to install on Debian-based systems:
+
+```bash
+# Download the latest .deb package (adjust version as needed)
+# Find latest version at: https://github.com/fxthiry/valerter/releases/latest
+VERSION="0.1.0"  # Replace with latest version
+curl -LO "https://github.com/fxthiry/valerter/releases/download/v${VERSION}/valerter_${VERSION}-1_amd64.deb"
+sudo dpkg -i "valerter_${VERSION}-1_amd64.deb"
+```
+
+The .deb package will:
+1. Install binary to `/usr/bin/valerter`
+2. Create `valerter` system user and group
+3. Install systemd service to `/lib/systemd/system/`
+4. Create config directory `/etc/valerter/` with example configuration
+
+**Configuration is preserved during upgrades** - dpkg will prompt you if you've modified `/etc/valerter/config.yaml`.
+
+To uninstall:
+```bash
+sudo dpkg -r valerter        # Remove (keeps config)
+sudo dpkg --purge valerter   # Purge (removes everything)
+```
+
+### From GitHub Releases (Tarball)
 
 Download and install the latest release:
 
