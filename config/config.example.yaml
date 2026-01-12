@@ -1,89 +1,104 @@
+# ==============================================================================
 # Valerter Configuration Example
+# ==============================================================================
 # Copy to /etc/valerter/config.yaml and customize
 #
-# Quick Start Authentication Examples (uncomment ONE):
+# Environment variable substitution: Use ${VAR_NAME} syntax for secrets.
+# Variables are resolved at startup from the process environment.
 #
-# 1. Basic Auth:
-#    basic_auth:
-#      username: "${VL_USER}"
-#      password: "${VL_PASS}"
-#
-# 2. Bearer Token:
-#    headers:
-#      Authorization: "Bearer ${VL_TOKEN}"
-#
-# 3. Self-signed certificate:
-#    tls:
-#      verify: false
+# Quick Start: Uncomment and configure sections as needed.
+# Minimal config requires: victorialogs.url, defaults, templates, rules
+# ==============================================================================
 
-# VictoriaLogs connection settings
+# ==============================================================================
+# SECTION 1: VictoriaLogs Connection (REQUIRED)
+# ==============================================================================
+# Configure the connection to your VictoriaLogs instance.
+# The URL is required; authentication and TLS are optional.
+
 victorialogs:
+  # REQUIRED: VictoriaLogs base URL (typically port 9428)
   url: "http://victorialogs:9428"
 
-  # ===== OPTIONAL: Authentication Options =====
-
-  # Basic Auth (optional) - generates Authorization header automatically
-  # Recommended: use environment variables for credentials
+  # OPTIONAL: Basic Authentication
+  # Generates 'Authorization: Basic ...' header automatically.
+  # Recommended: use environment variables for credentials.
   # basic_auth:
-  #   username: "${VL_USER}"
-  #   password: "${VL_PASS}"
+  #   username: "${VL_USER}"       # REQUIRED if basic_auth is set
+  #   password: "${VL_PASS}"       # REQUIRED if basic_auth is set
 
-  # Custom headers (optional) - for tokens, API keys, etc.
-  # Values should use environment variables for security
+  # OPTIONAL: Custom HTTP headers
+  # Use for Bearer tokens, API keys, or custom auth schemes.
   # headers:
   #   Authorization: "Bearer ${VL_TOKEN}"
   #   X-API-Key: "${VL_API_KEY}"
 
-  # TLS configuration (optional)
+  # OPTIONAL: TLS configuration
   # tls:
-  #   verify: true    # Set to false for self-signed certificates (like curl -k)
+  #   verify: true                 # Default: true. Set to false for self-signed certs (like curl -k)
 
-# Metrics exposition settings
+# ==============================================================================
+# SECTION 2: Metrics (OPTIONAL)
+# ==============================================================================
+# Prometheus metrics exposition. Exposes /metrics endpoint.
+# Default: enabled=true, port=9090
+
 metrics:
-  enabled: true       # Enable Prometheus metrics endpoint
-  port: 9090          # Port for /metrics endpoint
+  enabled: true                    # Default: true
+  port: 9090                       # Default: 9090
 
-# ============================================================
-# Notifiers Configuration (Story 6.2, 6.5)
-# ============================================================
-# Define named notifiers for sending alerts.
-# Each notifier has a unique name and type-specific configuration.
+# ==============================================================================
+# SECTION 3: Notifiers (OPTIONAL)
+# ==============================================================================
+# Named notification channels. Rules can target one or more notifiers.
+# If omitted, falls back to MATTERMOST_WEBHOOK env var for backward compatibility.
 #
 # Supported types:
-#   - mattermost: Send alerts to Mattermost via incoming webhook
-#   - webhook: Send alerts to any HTTP endpoint (Story 6.5)
-#   - email: Send alerts via SMTP (Story 6.6)
-#
-# If this section is omitted, valerter falls back to MATTERMOST_WEBHOOK
-# environment variable for backward compatibility.
+#   - mattermost: Mattermost incoming webhook
+#   - webhook: Generic HTTP endpoint (PagerDuty, Slack, custom APIs)
+#   - email: SMTP email notifications
 
 # notifiers:
-#   # ===== Mattermost Notifier =====
-#   mattermost-infra:
-#     type: mattermost
-#     webhook_url: "${MATTERMOST_WEBHOOK_INFRA}"  # Use env vars for secrets!
-#     channel: infra-alerts                        # Optional: override channel
-#     username: valerter-infra                     # Optional: webhook username
-#     icon_url: "https://example.com/icon.png"    # Optional: webhook icon
+#   # --------------------------------------------------------------------------
+#   # Mattermost Notifier
+#   # --------------------------------------------------------------------------
+#   # Required: webhook_url
+#   # Optional: channel, username, icon_url
 #
 #   mattermost-ops:
 #     type: mattermost
-#     webhook_url: "${MATTERMOST_WEBHOOK_OPS}"
-#     channel: ops-alerts
+#     webhook_url: "${MATTERMOST_WEBHOOK}"   # REQUIRED - Use env var for secret
+#     channel: ops-alerts                     # Optional: override default channel
+#     username: valerter                      # Optional: webhook username
+#     icon_url: "https://example.com/icon.png"  # Optional: webhook icon
 #
-#   # Minimal config - only webhook_url is required
-#   mattermost-default:
+#   # Minimal mattermost config (only webhook_url is required)
+#   mattermost-minimal:
 #     type: mattermost
 #     webhook_url: "${MATTERMOST_WEBHOOK}"
 #
-#   # ===== Generic Webhook Notifier (Story 6.5) =====
-#   # Send alerts to any HTTP endpoint with custom headers and body
+#   # --------------------------------------------------------------------------
+#   # Webhook Notifier (Generic HTTP)
+#   # --------------------------------------------------------------------------
+#   # Required: url
+#   # Optional: method (default: POST), headers, body_template
+#   #
+#   # If body_template is omitted, sends default JSON payload:
+#   # {
+#   #   "alert_name": "<notifier_name>",
+#   #   "rule_name": "...",
+#   #   "title": "...",
+#   #   "body": "...",
+#   #   "color": "...",
+#   #   "icon": "...",
+#   #   "timestamp": "<ISO8601>"
+#   # }
 #
 #   # Example: PagerDuty integration
 #   pagerduty:
 #     type: webhook
 #     url: "https://events.pagerduty.com/v2/enqueue"
-#     method: POST                                  # Optional: POST (default), PUT
+#     method: POST                            # Optional, default: POST
 #     headers:
 #       Authorization: "Token token=${PAGERDUTY_TOKEN}"
 #       Content-Type: "application/json"
@@ -106,18 +121,8 @@ metrics:
 #   slack-alerts:
 #     type: webhook
 #     url: "${SLACK_WEBHOOK_URL}"
-#     # Without body_template, sends default JSON payload:
-#     # {
-#     #   "alert_name": "slack-alerts",
-#     #   "rule_name": "...",
-#     #   "title": "...",
-#     #   "body": "...",
-#     #   "color": "...",
-#     #   "icon": "...",
-#     #   "timestamp": "2026-01-12T14:30:00Z"
-#     # }
 #
-#   # Example: Custom API with auth header
+#   # Example: Custom API with PUT method and auth header
 #   custom-api:
 #     type: webhook
 #     url: "https://api.example.com/alerts"
@@ -128,54 +133,82 @@ metrics:
 #     body_template: |
 #       {"alert": "{{ title }}", "details": "{{ body }}"}
 #
-#   # ===== Email Notifier (Story 6.6) =====
-#   # Send alerts via SMTP with TLS support
+#   # --------------------------------------------------------------------------
+#   # Email Notifier (SMTP)
+#   # --------------------------------------------------------------------------
+#   # Required: smtp (host, port), from, to, subject_template
+#   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify, body_format
+#   #
+#   # TLS modes:
+#   #   - none: No encryption (port 25, internal networks only)
+#   #   - starttls: STARTTLS upgrade (port 587, recommended)
+#   #   - tls: Direct TLS connection (port 465)
+#   #
+#   # Body formats:
+#   #   - text: Plain text (default)
+#   #   - html: HTML formatted email
 #
-#   # Example: Email to ops team
+#   # Example: Full email config with authentication
 #   email-ops:
 #     type: email
 #     smtp:
-#       host: smtp.example.com
-#       port: 587                           # 587=STARTTLS, 465=direct TLS, 25=none
-#       username: "${SMTP_USER}"            # Optional: SMTP auth username
-#       password: "${SMTP_PASSWORD}"        # Optional: SMTP auth password
-#       tls: starttls                       # none, starttls (default), tls
-#       tls_verify: true                    # Verify TLS certificates (default: true)
-#     from: "valerter@example.com"
-#     to:
+#       host: smtp.example.com               # REQUIRED
+#       port: 587                            # REQUIRED (587=STARTTLS, 465=TLS, 25=none)
+#       username: "${SMTP_USER}"             # Optional: SMTP auth username
+#       password: "${SMTP_PASSWORD}"         # Optional: SMTP auth password
+#       tls: starttls                        # Default: starttls. Options: none, starttls, tls
+#       tls_verify: true                     # Default: true. Set false for self-signed certs
+#     from: "valerter@example.com"           # REQUIRED
+#     to:                                    # REQUIRED (at least one recipient)
 #       - "ops@example.com"
 #       - "admin@example.com"
-#     subject_template: "[{{ rule_name | upper }}] {{ title }}"
-#     body_format: text                     # text (default) or html
+#     subject_template: "[{{ rule_name | upper }}] {{ title }}"  # REQUIRED
+#     body_format: text                      # Default: text. Options: text, html
 #
-#   # Example: Minimal email config (no auth, STARTTLS)
+#   # Example: Minimal email config (internal network, no auth)
 #   email-internal:
 #     type: email
 #     smtp:
 #       host: internal-smtp.local
 #       port: 25
-#       tls: none                           # Internal network, no encryption
+#       tls: none
 #       tls_verify: false
 #     from: "alerts@internal.local"
 #     to:
 #       - "team@internal.local"
 #     subject_template: "Alert: {{ title }}"
 
-# Default values applied to rules when not specified
+# ==============================================================================
+# SECTION 4: Defaults (REQUIRED)
+# ==============================================================================
+# Default values applied to rules when not explicitly specified.
+
 defaults:
+  # REQUIRED: Default throttle settings
   throttle:
-    count: 5          # Max alerts per window
-    window: 60s       # Time window for throttling
+    count: 5                       # REQUIRED: Max alerts per window
+    window: 60s                    # REQUIRED: Time window (e.g., 60s, 5m, 1h)
+
+  # REQUIRED: Default notification settings
   notify:
-    template: "default_alert"
+    template: "default_alert"      # REQUIRED: Template name from templates section
 
-# Reusable message templates
+# ==============================================================================
+# SECTION 5: Templates (REQUIRED)
+# ==============================================================================
+# Reusable message templates for alert formatting.
+# Uses Jinja2-like syntax (minijinja). Available variables depend on parser output.
+# Built-in variables: title, body, rule_name, color, icon
+
 templates:
+  # Simple default template
   default_alert:
-    title: "{{ title | default('Alert') }}"
-    body: "{{ body }}"
-    color: "#ff0000"
+    title: "{{ title | default('Alert') }}"  # REQUIRED
+    body: "{{ body }}"                        # REQUIRED
+    color: "#ff0000"                          # Optional
+    # icon: "warning"                         # Optional
 
+  # Example: Template with conditional color
   custom_template:
     title: "{{ severity }}: {{ title }}"
     body: |
@@ -185,77 +218,88 @@ templates:
     color: "{{ '#ff0000' if severity == 'critical' else '#ffaa00' }}"
     icon: "warning"
 
-# Alert rules
-rules:
-  - name: "high_cpu_alert"
-    enabled: true
-    query: '_stream:{host="server1"} | json | cpu > 90'
-    parser:
-      json:
-        fields: ["host", "cpu", "timestamp"]
-    throttle:
-      key: "{{ host }}"      # Group throttling by host
-      count: 3               # Max 3 alerts
-      window: 5m             # Per 5 minutes
-    notify:
-      template: "default_alert"
-      # destinations: Send to multiple notifiers (Story 6.3)
-      # If omitted, uses default notifier. Must match names from notifiers: section.
-      # Example:
-      #   destinations:
-      #     - mattermost-infra
-      #     - mattermost-ops
+# ==============================================================================
+# SECTION 6: Rules (REQUIRED)
+# ==============================================================================
+# Alert rules define what logs to monitor and how to process them.
+# At least one rule is required.
 
+rules:
+  # --------------------------------------------------------------------------
+  # Example 1: JSON parser with per-host throttling
+  # --------------------------------------------------------------------------
+  - name: "high_cpu_alert"                   # REQUIRED: Unique rule name
+    enabled: true                            # Default: true
+    query: '_stream:{host="server1"} | json | cpu > 90'  # REQUIRED: LogsQL query
+    parser:                                  # At least one of regex or json recommended
+      json:
+        fields: ["host", "cpu", "timestamp"]  # REQUIRED: Fields to extract from JSON
+    throttle:                                # Optional: Overrides defaults.throttle
+      key: "{{ host }}"                      # Optional: Group throttling by field value
+      count: 3                               # REQUIRED if throttle is set
+      window: 5m                             # REQUIRED if throttle is set
+    notify:                                  # Optional: Overrides defaults.notify
+      template: "default_alert"              # Optional: Template name
+      # channel: "custom-channel"            # Optional: Override channel (legacy, prefer destinations)
+      # destinations:                        # Optional: Send to specific notifiers
+      #   - mattermost-ops                   # Must match names in notifiers section
+      #   - email-ops
+
+  # --------------------------------------------------------------------------
+  # Example 2: Regex parser with default settings
+  # --------------------------------------------------------------------------
   - name: "error_log_alert"
     enabled: true
     query: '_stream:{app="myapp"} level:error'
     parser:
-      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
-    # Uses defaults for throttle and notify (including default notifier)
+      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'  # Named capture groups
+    # Uses defaults for throttle and notify
 
-  # Example: Rule with multi-destination routing (Story 6.3)
+  # --------------------------------------------------------------------------
+  # Example 3: Multi-destination routing
+  # --------------------------------------------------------------------------
   # - name: "critical_error_alert"
   #   enabled: true
   #   query: '_stream:{app="myapp"} level:critical'
   #   parser:
   #     json:
-  #       fields: ["message", "error"]
+  #       fields: ["message", "error", "stack_trace"]
   #   notify:
   #     template: "default_alert"
-  #     destinations:
-  #       - mattermost-infra    # Send to infra team
-  #       - mattermost-ops      # Also send to ops team
+  #     destinations:                        # Send to multiple channels
+  #       - mattermost-ops
+  #       - email-ops
+  #       - pagerduty
 
+  # --------------------------------------------------------------------------
+  # Example 4: Disabled rule (for reference or testing)
+  # --------------------------------------------------------------------------
   - name: "disabled_example"
-    enabled: false
+    enabled: false                           # Rule is ignored
     query: '_stream:{app="test"}'
     parser:
       json:
         fields: ["message"]
 
-# Environment variables:
+# ==============================================================================
+# ENVIRONMENT VARIABLES REFERENCE
+# ==============================================================================
 #
-# Notification (pick ONE method):
-# - notifiers: section in config (recommended - supports multiple notifiers)
-# - MATTERMOST_WEBHOOK: Legacy webhook URL (backward compatible fallback)
+# VictoriaLogs Authentication:
+#   VL_USER         - Basic Auth username
+#   VL_PASS         - Basic Auth password
+#   VL_TOKEN        - Bearer token (for headers section)
+#   VL_API_KEY      - API key (for headers section)
 #
-# VictoriaLogs Authentication (optional):
-# - VL_USER: VictoriaLogs Basic Auth username
-# - VL_PASS: VictoriaLogs Basic Auth password
-# - VL_TOKEN: VictoriaLogs Bearer token (use in headers section)
-# - VL_API_KEY: VictoriaLogs API key (use in headers section)
+# Mattermost:
+#   MATTERMOST_WEBHOOK - Legacy webhook URL (backward compatibility fallback)
 #
-# Notifier Webhooks (for use in notifiers: section):
-# - MATTERMOST_WEBHOOK_INFRA: Webhook URL for infra alerts
-# - MATTERMOST_WEBHOOK_OPS: Webhook URL for ops alerts
-# - etc. (use ${VAR_NAME} syntax in webhook_url field)
-#
-# Email/SMTP (for use in email notifiers):
-# - SMTP_USER: SMTP authentication username
-# - SMTP_PASSWORD: SMTP authentication password
+# SMTP/Email:
+#   SMTP_USER       - SMTP authentication username
+#   SMTP_PASSWORD   - SMTP authentication password
 #
 # Logging:
-# - RUST_LOG: Log level (default: info)
-# - LOG_FORMAT: Log output format - "text" (default) or "json"
-#               Use "json" for log aggregation systems (Loki, ELK, etc.)
-#               Use "text" for journalctl and human reading
+#   RUST_LOG        - Log level: error, warn, info (default), debug, trace
+#   LOG_FORMAT      - Output format: text (default), json
+#
+# ==============================================================================

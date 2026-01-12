@@ -73,7 +73,36 @@ Valerter is configured via YAML file at `/etc/valerter/config.yaml`.
 
 See [config/config.example.yaml](config/config.example.yaml) for a complete reference.
 
-### Basic Example
+### Quick Start
+
+Minimal configuration to get started:
+
+```yaml
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default_alert"
+
+templates:
+  default_alert:
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+
+rules:
+  - name: "error_alert"
+    query: '_stream:{app="myapp"} level:error'
+    parser:
+      regex: '(?P<message>.*)'
+```
+
+This sends alerts to `MATTERMOST_WEBHOOK` environment variable (legacy mode).
+
+### Full Example
 
 ```yaml
 # VictoriaLogs connection
@@ -128,11 +157,20 @@ notifiers:
       - "ops@example.com"
     subject_template: "[{{ rule_name | upper }}] {{ title }}"
 
-# Default throttle settings
+# Default settings
 defaults:
   throttle:
     count: 5
     window: 60s
+  notify:
+    template: "default_alert"
+
+# Message templates
+templates:
+  default_alert:
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+    color: "#ff0000"
 
 # Alert rules
 rules:
