@@ -541,12 +541,16 @@ fn test_reconnect_callback_trait() {
 //   The default value (verify: true) is tested in config.rs unit tests.
 // =============================================================================
 
-use valerter::config::{BasicAuthConfig, SecretString};
 use std::collections::HashMap;
+use valerter::config::{BasicAuthConfig, SecretString};
 use wiremock::matchers::header_exists;
 
 /// Helper to create a TailConfig with Basic Auth
-fn create_config_with_basic_auth(mock_server: &MockServer, username: &str, password: &str) -> TailConfig {
+fn create_config_with_basic_auth(
+    mock_server: &MockServer,
+    username: &str,
+    password: &str,
+) -> TailConfig {
     TailConfig {
         base_url: mock_server.uri(),
         query: "_stream:auth".to_string(),
@@ -561,7 +565,10 @@ fn create_config_with_basic_auth(mock_server: &MockServer, username: &str, passw
 }
 
 /// Helper to create a TailConfig with custom headers
-fn create_config_with_headers(mock_server: &MockServer, headers: HashMap<String, SecretString>) -> TailConfig {
+fn create_config_with_headers(
+    mock_server: &MockServer,
+    headers: HashMap<String, SecretString>,
+) -> TailConfig {
     TailConfig {
         base_url: mock_server.uri(),
         query: "_stream:headers".to_string(),
@@ -580,10 +587,10 @@ async fn test_basic_auth_header_is_sent() {
     Mock::given(method("POST"))
         .and(path("/select/logsql/tail"))
         .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            b"{\"_msg\":\"authenticated\"}\n",
-            "application/x-ndjson",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"_msg\":\"authenticated\"}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -605,17 +612,23 @@ async fn test_custom_headers_are_sent() {
         .and(path("/select/logsql/tail"))
         .and(header("X-API-Key", "secret-key-123"))
         .and(header("X-Custom", "custom-value"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            b"{\"_msg\":\"headers received\"}\n",
-            "application/x-ndjson",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"_msg\":\"headers received\"}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let mut headers = HashMap::new();
-    headers.insert("X-API-Key".to_string(), SecretString::new("secret-key-123".to_string()));
-    headers.insert("X-Custom".to_string(), SecretString::new("custom-value".to_string()));
+    headers.insert(
+        "X-API-Key".to_string(),
+        SecretString::new("secret-key-123".to_string()),
+    );
+    headers.insert(
+        "X-Custom".to_string(),
+        SecretString::new("custom-value".to_string()),
+    );
 
     let config = create_config_with_headers(&mock_server, headers);
     let mut client = TailClient::new(config).unwrap();
@@ -633,10 +646,10 @@ async fn test_bearer_token_in_header() {
     Mock::given(method("POST"))
         .and(path("/select/logsql/tail"))
         .and(header("Authorization", "Bearer my-jwt-token-here"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            b"{\"_msg\":\"bearer auth ok\"}\n",
-            "application/x-ndjson",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"_msg\":\"bearer auth ok\"}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -665,16 +678,19 @@ async fn test_basic_auth_with_custom_headers_combined() {
         .and(path("/select/logsql/tail"))
         .and(header_exists("Authorization")) // Basic auth header
         .and(header("X-Tenant-ID", "tenant-abc"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            b"{\"_msg\":\"combined auth ok\"}\n",
-            "application/x-ndjson",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"_msg\":\"combined auth ok\"}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let mut headers = HashMap::new();
-    headers.insert("X-Tenant-ID".to_string(), SecretString::new("tenant-abc".to_string()));
+    headers.insert(
+        "X-Tenant-ID".to_string(),
+        SecretString::new("tenant-abc".to_string()),
+    );
 
     let config = TailConfig {
         base_url: mock_server.uri(),
@@ -707,7 +723,10 @@ async fn test_basic_auth_401_on_wrong_credentials() {
     // Server expects correct credentials, returns 401 for wrong ones
     Mock::given(method("POST"))
         .and(path("/select/logsql/tail"))
-        .and(header("Authorization", "Basic d3JvbmdfdXNlcjp3cm9uZ19wYXNz")) // wrong_user:wrong_pass
+        .and(header(
+            "Authorization",
+            "Basic d3JvbmdfdXNlcjp3cm9uZ19wYXNz",
+        )) // wrong_user:wrong_pass
         .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
         .mount(&mock_server)
         .await;
@@ -733,10 +752,10 @@ async fn test_without_auth_no_authorization_header() {
     // This mock will FAIL if Authorization header is present
     Mock::given(method("POST"))
         .and(path("/select/logsql/tail"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            b"{\"_msg\":\"no auth\"}\n",
-            "application/x-ndjson",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"_msg\":\"no auth\"}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;

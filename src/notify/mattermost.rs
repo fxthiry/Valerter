@@ -5,7 +5,7 @@
 
 use crate::config::SecretString;
 use crate::error::NotifyError;
-use crate::notify::{backoff_delay, AlertPayload, Notifier};
+use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
@@ -329,7 +329,10 @@ mod tests {
 
         assert_eq!(payload.channel, Some("infra-alerts".to_string()));
         assert_eq!(payload.username, Some("valerter-bot".to_string()));
-        assert_eq!(payload.icon_url, Some("https://example.com/icon.png".to_string()));
+        assert_eq!(
+            payload.icon_url,
+            Some("https://example.com/icon.png".to_string())
+        );
     }
 
     #[test]
@@ -366,13 +369,7 @@ mod tests {
             icon: None,
         };
 
-        let payload = build_mattermost_payload(
-            &message,
-            "rule",
-            Some("alerts"),
-            Some("bot"),
-            None,
-        );
+        let payload = build_mattermost_payload(&message, "rule", Some("alerts"), Some("bot"), None);
         let json = serde_json::to_string(&payload).unwrap();
 
         assert!(json.contains("\"channel\":\"alerts\""));
@@ -438,6 +435,9 @@ mod tests {
         assert_eq!(notifier.notifier_type(), "mattermost");
         assert_eq!(notifier.channel, Some("infra-alerts".to_string()));
         assert_eq!(notifier.username, Some("valerter-bot".to_string()));
-        assert_eq!(notifier.icon_url, Some("https://example.com/icon.png".to_string()));
+        assert_eq!(
+            notifier.icon_url,
+            Some("https://example.com/icon.png".to_string())
+        );
     }
 }

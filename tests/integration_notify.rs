@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use valerter::config::{SecretString, WebhookNotifierConfig};
-use valerter::notify::{AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry, WebhookNotifier};
+use valerter::notify::{
+    AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry,
+    WebhookNotifier,
+};
 use valerter::template::RenderedMessage;
 use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -512,18 +515,31 @@ async fn test_webhook_send_with_body_template() {
     // Expect custom JSON body from template
     Mock::given(method("POST"))
         .and(path("/api/alerts"))
-        .and(body_string_contains("\"alert_title\": \"Alert from template_rule\""))
-        .and(body_string_contains("\"alert_body\": \"Test body content\""))
+        .and(body_string_contains(
+            "\"alert_title\": \"Alert from template_rule\"",
+        ))
+        .and(body_string_contains(
+            "\"alert_body\": \"Test body content\"",
+        ))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
-    let body_template = Some(r#"{"alert_title": "{{ title }}", "alert_body": "{{ body }}", "rule": "{{ rule_name }}"}"#.to_string());
+    let body_template = Some(
+        r#"{"alert_title": "{{ title }}", "alert_body": "{{ body }}", "rule": "{{ rule_name }}"}"#
+            .to_string(),
+    );
 
     let queue = NotificationQueue::new(10);
-    let registry = make_webhook_registry("test-webhook", &webhook_url, "POST", HashMap::new(), body_template);
+    let registry = make_webhook_registry(
+        "test-webhook",
+        &webhook_url,
+        "POST",
+        HashMap::new(),
+        body_template,
+    );
     let mut worker = NotificationWorker::new(&queue, registry, "test-webhook".to_string());
 
     let payload = make_payload("template_rule");
@@ -565,7 +581,13 @@ async fn test_webhook_send_with_default_body() {
 
     let queue = NotificationQueue::new(10);
     // No body_template = uses DefaultWebhookPayload
-    let registry = make_webhook_registry("default-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let registry = make_webhook_registry(
+        "default-webhook",
+        &webhook_url,
+        "POST",
+        HashMap::new(),
+        None,
+    );
     let mut worker = NotificationWorker::new(&queue, registry, "default-webhook".to_string());
 
     let payload = make_payload("default_rule");
@@ -601,7 +623,10 @@ async fn test_webhook_with_custom_headers() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
     let mut headers = HashMap::new();
-    headers.insert("Authorization".to_string(), "Bearer test-token-123".to_string());
+    headers.insert(
+        "Authorization".to_string(),
+        "Bearer test-token-123".to_string(),
+    );
     headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
 
     let queue = NotificationQueue::new(10);
@@ -650,7 +675,8 @@ async fn test_webhook_retry_on_500_then_success() {
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
     let queue = NotificationQueue::new(10);
-    let registry = make_webhook_registry("retry-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let registry =
+        make_webhook_registry("retry-webhook", &webhook_url, "POST", HashMap::new(), None);
     let mut worker = NotificationWorker::new(&queue, registry, "retry-webhook".to_string());
 
     let payload = make_payload("retry_rule");
@@ -686,7 +712,13 @@ async fn test_webhook_no_retry_on_400() {
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
     let queue = NotificationQueue::new(10);
-    let registry = make_webhook_registry("no-retry-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let registry = make_webhook_registry(
+        "no-retry-webhook",
+        &webhook_url,
+        "POST",
+        HashMap::new(),
+        None,
+    );
     let mut worker = NotificationWorker::new(&queue, registry, "no-retry-webhook".to_string());
 
     let payload = make_payload("no_retry_rule");

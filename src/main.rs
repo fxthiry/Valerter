@@ -107,14 +107,13 @@ fn create_notifier_registry(
         }
 
         // Create registry from config
-        let registry = NotifierRegistry::from_config(notifiers_config, http_client).map_err(
-            |errors| {
+        let registry =
+            NotifierRegistry::from_config(notifiers_config, http_client).map_err(|errors| {
                 for e in &errors {
                     error!(error = %e, "Notifier configuration error");
                 }
                 anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
-            },
-        )?;
+            })?;
 
         // Use first notifier alphabetically as default for deterministic behavior (Fix L3)
         let default_name = registry
@@ -135,11 +134,8 @@ fn create_notifier_registry(
     // Priority 2: Fallback to legacy MATTERMOST_WEBHOOK
     if let Some(webhook_url) = &config.mattermost_webhook {
         let mut registry = NotifierRegistry::new();
-        let mattermost = MattermostNotifier::new(
-            "default".to_string(),
-            webhook_url.clone(),
-            http_client,
-        );
+        let mattermost =
+            MattermostNotifier::new("default".to_string(), webhook_url.clone(), http_client);
         registry
             .register(Arc::new(mattermost))
             .expect("Failed to register default notifier");
@@ -233,10 +229,8 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
 
     // Create notifier registry (Story 6.2: named notifiers with backward compatibility)
-    let (registry, default_notifier) = create_notifier_registry(
-        &runtime_config,
-        http_client.clone(),
-    )?;
+    let (registry, default_notifier) =
+        create_notifier_registry(&runtime_config, http_client.clone())?;
 
     // Validate rule destinations against registry (Story 6.3: fail-fast at startup)
     let valid_notifiers: Vec<&str> = registry.names().collect();

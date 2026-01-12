@@ -40,7 +40,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig};
+use crate::config::{
+    BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig,
+};
 use crate::error::RuleError;
 use crate::notify::{AlertPayload, NotificationQueue};
 use crate::parser::{RuleParser, record_parse_error};
@@ -941,10 +943,7 @@ mod tests {
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test"}"#;
 
         // Test with multiple destinations (Story 6.3)
-        let destinations = vec![
-            "mattermost-infra".to_string(),
-            "mattermost-ops".to_string(),
-        ];
+        let destinations = vec!["mattermost-infra".to_string(), "mattermost-ops".to_string()];
         let result = process_log_line(
             line,
             &parser,

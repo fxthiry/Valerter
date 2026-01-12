@@ -1376,15 +1376,19 @@ mod tests {
     #[test]
     fn load_webhook_from_environment_variable() {
         // Use temp_env for safe env var handling (Fix M3)
-        temp_env::with_var("MATTERMOST_WEBHOOK", Some("https://test.webhook.url/hook"), || {
-            let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        temp_env::with_var(
+            "MATTERMOST_WEBHOOK",
+            Some("https://test.webhook.url/hook"),
+            || {
+                let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
 
-            assert!(config.mattermost_webhook.is_some());
-            assert_eq!(
-                config.mattermost_webhook.as_ref().unwrap().expose(),
-                "https://test.webhook.url/hook"
-            );
-        });
+                assert!(config.mattermost_webhook.is_some());
+                assert_eq!(
+                    config.mattermost_webhook.as_ref().unwrap().expose(),
+                    "https://test.webhook.url/hook"
+                );
+            },
+        );
     }
 
     // Fix M3: Test that config.example.yaml is valid and parseable
@@ -1792,22 +1796,35 @@ mod tests {
         assert_eq!(notifiers.len(), 5);
 
         // Check mattermost-infra notifier with all fields
-        let infra = notifiers.get("mattermost-infra").expect("mattermost-infra should exist");
+        let infra = notifiers
+            .get("mattermost-infra")
+            .expect("mattermost-infra should exist");
         match infra {
             NotifierConfig::Mattermost(cfg) => {
-                assert_eq!(cfg.webhook_url, "https://mattermost.example.com/hooks/infra123");
+                assert_eq!(
+                    cfg.webhook_url,
+                    "https://mattermost.example.com/hooks/infra123"
+                );
                 assert_eq!(cfg.channel, Some("infra-alerts".to_string()));
                 assert_eq!(cfg.username, Some("valerter-infra".to_string()));
-                assert_eq!(cfg.icon_url, Some("https://example.com/infra-icon.png".to_string()));
+                assert_eq!(
+                    cfg.icon_url,
+                    Some("https://example.com/infra-icon.png".to_string())
+                );
             }
             _ => panic!("Expected Mattermost variant"),
         }
 
         // Check mattermost-ops notifier with only required field
-        let ops = notifiers.get("mattermost-ops").expect("mattermost-ops should exist");
+        let ops = notifiers
+            .get("mattermost-ops")
+            .expect("mattermost-ops should exist");
         match ops {
             NotifierConfig::Mattermost(cfg) => {
-                assert_eq!(cfg.webhook_url, "https://mattermost.example.com/hooks/ops456");
+                assert_eq!(
+                    cfg.webhook_url,
+                    "https://mattermost.example.com/hooks/ops456"
+                );
                 assert!(cfg.channel.is_none());
                 assert!(cfg.username.is_none());
                 assert!(cfg.icon_url.is_none());
@@ -1816,7 +1833,9 @@ mod tests {
         }
 
         // Story 6.5: Check webhook-pagerduty notifier
-        let pagerduty = notifiers.get("webhook-pagerduty").expect("webhook-pagerduty should exist");
+        let pagerduty = notifiers
+            .get("webhook-pagerduty")
+            .expect("webhook-pagerduty should exist");
         match pagerduty {
             NotifierConfig::Webhook(cfg) => {
                 assert_eq!(cfg.url, "https://events.pagerduty.com/v2/enqueue");
@@ -1828,7 +1847,9 @@ mod tests {
         }
 
         // Story 6.5: Check webhook-simple notifier (defaults)
-        let simple = notifiers.get("webhook-simple").expect("webhook-simple should exist");
+        let simple = notifiers
+            .get("webhook-simple")
+            .expect("webhook-simple should exist");
         match simple {
             NotifierConfig::Webhook(cfg) => {
                 assert_eq!(cfg.url, "https://api.example.com/alerts");
@@ -1851,7 +1872,10 @@ mod tests {
     fn load_config_with_unknown_notifier_type_fails() {
         let result = Config::load(&fixture_path("config_invalid_notifier_type.yaml"));
 
-        assert!(result.is_err(), "Unknown notifier type should fail to parse");
+        assert!(
+            result.is_err(),
+            "Unknown notifier type should fail to parse"
+        );
         let err = result.unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
@@ -1916,11 +1940,15 @@ mod tests {
 
     #[test]
     fn resolve_env_vars_substitutes_single_variable() {
-        temp_env::with_var("TEST_WEBHOOK_VAR", Some("https://example.com/hooks/abc"), || {
-            let result = resolve_env_vars("${TEST_WEBHOOK_VAR}");
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), "https://example.com/hooks/abc");
-        });
+        temp_env::with_var(
+            "TEST_WEBHOOK_VAR",
+            Some("https://example.com/hooks/abc"),
+            || {
+                let result = resolve_env_vars("${TEST_WEBHOOK_VAR}");
+                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), "https://example.com/hooks/abc");
+            },
+        );
     }
 
     #[test]
@@ -1977,10 +2005,7 @@ mod tests {
     #[test]
     fn resolve_env_vars_error_lists_all_undefined_variables() {
         temp_env::with_vars(
-            [
-                ("UNDEFINED_A", None::<&str>),
-                ("UNDEFINED_B", None::<&str>),
-            ],
+            [("UNDEFINED_A", None::<&str>), ("UNDEFINED_B", None::<&str>)],
             || {
                 let result = resolve_env_vars("${UNDEFINED_A} and ${UNDEFINED_B}");
                 assert!(result.is_err());
@@ -1988,8 +2013,16 @@ mod tests {
                 let err = result.unwrap_err();
                 match err {
                     ConfigError::ValidationError(msg) => {
-                        assert!(msg.contains("UNDEFINED_A"), "Should mention UNDEFINED_A: {}", msg);
-                        assert!(msg.contains("UNDEFINED_B"), "Should mention UNDEFINED_B: {}", msg);
+                        assert!(
+                            msg.contains("UNDEFINED_A"),
+                            "Should mention UNDEFINED_A: {}",
+                            msg
+                        );
+                        assert!(
+                            msg.contains("UNDEFINED_B"),
+                            "Should mention UNDEFINED_B: {}",
+                            msg
+                        );
                     }
                     _ => panic!("Expected ValidationError, got {:?}", err),
                 }
@@ -2279,7 +2312,10 @@ mod tests {
                     name: "rule_1".to_string(),
                     enabled: true,
                     query: "test".to_string(),
-                    parser: CompiledParser { regex: None, json: None },
+                    parser: CompiledParser {
+                        regex: None,
+                        json: None,
+                    },
                     throttle: None,
                     notify: Some(NotifyConfig {
                         template: None,
@@ -2291,7 +2327,10 @@ mod tests {
                     name: "rule_2".to_string(),
                     enabled: true,
                     query: "test".to_string(),
-                    parser: CompiledParser { regex: None, json: None },
+                    parser: CompiledParser {
+                        regex: None,
+                        json: None,
+                    },
                     throttle: None,
                     notify: Some(NotifyConfig {
                         template: None,
@@ -2402,7 +2441,10 @@ mod tests {
             NotifierConfig::Webhook(cfg) => {
                 assert_eq!(cfg.headers.len(), 2);
                 // Headers are stored as-is, env var resolution happens at notifier creation
-                assert_eq!(cfg.headers.get("Authorization").unwrap(), "Bearer ${WEBHOOK_TOKEN}");
+                assert_eq!(
+                    cfg.headers.get("Authorization").unwrap(),
+                    "Bearer ${WEBHOOK_TOKEN}"
+                );
                 assert_eq!(cfg.headers.get("X-API-Key").unwrap(), "${API_KEY}");
             }
             _ => panic!("Expected Webhook variant"),

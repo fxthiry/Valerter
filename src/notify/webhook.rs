@@ -3,14 +3,14 @@
 //! Implements the `Notifier` trait for sending alerts to arbitrary HTTP endpoints
 //! with customizable body templates and headers.
 
-use crate::config::{resolve_env_vars, SecretString, WebhookNotifierConfig};
+use crate::config::{SecretString, WebhookNotifierConfig, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{backoff_delay, AlertPayload, Notifier};
+use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
 use chrono::Utc;
-use minijinja::{context, Environment};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use minijinja::{Environment, context};
 use reqwest::Method;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::Duration;
@@ -107,7 +107,8 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
     env.add_template("body", source)
         .map_err(|e| NotifyError::SendFailed(format!("template error: {}", e)))?;
 
-    let tmpl = env.get_template("body")
+    let tmpl = env
+        .get_template("body")
         .map_err(|e| NotifyError::SendFailed(format!("template error: {}", e)))?;
 
     tmpl.render(context! {
@@ -139,12 +140,11 @@ impl WebhookNotifier {
         client: reqwest::Client,
     ) -> Result<Self, ConfigError> {
         // Resolve environment variables in URL
-        let resolved_url = resolve_env_vars(&config.url).map_err(|e| {
-            ConfigError::InvalidNotifier {
+        let resolved_url =
+            resolve_env_vars(&config.url).map_err(|e| ConfigError::InvalidNotifier {
                 name: name.to_string(),
                 message: format!("url: {}", e),
-            }
-        })?;
+            })?;
 
         // Parse and validate HTTP method (AC6: only POST and PUT supported)
         let method_upper = config.method.to_uppercase();
@@ -157,29 +157,25 @@ impl WebhookNotifier {
                 ),
             });
         }
-        let method = Method::from_str(&method_upper).map_err(|_| {
-            ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("invalid method: {}", config.method),
-            }
+        let method = Method::from_str(&method_upper).map_err(|_| ConfigError::InvalidNotifier {
+            name: name.to_string(),
+            message: format!("invalid method: {}", config.method),
         })?;
 
         // Resolve headers with environment variable substitution
         let mut headers = HeaderMap::new();
         for (key, value) in &config.headers {
-            let resolved_value = resolve_env_vars(value).map_err(|e| {
-                ConfigError::InvalidNotifier {
+            let resolved_value =
+                resolve_env_vars(value).map_err(|e| ConfigError::InvalidNotifier {
                     name: name.to_string(),
                     message: format!("header '{}': {}", key, e),
-                }
-            })?;
+                })?;
 
-            let header_name = HeaderName::from_str(key).map_err(|_| {
-                ConfigError::InvalidNotifier {
+            let header_name =
+                HeaderName::from_str(key).map_err(|_| ConfigError::InvalidNotifier {
                     name: name.to_string(),
                     message: format!("invalid header name: {}", key),
-                }
-            })?;
+                })?;
 
             let header_value = HeaderValue::from_str(&resolved_value).map_err(|_| {
                 ConfigError::InvalidNotifier {
@@ -194,11 +190,9 @@ impl WebhookNotifier {
         // Validate body template if provided
         let body_template_source = match &config.body_template {
             Some(template_str) => {
-                validate_body_template(template_str).map_err(|e| {
-                    ConfigError::InvalidNotifier {
-                        name: name.to_string(),
-                        message: format!("body_template: {}", e),
-                    }
+                validate_body_template(template_str).map_err(|e| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message: format!("body_template: {}", e),
                 })?;
                 Some(template_str.clone())
             }
@@ -257,8 +251,9 @@ impl Notifier for WebhookNotifier {
             Some(template_source) => render_body_template(template_source, alert)?,
             None => {
                 let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
-                serde_json::to_string(&payload)
-                    .map_err(|e| NotifyError::SendFailed(format!("JSON serialization error: {}", e)))?
+                serde_json::to_string(&payload).map_err(|e| {
+                    NotifyError::SendFailed(format!("JSON serialization error: {}", e))
+                })?
             }
         };
 
@@ -383,7 +378,10 @@ mod tests {
                 method: "PUT".to_string(),
                 headers: {
                     let mut h = HashMap::new();
-                    h.insert("Authorization".to_string(), "Bearer ${TEST_WEBHOOK_TOKEN}".to_string());
+                    h.insert(
+                        "Authorization".to_string(),
+                        "Bearer ${TEST_WEBHOOK_TOKEN}".to_string(),
+                    );
                     h.insert("Content-Type".to_string(), "application/json".to_string());
                     h
                 },
@@ -420,19 +418,24 @@ mod tests {
 
     #[test]
     fn from_config_resolves_url_env_var() {
-        temp_env::with_var("TEST_WEBHOOK_URL", Some("https://resolved.example.com/hook"), || {
-            let config = WebhookNotifierConfig {
-                url: "${TEST_WEBHOOK_URL}".to_string(),
-                method: "POST".to_string(),
-                headers: HashMap::new(),
-                body_template: None,
-            };
+        temp_env::with_var(
+            "TEST_WEBHOOK_URL",
+            Some("https://resolved.example.com/hook"),
+            || {
+                let config = WebhookNotifierConfig {
+                    url: "${TEST_WEBHOOK_URL}".to_string(),
+                    method: "POST".to_string(),
+                    headers: HashMap::new(),
+                    body_template: None,
+                };
 
-            let client = reqwest::Client::new();
-            let notifier = WebhookNotifier::from_config("env-webhook", &config, client).unwrap();
+                let client = reqwest::Client::new();
+                let notifier =
+                    WebhookNotifier::from_config("env-webhook", &config, client).unwrap();
 
-            assert_eq!(notifier.url(), "https://resolved.example.com/hook");
-        });
+                assert_eq!(notifier.url(), "https://resolved.example.com/hook");
+            },
+        );
     }
 
     #[test]
@@ -469,7 +472,10 @@ mod tests {
                 method: "POST".to_string(),
                 headers: {
                     let mut h = HashMap::new();
-                    h.insert("Authorization".to_string(), "Bearer ${UNDEFINED_TOKEN}".to_string());
+                    h.insert(
+                        "Authorization".to_string(),
+                        "Bearer ${UNDEFINED_TOKEN}".to_string(),
+                    );
                     h
                 },
                 body_template: None,
@@ -655,9 +661,8 @@ mod tests {
         };
 
         let client = reqwest::Client::new();
-        let notifier: Box<dyn Notifier> = Box::new(
-            WebhookNotifier::from_config("test", &config, client).unwrap()
-        );
+        let notifier: Box<dyn Notifier> =
+            Box::new(WebhookNotifier::from_config("test", &config, client).unwrap());
 
         assert_eq!(notifier.name(), "test");
         assert_eq!(notifier.notifier_type(), "webhook");
@@ -669,25 +674,30 @@ mod tests {
 
     #[test]
     fn debug_output_does_not_expose_url() {
-        temp_env::with_var("TEST_SECRET_URL", Some("https://secret.example.com/hook/abc123"), || {
-            let config = WebhookNotifierConfig {
-                url: "${TEST_SECRET_URL}".to_string(),
-                method: "POST".to_string(),
-                headers: HashMap::new(),
-                body_template: None,
-            };
+        temp_env::with_var(
+            "TEST_SECRET_URL",
+            Some("https://secret.example.com/hook/abc123"),
+            || {
+                let config = WebhookNotifierConfig {
+                    url: "${TEST_SECRET_URL}".to_string(),
+                    method: "POST".to_string(),
+                    headers: HashMap::new(),
+                    body_template: None,
+                };
 
-            let client = reqwest::Client::new();
-            let notifier = WebhookNotifier::from_config("secret-webhook", &config, client).unwrap();
-            let debug = format!("{:?}", notifier);
+                let client = reqwest::Client::new();
+                let notifier =
+                    WebhookNotifier::from_config("secret-webhook", &config, client).unwrap();
+                let debug = format!("{:?}", notifier);
 
-            // URL should NOT appear in debug output
-            assert!(!debug.contains("secret.example.com"));
-            assert!(!debug.contains("abc123"));
-            // Name and method are OK to show
-            assert!(debug.contains("secret-webhook"));
-            assert!(debug.contains("POST"));
-        });
+                // URL should NOT appear in debug output
+                assert!(!debug.contains("secret.example.com"));
+                assert!(!debug.contains("abc123"));
+                // Name and method are OK to show
+                assert!(debug.contains("secret-webhook"));
+                assert!(debug.contains("POST"));
+            },
+        );
     }
 
     #[test]
@@ -698,7 +708,10 @@ mod tests {
                 method: "POST".to_string(),
                 headers: {
                     let mut h = HashMap::new();
-                    h.insert("Authorization".to_string(), "${TEST_AUTH_TOKEN}".to_string());
+                    h.insert(
+                        "Authorization".to_string(),
+                        "${TEST_AUTH_TOKEN}".to_string(),
+                    );
                     h
                 },
                 body_template: None,

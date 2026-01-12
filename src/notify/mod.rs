@@ -764,10 +764,8 @@ mod tests {
             }))
             .unwrap();
 
-        let result = registry.validate_destinations(&[
-            "notifier-a".to_string(),
-            "notifier-b".to_string(),
-        ]);
+        let result =
+            registry.validate_destinations(&["notifier-a".to_string(), "notifier-b".to_string()]);
         assert!(result.is_ok());
     }
 
@@ -821,42 +819,50 @@ mod tests {
         use crate::config::{MattermostNotifierConfig, NotifierConfig};
 
         // Use temp_env for safe env var handling (Fix M3)
-        temp_env::with_var("TEST_MM_WEBHOOK", Some("https://mm.example.com/hooks/test123"), || {
-            let mut notifiers_config = HashMap::new();
-            notifiers_config.insert(
-                "mattermost-infra".to_string(),
-                NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${TEST_MM_WEBHOOK}".to_string(),
-                    channel: Some("infra-alerts".to_string()),
-                    username: Some("valerter".to_string()),
-                    icon_url: None,
-                }),
-            );
-            notifiers_config.insert(
-                "mattermost-ops".to_string(),
-                NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "https://static.example.com/hooks/static".to_string(),
-                    channel: None,
-                    username: None,
-                    icon_url: None,
-                }),
-            );
+        temp_env::with_var(
+            "TEST_MM_WEBHOOK",
+            Some("https://mm.example.com/hooks/test123"),
+            || {
+                let mut notifiers_config = HashMap::new();
+                notifiers_config.insert(
+                    "mattermost-infra".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "${TEST_MM_WEBHOOK}".to_string(),
+                        channel: Some("infra-alerts".to_string()),
+                        username: Some("valerter".to_string()),
+                        icon_url: None,
+                    }),
+                );
+                notifiers_config.insert(
+                    "mattermost-ops".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "https://static.example.com/hooks/static".to_string(),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                    }),
+                );
 
-            let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let client = reqwest::Client::new();
+                let result = NotifierRegistry::from_config(&notifiers_config, client);
 
-            assert!(result.is_ok(), "from_config should succeed: {:?}", result.err());
-            let registry = result.unwrap();
+                assert!(
+                    result.is_ok(),
+                    "from_config should succeed: {:?}",
+                    result.err()
+                );
+                let registry = result.unwrap();
 
-            assert_eq!(registry.len(), 2);
-            assert!(registry.get("mattermost-infra").is_some());
-            assert!(registry.get("mattermost-ops").is_some());
+                assert_eq!(registry.len(), 2);
+                assert!(registry.get("mattermost-infra").is_some());
+                assert!(registry.get("mattermost-ops").is_some());
 
-            // Check types
-            let infra = registry.get("mattermost-infra").unwrap();
-            assert_eq!(infra.name(), "mattermost-infra");
-            assert_eq!(infra.notifier_type(), "mattermost");
-        });
+                // Check types
+                let infra = registry.get("mattermost-infra").unwrap();
+                assert_eq!(infra.name(), "mattermost-infra");
+                assert_eq!(infra.notifier_type(), "mattermost");
+            },
+        );
     }
 
     #[test]
@@ -886,7 +892,11 @@ mod tests {
             match &errors[0] {
                 ConfigError::InvalidNotifier { name, message } => {
                     assert_eq!(name, "bad-notifier");
-                    assert!(message.contains("UNDEFINED_WEBHOOK_VAR"), "Error should mention the undefined var: {}", message);
+                    assert!(
+                        message.contains("UNDEFINED_WEBHOOK_VAR"),
+                        "Error should mention the undefined var: {}",
+                        message
+                    );
                 }
                 other => panic!("Expected InvalidNotifier, got {:?}", other),
             }
@@ -929,7 +939,11 @@ mod tests {
 
                 assert!(result.is_err());
                 let errors = result.unwrap_err();
-                assert_eq!(errors.len(), 2, "Should collect all errors, not stop at first");
+                assert_eq!(
+                    errors.len(),
+                    2,
+                    "Should collect all errors, not stop at first"
+                );
             },
         );
     }
@@ -962,7 +976,10 @@ mod tests {
                     method: "POST".to_string(),
                     headers: {
                         let mut h = std::collections::HashMap::new();
-                        h.insert("Authorization".to_string(), "Bearer ${TEST_WEBHOOK_TOKEN}".to_string());
+                        h.insert(
+                            "Authorization".to_string(),
+                            "Bearer ${TEST_WEBHOOK_TOKEN}".to_string(),
+                        );
                         h.insert("Content-Type".to_string(), "application/json".to_string());
                         h
                     },
@@ -973,7 +990,11 @@ mod tests {
             let client = reqwest::Client::new();
             let result = NotifierRegistry::from_config(&notifiers_config, client);
 
-            assert!(result.is_ok(), "Should successfully create webhook notifier: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "Should successfully create webhook notifier: {:?}",
+                result
+            );
             let registry = result.unwrap();
             assert_eq!(registry.len(), 1);
 
@@ -1025,7 +1046,10 @@ mod tests {
                     method: "POST".to_string(),
                     headers: {
                         let mut h = std::collections::HashMap::new();
-                        h.insert("Authorization".to_string(), "Bearer ${UNDEFINED_WEBHOOK_TOKEN}".to_string());
+                        h.insert(
+                            "Authorization".to_string(),
+                            "Bearer ${UNDEFINED_WEBHOOK_TOKEN}".to_string(),
+                        );
                         h
                     },
                     body_template: None,
@@ -1056,7 +1080,10 @@ mod tests {
 
         temp_env::with_vars(
             [
-                ("TEST_MM_WEBHOOK_MIXED", Some("https://mm.example.com/hooks/abc")),
+                (
+                    "TEST_MM_WEBHOOK_MIXED",
+                    Some("https://mm.example.com/hooks/abc"),
+                ),
                 ("TEST_WH_TOKEN_MIXED", Some("token-xyz")),
             ],
             || {
@@ -1077,7 +1104,10 @@ mod tests {
                         method: "POST".to_string(),
                         headers: {
                             let mut h = std::collections::HashMap::new();
-                            h.insert("X-API-Key".to_string(), "${TEST_WH_TOKEN_MIXED}".to_string());
+                            h.insert(
+                                "X-API-Key".to_string(),
+                                "${TEST_WH_TOKEN_MIXED}".to_string(),
+                            );
                             h
                         },
                         body_template: None,
@@ -1087,7 +1117,11 @@ mod tests {
                 let client = reqwest::Client::new();
                 let result = NotifierRegistry::from_config(&notifiers_config, client);
 
-                assert!(result.is_ok(), "Should create mixed notifiers: {:?}", result);
+                assert!(
+                    result.is_ok(),
+                    "Should create mixed notifiers: {:?}",
+                    result
+                );
                 let registry = result.unwrap();
                 assert_eq!(registry.len(), 2);
 
@@ -1357,7 +1391,11 @@ mod tests {
                 let client = reqwest::Client::new();
                 let result = NotifierRegistry::from_config(&notifiers_config, client);
 
-                assert!(result.is_ok(), "Should resolve env vars for email auth: {:?}", result);
+                assert!(
+                    result.is_ok(),
+                    "Should resolve env vars for email auth: {:?}",
+                    result
+                );
                 let registry = result.unwrap();
                 assert_eq!(registry.get("email-auth").unwrap().notifier_type(), "email");
             },
@@ -1451,60 +1489,71 @@ mod tests {
             TlsMode, WebhookNotifierConfig,
         };
 
-        temp_env::with_var("TEST_MM_ALL_TYPES", Some("https://mm.example.com/hooks/abc"), || {
-            let mut notifiers_config = HashMap::new();
+        temp_env::with_var(
+            "TEST_MM_ALL_TYPES",
+            Some("https://mm.example.com/hooks/abc"),
+            || {
+                let mut notifiers_config = HashMap::new();
 
-            // Mattermost
-            notifiers_config.insert(
-                "mattermost".to_string(),
-                NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${TEST_MM_ALL_TYPES}".to_string(),
-                    channel: None,
-                    username: None,
-                    icon_url: None,
-                }),
-            );
-
-            // Webhook
-            notifiers_config.insert(
-                "webhook".to_string(),
-                NotifierConfig::Webhook(WebhookNotifierConfig {
-                    url: "https://api.example.com/alerts".to_string(),
-                    method: "POST".to_string(),
-                    headers: std::collections::HashMap::new(),
-                    body_template: None,
-                }),
-            );
-
-            // Email
-            notifiers_config.insert(
-                "email".to_string(),
-                NotifierConfig::Email(EmailNotifierConfig {
-                    smtp: SmtpConfig {
-                        host: "smtp.example.com".to_string(),
-                        port: 587,
+                // Mattermost
+                notifiers_config.insert(
+                    "mattermost".to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: "${TEST_MM_ALL_TYPES}".to_string(),
+                        channel: None,
                         username: None,
-                        password: None,
-                        tls: TlsMode::Starttls,
-                        tls_verify: true,
-                    },
-                    from: "valerter@example.com".to_string(),
-                    to: vec!["ops@example.com".to_string()],
-                    subject_template: "{{ title }}".to_string(),
-                    body_format: BodyFormat::Text,
-                }),
-            );
+                        icon_url: None,
+                    }),
+                );
 
-            let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+                // Webhook
+                notifiers_config.insert(
+                    "webhook".to_string(),
+                    NotifierConfig::Webhook(WebhookNotifierConfig {
+                        url: "https://api.example.com/alerts".to_string(),
+                        method: "POST".to_string(),
+                        headers: std::collections::HashMap::new(),
+                        body_template: None,
+                    }),
+                );
 
-            assert!(result.is_ok(), "Should create all three notifier types: {:?}", result);
-            let registry = result.unwrap();
-            assert_eq!(registry.len(), 3);
+                // Email
+                notifiers_config.insert(
+                    "email".to_string(),
+                    NotifierConfig::Email(EmailNotifierConfig {
+                        smtp: SmtpConfig {
+                            host: "smtp.example.com".to_string(),
+                            port: 587,
+                            username: None,
+                            password: None,
+                            tls: TlsMode::Starttls,
+                            tls_verify: true,
+                        },
+                        from: "valerter@example.com".to_string(),
+                        to: vec!["ops@example.com".to_string()],
+                        subject_template: "{{ title }}".to_string(),
+                        body_format: BodyFormat::Text,
+                    }),
+                );
 
-            assert_eq!(registry.get("mattermost").unwrap().notifier_type(), "mattermost");
-            assert_eq!(registry.get("webhook").unwrap().notifier_type(), "webhook");
-            assert_eq!(registry.get("email").unwrap().notifier_type(), "email");
-        });
+                let client = reqwest::Client::new();
+                let result = NotifierRegistry::from_config(&notifiers_config, client);
+
+                assert!(
+                    result.is_ok(),
+                    "Should create all three notifier types: {:?}",
+                    result
+                );
+                let registry = result.unwrap();
+                assert_eq!(registry.len(), 3);
+
+                assert_eq!(
+                    registry.get("mattermost").unwrap().notifier_type(),
+                    "mattermost"
+                );
+                assert_eq!(registry.get("webhook").unwrap().notifier_type(), "webhook");
+                assert_eq!(registry.get("email").unwrap().notifier_type(), "email");
+            },
+        );
     }
 }

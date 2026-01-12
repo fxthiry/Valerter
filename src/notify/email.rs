@@ -3,16 +3,16 @@
 //! Implements the `Notifier` trait for sending alerts via SMTP
 //! with exponential backoff retry.
 
-use crate::config::{resolve_env_vars, BodyFormat, EmailNotifierConfig, TlsMode};
+use crate::config::{BodyFormat, EmailNotifierConfig, TlsMode, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{backoff_delay, AlertPayload, Notifier};
+use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
-use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use minijinja::{context, Environment};
+use minijinja::{Environment, context};
 use std::time::Duration;
 
 /// Backoff base delay for email retries (AD-07).
@@ -95,10 +95,13 @@ impl EmailNotifier {
         let transport = Self::build_transport(name, config, username, password)?;
 
         // 3. Parse the 'from' email address
-        let from: Mailbox = config.from.parse().map_err(|e| ConfigError::InvalidNotifier {
-            name: name.to_string(),
-            message: format!("invalid 'from' address '{}': {}", config.from, e),
-        })?;
+        let from: Mailbox = config
+            .from
+            .parse()
+            .map_err(|e| ConfigError::InvalidNotifier {
+                name: name.to_string(),
+                message: format!("invalid 'from' address '{}': {}", config.from, e),
+            })?;
 
         // 4. Parse the 'to' email addresses
         let to: Vec<Mailbox> = config
@@ -155,10 +158,14 @@ impl EmailNotifier {
                 // Disable certificate verification for self-signed certs
                 tls_builder = tls_builder.dangerous_accept_invalid_certs(true);
             }
-            Some(tls_builder.build().map_err(|e| ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("TLS configuration error: {}", e),
-            })?)
+            Some(
+                tls_builder
+                    .build()
+                    .map_err(|e| ConfigError::InvalidNotifier {
+                        name: name.to_string(),
+                        message: format!("TLS configuration error: {}", e),
+                    })?,
+            )
         } else {
             None
         };
@@ -330,7 +337,7 @@ impl EmailNotifier {
             || error_str.contains("551")  // User not local
             || error_str.contains("552")  // Message size exceeded
             || error_str.contains("553")  // Mailbox name invalid
-            || error_str.contains("554")  // Transaction failed
+            || error_str.contains("554") // Transaction failed
     }
 }
 
@@ -632,7 +639,11 @@ mod tests {
 
                 // Should not fail due to env var resolution
                 // (May fail later due to actual SMTP connection, but that's OK)
-                assert!(result.is_ok(), "Should resolve env vars: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "Should resolve env vars: {:?}",
+                    result.err()
+                );
             },
         );
     }
@@ -671,7 +682,11 @@ mod tests {
         let result = EmailNotifier::from_config("insecure-email", &config);
 
         // Should successfully create notifier with disabled cert verification
-        assert!(result.is_ok(), "Should create notifier with tls_verify=false: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should create notifier with tls_verify=false: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -681,7 +696,11 @@ mod tests {
 
         let result = EmailNotifier::from_config("secure-email-tls", &config);
 
-        assert!(result.is_ok(), "Should create notifier with tls_verify=true: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should create notifier with tls_verify=true: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -692,7 +711,11 @@ mod tests {
 
         let result = EmailNotifier::from_config("no-tls", &config);
 
-        assert!(result.is_ok(), "Should create notifier with tls=none: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should create notifier with tls=none: {:?}",
+            result.err()
+        );
     }
 
     // ===================================================================

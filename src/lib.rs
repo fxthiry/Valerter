@@ -18,8 +18,8 @@ pub use cli::LogFormat;
 pub use engine::RuleEngine;
 pub use metrics::{MetricsServer, register_metric_descriptions};
 pub use notify::{
-    backoff_delay, AlertPayload, MattermostNotifier, Notifier, NotificationQueue,
-    NotificationWorker, NotifierRegistry, DEFAULT_QUEUE_CAPACITY,
+    AlertPayload, DEFAULT_QUEUE_CAPACITY, MattermostNotifier, NotificationQueue,
+    NotificationWorker, Notifier, NotifierRegistry, backoff_delay,
 };
 pub use parser::{RuleParser, record_parse_error};
 pub use stream_buffer::StreamBuffer;
