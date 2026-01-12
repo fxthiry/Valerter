@@ -111,14 +111,32 @@ rules:
       window: 5m             # Per 5 minutes
     notify:
       template: "default_alert"
-      channel: "alerts"
+      # destinations: Send to multiple notifiers (Story 6.3)
+      # If omitted, uses default notifier. Must match names from notifiers: section.
+      # Example:
+      #   destinations:
+      #     - mattermost-infra
+      #     - mattermost-ops
 
   - name: "error_log_alert"
     enabled: true
     query: '_stream:{app="myapp"} level:error'
     parser:
       regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
-    # Uses defaults for throttle and notify
+    # Uses defaults for throttle and notify (including default notifier)
+
+  # Example: Rule with multi-destination routing (Story 6.3)
+  # - name: "critical_error_alert"
+  #   enabled: true
+  #   query: '_stream:{app="myapp"} level:critical'
+  #   parser:
+  #     json:
+  #       fields: ["message", "error"]
+  #   notify:
+  #     template: "default_alert"
+  #     destinations:
+  #       - mattermost-infra    # Send to infra team
+  #       - mattermost-ops      # Also send to ops team
 
   - name: "disabled_example"
     enabled: false

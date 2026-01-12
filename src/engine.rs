@@ -64,7 +64,9 @@ struct RuleSpawnContext {
     template_engine: Arc<TemplateEngine>,
     default_template: String,
     default_throttle: CompiledThrottle,
-    webhook_url: Option<String>,
+    /// Notification destinations for this rule (Story 6.3).
+    /// Empty vec means use the default notifier.
+    destinations: Vec<String>,
 }
 
 /// Rule engine that orchestrates all alert rules.
@@ -164,18 +166,19 @@ impl RuleEngine {
             window: self.runtime_config.defaults.throttle.window,
         };
 
-        // Get webhook URL (required for sending notifications)
-        let webhook_url = self
-            .runtime_config
-            .mattermost_webhook
-            .as_ref()
-            .map(|s| s.expose().to_string());
-
         for rule in &self.runtime_config.rules {
             if !rule.enabled {
                 info!(rule_name = %rule.name, "Rule disabled, skipping");
                 continue;
             }
+
+            // Extract destinations from rule's notify config (Story 6.3).
+            // Empty vec means use the default notifier.
+            let destinations = rule
+                .notify
+                .as_ref()
+                .and_then(|n| n.destinations.clone())
+                .unwrap_or_default();
 
             let ctx = RuleSpawnContext {
                 rule: rule.clone(),
@@ -187,7 +190,7 @@ impl RuleEngine {
                 template_engine: Arc::clone(&template_engine),
                 default_template: default_template.clone(),
                 default_throttle: default_throttle.clone(),
-                webhook_url: webhook_url.clone(),
+                destinations,
             };
 
             let rule_name = rule.name.clone();
@@ -391,15 +394,9 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         .and_then(|n| n.template.clone())
         .unwrap_or(ctx.default_template.clone());
 
-    // Get webhook URL (required for sending notifications)
-    let webhook_url = match &ctx.webhook_url {
-        Some(url) => url.clone(),
-        None => {
-            warn!(rule_name = %ctx.rule.name, "No webhook URL configured, rule will not send notifications");
-            // Still run the rule (for testing/metrics purposes), but don't send
-            String::new()
-        }
-    };
+    // Get destinations for this rule (Story 6.3).
+    // Empty vec means use the default notifier.
+    let destinations = ctx.destinations.clone();
 
     // Wrap parser in Arc for sharing across closure invocations
     let parser = Arc::new(parser);
@@ -422,7 +419,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
     // Stream with reconnection - runs until cancelled
     let rule_name = ctx.rule.name.clone();
     let template_name = Arc::new(template_name);
-    let webhook_url = Arc::new(webhook_url);
+    let destinations = Arc::new(destinations);
     let template_engine = ctx.template_engine;
     let queue = ctx.queue;
 
@@ -436,7 +433,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
             let template_engine = Arc::clone(&template_engine);
             let template_name = Arc::clone(&template_name);
             let rule_name = rule_name.clone();
-            let webhook_url = Arc::clone(&webhook_url);
+            let destinations = Arc::clone(&destinations);
 
             async move {
                 // Pattern Log+Continue: never propagate errors, just log and continue
@@ -447,7 +444,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
                     &template_engine,
                     &template_name,
                     &rule_name,
-                    &webhook_url,
+                    &destinations,
                     &queue,
                 )
                 .await
@@ -488,7 +485,7 @@ async fn process_log_line(
     template_engine: &TemplateEngine,
     template_name: &str,
     rule_name: &str,
-    webhook_url: &str,
+    destinations: &[String],
     queue: &NotificationQueue,
 ) -> Result<(), ProcessError> {
     // Step 1: Parse the log line
@@ -512,22 +509,20 @@ async fn process_log_line(
     // Step 3: Render template
     let rendered = template_engine.render_with_fallback(template_name, &fields, rule_name);
 
-    // Step 4: Send to queue (if webhook configured)
-    if !webhook_url.is_empty() {
-        let payload = AlertPayload {
-            message: rendered,
-            rule_name: rule_name.to_string(),
-            webhook_url: webhook_url.to_string(),
-        };
+    // Step 4: Send to queue with destinations (Story 6.3)
+    let payload = AlertPayload {
+        message: rendered,
+        rule_name: rule_name.to_string(),
+        destinations: destinations.to_vec(),
+    };
 
-        if let Err(e) = queue.send(payload) {
-            warn!(
-                rule_name = %rule_name,
-                error = %e,
-                "Failed to send to notification queue"
-            );
-            return Err(ProcessError::Queue);
-        }
+    if let Err(e) = queue.send(payload) {
+        warn!(
+            rule_name = %rule_name,
+            error = %e,
+            "Failed to send to notification queue"
+        );
+        return Err(ProcessError::Queue);
     }
 
     Ok(())
@@ -831,6 +826,8 @@ mod tests {
 
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test message"}"#;
 
+        // Test with explicit destinations (Story 6.3)
+        let destinations = vec!["mattermost-infra".to_string()];
         let result = process_log_line(
             line,
             &parser,
@@ -838,7 +835,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
-            "https://example.com/webhook",
+            &destinations,
             &queue,
         )
         .await;
@@ -870,7 +867,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
-            "https://example.com/webhook",
+            &[], // Empty destinations = use default
             &queue,
         )
         .await;
@@ -904,7 +901,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
-            "https://example.com/webhook",
+            &[], // Empty destinations = use default
             &queue,
         )
         .await;
@@ -919,7 +916,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
-            "https://example.com/webhook",
+            &[],
             &queue,
         )
         .await;
@@ -929,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_log_line_no_webhook_skips_send() {
+    async fn process_log_line_with_multiple_destinations() {
         let parser = RuleParser::new(None, None);
         let throttle_config = CompiledThrottle {
             key_template: None,
@@ -939,11 +936,15 @@ mod tests {
         let throttler = Throttler::new(Some(&throttle_config), "test_rule");
         let template_engine = TemplateEngine::new(make_test_templates());
         let queue = NotificationQueue::new(10);
-        let _rx = queue.subscribe();
+        let mut rx = queue.subscribe();
 
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test"}"#;
 
-        // Empty webhook URL should skip sending
+        // Test with multiple destinations (Story 6.3)
+        let destinations = vec![
+            "mattermost-infra".to_string(),
+            "mattermost-ops".to_string(),
+        ];
         let result = process_log_line(
             line,
             &parser,
@@ -951,14 +952,19 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
-            "",
+            &destinations,
             &queue,
         )
         .await;
 
         assert!(result.is_ok());
-        // Queue should be empty since webhook was empty
-        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.len(), 1);
+
+        // Verify the payload has the destinations
+        let payload = rx.recv().await.unwrap();
+        assert_eq!(payload.destinations.len(), 2);
+        assert_eq!(payload.destinations[0], "mattermost-infra");
+        assert_eq!(payload.destinations[1], "mattermost-ops");
     }
 
     // ===================================================================

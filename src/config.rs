@@ -271,9 +271,13 @@ pub struct NotifyConfig {
     /// Template name to use (overrides default).
     #[serde(default)]
     pub template: Option<String>,
-    /// Channel to send notification to.
+    /// Channel to send notification to (legacy).
     #[serde(default)]
     pub channel: Option<String>,
+    /// List of notification destinations (Story 6.3).
+    /// If not specified, uses the default notifier.
+    #[serde(default)]
+    pub destinations: Option<Vec<String>>,
 }
 
 // ============================================================
@@ -467,6 +471,90 @@ pub struct CompiledTemplate {
 
 /// Default configuration file path (AD-08).
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/valerter/config.yaml";
+
+impl RuntimeConfig {
+    /// Collect all unique destination names referenced in rules (Story 6.3).
+    ///
+    /// This is used to validate that all destinations exist in the notifier registry
+    /// at startup time (fail-fast validation).
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples (rule_name, destinations) for rules that have
+    /// explicit destinations configured.
+    pub fn collect_rule_destinations(&self) -> Vec<(&str, &[String])> {
+        self.rules
+            .iter()
+            .filter_map(|rule| {
+                rule.notify
+                    .as_ref()
+                    .and_then(|n| n.destinations.as_ref())
+                    .filter(|d| !d.is_empty())
+                    .map(|d| (rule.name.as_str(), d.as_slice()))
+            })
+            .collect()
+    }
+
+    /// Validate that all rule destinations exist in a list of valid notifier names (Story 6.3).
+    ///
+    /// # Arguments
+    ///
+    /// * `valid_notifiers` - List of valid notifier names from the registry
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All destinations are valid
+    /// * `Err(Vec<ConfigError>)` - List of errors for invalid destinations
+    pub fn validate_rule_destinations(
+        &self,
+        valid_notifiers: &[&str],
+    ) -> Result<(), Vec<ConfigError>> {
+        let mut errors = Vec::new();
+
+        for (rule_name, destinations) in self.collect_rule_destinations() {
+            let unknown: Vec<_> = destinations
+                .iter()
+                .filter(|d| !valid_notifiers.contains(&d.as_str()))
+                .collect();
+
+            if !unknown.is_empty() {
+                errors.push(ConfigError::ValidationError(format!(
+                    "rule '{}': unknown notifier{} {}",
+                    rule_name,
+                    if unknown.len() > 1 { "s" } else { "" },
+                    unknown
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+
+        // Also validate that rules with notifiers: section configured have at least one destination
+        // when config.notifiers is present (AC#4 - destinations required)
+        if self.notifiers.is_some() {
+            for rule in &self.rules {
+                if let Some(ref notify) = rule.notify
+                    && let Some(ref destinations) = notify.destinations
+                    && destinations.is_empty()
+                {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': notify.destinations cannot be empty",
+                        rule.name
+                    )));
+                }
+                // If destinations is None, it will use the default notifier (backward compat)
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
 
 impl Config {
     /// Load configuration from a file path.
@@ -1229,6 +1317,7 @@ mod tests {
                 notify: Some(NotifyConfig {
                     template: Some("nonexistent_template".to_string()),
                     channel: None,
+                    destinations: None,
                 }),
             }],
             metrics: MetricsConfig::default(),
@@ -1771,5 +1860,294 @@ mod tests {
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), "lowercase_value");
         });
+    }
+
+    // ===================================================================
+    // Story 6.3: NotifyConfig with destinations tests
+    // ===================================================================
+
+    #[test]
+    fn notify_config_parses_with_destinations() {
+        let yaml = r#"
+            template: custom_alert
+            destinations:
+              - mattermost-infra
+              - mattermost-ops
+        "#;
+        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.template, Some("custom_alert".to_string()));
+        assert!(config.destinations.is_some());
+        let destinations = config.destinations.unwrap();
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(destinations[0], "mattermost-infra");
+        assert_eq!(destinations[1], "mattermost-ops");
+    }
+
+    #[test]
+    fn notify_config_parses_without_destinations_for_backward_compat() {
+        let yaml = r#"
+            template: default_alert
+            channel: alerts
+        "#;
+        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.template, Some("default_alert".to_string()));
+        assert_eq!(config.channel, Some("alerts".to_string()));
+        assert!(config.destinations.is_none());
+    }
+
+    #[test]
+    fn notify_config_parses_with_single_destination() {
+        let yaml = r#"
+            destinations:
+              - mattermost-infra
+        "#;
+        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.destinations.is_some());
+        let destinations = config.destinations.unwrap();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0], "mattermost-infra");
+    }
+
+    #[test]
+    fn notify_config_parses_empty_destinations_as_empty_vec() {
+        let yaml = r#"
+            destinations: []
+        "#;
+        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.destinations.is_some());
+        let destinations = config.destinations.unwrap();
+        assert!(destinations.is_empty());
+    }
+
+    #[test]
+    fn notify_config_default_is_all_none() {
+        let yaml = "{}";
+        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.template.is_none());
+        assert!(config.channel.is_none());
+        assert!(config.destinations.is_none());
+    }
+
+    // ===================================================================
+    // Story 6.3: RuntimeConfig destination validation tests
+    // ===================================================================
+
+    fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> RuntimeConfig {
+        use std::collections::HashMap;
+
+        RuntimeConfig {
+            victorialogs: VictoriaLogsConfig {
+                url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+            defaults: DefaultsConfig {
+                throttle: ThrottleConfig {
+                    key: None,
+                    count: 5,
+                    window: Duration::from_secs(60),
+                },
+                notify: NotifyDefaults {
+                    template: "default".to_string(),
+                },
+            },
+            templates: {
+                let mut t = HashMap::new();
+                t.insert(
+                    "default".to_string(),
+                    CompiledTemplate {
+                        title: "{{ title }}".to_string(),
+                        body: "{{ body }}".to_string(),
+                        color: None,
+                        icon: None,
+                    },
+                );
+                t
+            },
+            rules: vec![CompiledRule {
+                name: "test_rule".to_string(),
+                enabled: true,
+                query: "test".to_string(),
+                parser: CompiledParser {
+                    regex: None,
+                    json: None,
+                },
+                throttle: None,
+                notify: Some(NotifyConfig {
+                    template: None,
+                    channel: None,
+                    destinations,
+                }),
+            }],
+            metrics: MetricsConfig::default(),
+            notifiers: Some(HashMap::new()), // Notifiers section exists
+            mattermost_webhook: None,
+        }
+    }
+
+    #[test]
+    fn collect_rule_destinations_returns_configured_destinations() {
+        let config = make_runtime_config_with_destinations(Some(vec![
+            "mattermost-infra".to_string(),
+            "mattermost-ops".to_string(),
+        ]));
+
+        let destinations = config.collect_rule_destinations();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].0, "test_rule");
+        assert_eq!(destinations[0].1, &["mattermost-infra", "mattermost-ops"]);
+    }
+
+    #[test]
+    fn collect_rule_destinations_skips_rules_without_destinations() {
+        let config = make_runtime_config_with_destinations(None);
+
+        let destinations = config.collect_rule_destinations();
+        assert!(destinations.is_empty());
+    }
+
+    #[test]
+    fn collect_rule_destinations_skips_empty_destinations() {
+        let config = make_runtime_config_with_destinations(Some(vec![]));
+
+        let destinations = config.collect_rule_destinations();
+        assert!(destinations.is_empty());
+    }
+
+    #[test]
+    fn validate_rule_destinations_passes_for_valid_destinations() {
+        let config = make_runtime_config_with_destinations(Some(vec![
+            "notifier-a".to_string(),
+            "notifier-b".to_string(),
+        ]));
+
+        let valid_notifiers = vec!["notifier-a", "notifier-b", "notifier-c"];
+        let result = config.validate_rule_destinations(&valid_notifiers);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rule_destinations_fails_for_unknown_destination() {
+        let config = make_runtime_config_with_destinations(Some(vec![
+            "notifier-a".to_string(),
+            "unknown-notifier".to_string(),
+        ]));
+
+        let valid_notifiers = vec!["notifier-a", "notifier-b"];
+        let result = config.validate_rule_destinations(&valid_notifiers);
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        let msg = errors[0].to_string();
+        assert!(msg.contains("test_rule"));
+        assert!(msg.contains("unknown-notifier"));
+    }
+
+    #[test]
+    fn validate_rule_destinations_fails_for_empty_destinations_when_notifiers_configured() {
+        let config = make_runtime_config_with_destinations(Some(vec![]));
+
+        let valid_notifiers = vec!["notifier-a"];
+        let result = config.validate_rule_destinations(&valid_notifiers);
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        let msg = errors[0].to_string();
+        assert!(msg.contains("test_rule"));
+        assert!(msg.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_rule_destinations_passes_for_none_destinations_backward_compat() {
+        let config = make_runtime_config_with_destinations(None);
+
+        let valid_notifiers = vec!["notifier-a"];
+        let result = config.validate_rule_destinations(&valid_notifiers);
+
+        // None destinations should be allowed for backward compatibility
+        // (will use default notifier at runtime)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rule_destinations_collects_all_errors() {
+        use std::collections::HashMap;
+
+        let config = RuntimeConfig {
+            victorialogs: VictoriaLogsConfig {
+                url: "http://localhost:9428".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+            defaults: DefaultsConfig {
+                throttle: ThrottleConfig {
+                    key: None,
+                    count: 5,
+                    window: Duration::from_secs(60),
+                },
+                notify: NotifyDefaults {
+                    template: "default".to_string(),
+                },
+            },
+            templates: {
+                let mut t = HashMap::new();
+                t.insert(
+                    "default".to_string(),
+                    CompiledTemplate {
+                        title: "{{ title }}".to_string(),
+                        body: "{{ body }}".to_string(),
+                        color: None,
+                        icon: None,
+                    },
+                );
+                t
+            },
+            rules: vec![
+                CompiledRule {
+                    name: "rule_1".to_string(),
+                    enabled: true,
+                    query: "test".to_string(),
+                    parser: CompiledParser { regex: None, json: None },
+                    throttle: None,
+                    notify: Some(NotifyConfig {
+                        template: None,
+                        channel: None,
+                        destinations: Some(vec!["unknown-1".to_string()]),
+                    }),
+                },
+                CompiledRule {
+                    name: "rule_2".to_string(),
+                    enabled: true,
+                    query: "test".to_string(),
+                    parser: CompiledParser { regex: None, json: None },
+                    throttle: None,
+                    notify: Some(NotifyConfig {
+                        template: None,
+                        channel: None,
+                        destinations: Some(vec!["unknown-2".to_string()]),
+                    }),
+                },
+            ],
+            metrics: MetricsConfig::default(),
+            notifiers: Some(HashMap::new()),
+            mattermost_webhook: None,
+        };
+
+        let valid_notifiers = vec!["valid-notifier"];
+        let result = config.validate_rule_destinations(&valid_notifiers);
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        // Should have 2 errors - one for each rule with unknown destination
+        assert_eq!(errors.len(), 2, "Should collect all destination errors");
     }
 }

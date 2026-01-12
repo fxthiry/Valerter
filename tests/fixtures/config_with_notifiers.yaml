@@ -40,3 +40,16 @@ rules:
     parser:
       json:
         fields: ["message"]
+
+  # Story 6.3: Rule with multi-destination routing
+  - name: "test_multi_destination"
+    enabled: true
+    query: '_stream:{app="critical"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - mattermost-infra
+        - mattermost-ops

@@ -237,6 +237,20 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
         &runtime_config,
         http_client.clone(),
     )?;
+
+    // Validate rule destinations against registry (Story 6.3: fail-fast at startup)
+    let valid_notifiers: Vec<&str> = registry.names().collect();
+    if let Err(errors) = runtime_config.validate_rule_destinations(&valid_notifiers) {
+        for e in &errors {
+            error!(error = %e, "Destination validation error");
+        }
+        return Err(anyhow::anyhow!(
+            "Destination validation failed: {} errors",
+            errors.len()
+        ));
+    }
+    info!("All rule destinations validated successfully");
+
     let registry = Arc::new(registry);
 
     // Create notification worker with registry
