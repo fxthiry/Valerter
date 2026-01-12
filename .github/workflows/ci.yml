@@ -64,7 +64,8 @@ jobs:
         run: cargo install cargo-tarpaulin
       - name: Generate coverage report
         # Exclude SMTP integration tests (tested in 'test' job) to avoid tarpaulin timeout
-        run: cargo tarpaulin --out xml --output-dir coverage --exclude-files 'tests/smtp_integration.rs'
+        # Timeout increased to 120s for slower integration tests
+        run: cargo tarpaulin --timeout 120 --out xml --output-dir coverage --exclude-files 'tests/smtp_integration.rs'
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
