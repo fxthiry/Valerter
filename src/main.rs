@@ -10,10 +10,13 @@ use tracing::{error, info};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
+use std::sync::Arc;
+
 use valerter::cli::{Cli, LogFormat};
 use valerter::config::Config;
 use valerter::{
-    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, RuleEngine,
+    DEFAULT_QUEUE_CAPACITY, MattermostNotifier, MetricsServer, NotificationQueue,
+    NotificationWorker, NotifierRegistry, RuleEngine,
 };
 
 /// Initialize the tracing subscriber with the specified log format.
@@ -149,8 +152,25 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create notification queue (FR32: capacity 100)
     let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
 
-    // Create notification worker
-    let mut worker = NotificationWorker::new(&queue, http_client.clone());
+    // Create notifier registry with default Mattermost notifier (AC5: backward compatibility)
+    let mut registry = NotifierRegistry::new();
+    if runtime_config.mattermost_webhook.is_some() {
+        let mattermost = MattermostNotifier::new("default".to_string(), http_client.clone());
+        registry
+            .register(Arc::new(mattermost))
+            .expect("Failed to register default notifier");
+        info!("Registered default Mattermost notifier");
+    }
+
+    // Fail-fast validation: ensure at least one notifier is registered (AC4)
+    if registry.is_empty() {
+        error!("No notifiers configured. Set MATTERMOST_WEBHOOK environment variable.");
+        std::process::exit(1);
+    }
+    let registry = Arc::new(registry);
+
+    // Create notification worker with registry
+    let mut worker = NotificationWorker::new(&queue, registry.clone(), "default".to_string());
 
     // Create cancellation token for graceful shutdown
     let cancel = CancellationToken::new();

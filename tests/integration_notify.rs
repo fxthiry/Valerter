@@ -2,8 +2,9 @@
 //!
 //! Uses wiremock to simulate Mattermost webhook endpoints.
 
+use std::sync::Arc;
 use std::time::Duration;
-use valerter::notify::{AlertPayload, NotificationQueue, NotificationWorker};
+use valerter::notify::{AlertPayload, MattermostNotifier, NotificationQueue, NotificationWorker, NotifierRegistry};
 use valerter::template::RenderedMessage;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -28,6 +29,14 @@ fn make_client() -> reqwest::Client {
         .expect("Failed to create client")
 }
 
+/// Create a test registry with a default Mattermost notifier.
+fn make_test_registry(client: reqwest::Client) -> Arc<NotifierRegistry> {
+    let mut registry = NotifierRegistry::new();
+    let notifier = MattermostNotifier::new("default".to_string(), client);
+    registry.register(Arc::new(notifier)).unwrap();
+    Arc::new(registry)
+}
+
 // ============================================================================
 // Task 4.1: Test envoi reussi au premier essai
 // ============================================================================
@@ -45,7 +54,8 @@ async fn test_send_success_first_attempt() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/test-webhook", mock_server.uri());
     let payload = make_payload("test_rule", &webhook_url);
@@ -74,7 +84,6 @@ async fn test_send_success_first_attempt() {
 
 #[tokio::test]
 async fn test_retry_on_server_error_then_success() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let mock_server = MockServer::start().await;
@@ -101,7 +110,8 @@ async fn test_retry_on_server_error_then_success() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/retry-test", mock_server.uri());
     let payload = make_payload("retry_rule", &webhook_url);
@@ -142,7 +152,8 @@ async fn test_failure_after_max_retries() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/always-fail", mock_server.uri());
     let payload = make_payload("fail_rule", &webhook_url);
@@ -191,7 +202,8 @@ async fn test_mattermost_payload_format() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/format-test", mock_server.uri());
     let payload = make_payload("format_rule", &webhook_url);
@@ -231,7 +243,8 @@ async fn test_client_error_no_retry() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/bad-request", mock_server.uri());
     let payload = make_payload("bad_rule", &webhook_url);
@@ -270,7 +283,8 @@ async fn test_forbidden_no_retry() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/forbidden", mock_server.uri());
     let payload = make_payload("forbidden_rule", &webhook_url);
@@ -308,7 +322,8 @@ async fn test_multiple_alerts_processed() {
 
     let queue = NotificationQueue::new(10);
     let client = make_client();
-    let mut worker = NotificationWorker::new(&queue, client);
+    let registry = make_test_registry(client);
+    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
 
     let webhook_url = format!("{}/hooks/multi", mock_server.uri());
 

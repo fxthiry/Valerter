@@ -17,7 +17,10 @@ pub mod throttle;
 pub use cli::LogFormat;
 pub use engine::RuleEngine;
 pub use metrics::{MetricsServer, register_metric_descriptions};
-pub use notify::{AlertPayload, DEFAULT_QUEUE_CAPACITY, NotificationQueue, NotificationWorker};
+pub use notify::{
+    backoff_delay, AlertPayload, MattermostNotifier, Notifier, NotificationQueue,
+    NotificationWorker, NotifierRegistry, DEFAULT_QUEUE_CAPACITY,
+};
 pub use parser::{RuleParser, record_parse_error};
 pub use stream_buffer::StreamBuffer;
 pub use template::{RenderedMessage, TemplateEngine};

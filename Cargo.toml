@@ -37,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
+# Async Traits
+async-trait = "0.1"
+
 # Error Handling
 thiserror = "2.0"
 anyhow = "1.0"

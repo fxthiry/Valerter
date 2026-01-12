@@ -87,10 +87,10 @@ impl TailClient {
         let mut builder = Client::builder();
 
         // Configure TLS verification (AC #6, #7)
-        if let Some(ref tls) = config.tls {
-            if !tls.verify {
-                builder = builder.danger_accept_invalid_certs(true);
-            }
+        if let Some(ref tls) = config.tls
+            && !tls.verify
+        {
+            builder = builder.danger_accept_invalid_certs(true);
         }
 
         let client = builder
