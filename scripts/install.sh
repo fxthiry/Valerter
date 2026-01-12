@@ -69,40 +69,19 @@ if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
         echo "Copying example configuration..."
         cp "$SCRIPT_DIR/config.example.yaml" "$CONFIG_DIR/config.yaml"
         chown "$USER:$GROUP" "$CONFIG_DIR/config.yaml"
-        chmod 640 "$CONFIG_DIR/config.yaml"
+        chmod 600 "$CONFIG_DIR/config.yaml"
     elif [[ -f "$PROJECT_DIR/config/config.example.yaml" ]]; then
         # Development: config is in project config/ directory
         echo "Copying example configuration..."
         cp "$PROJECT_DIR/config/config.example.yaml" "$CONFIG_DIR/config.yaml"
         chown "$USER:$GROUP" "$CONFIG_DIR/config.yaml"
-        chmod 640 "$CONFIG_DIR/config.yaml"
+        chmod 600 "$CONFIG_DIR/config.yaml"
     else
         printf "${YELLOW}Warning: config.example.yaml not found, skipping config copy${NC}\n"
     fi
 fi
 
-# 5. Create environment file template
-if [[ ! -f "$CONFIG_DIR/environment" ]]; then
-    echo "Creating environment file template..."
-    cat > "$CONFIG_DIR/environment" <<EOF
-# Valerter environment variables
-# Set your Mattermost webhook URL here (required)
-MATTERMOST_WEBHOOK=
-
-# Optional: VictoriaLogs auth token
-# VL_AUTH_TOKEN=
-
-# Log level (debug, info, warn, error)
-# RUST_LOG=info
-
-# Log format (text, json)
-# LOG_FORMAT=text
-EOF
-    chown "$USER:$GROUP" "$CONFIG_DIR/environment"
-    chmod 600 "$CONFIG_DIR/environment"
-fi
-
-# 6. Install systemd unit
+# 5. Install systemd unit
 echo "Installing systemd unit..."
 # Check multiple locations: release archive (same dir), or project structure
 if [[ -f "$SCRIPT_DIR/valerter.service" ]]; then
@@ -115,7 +94,7 @@ else
 fi
 systemctl daemon-reload
 
-# 7. Enable service
+# 6. Enable service
 echo "Enabling valerter service..."
 systemctl enable valerter
 
@@ -123,8 +102,7 @@ echo ""
 printf "${GREEN}Installation complete!${NC}\n"
 echo ""
 printf "${YELLOW}Post-installation steps:${NC}\n"
-echo "1. Edit /etc/valerter/config.yaml with your VictoriaLogs URL and alert rules"
-echo "2. Edit /etc/valerter/environment and set MATTERMOST_WEBHOOK"
-echo "3. Start the service: systemctl start valerter"
-echo "4. Check status: systemctl status valerter"
-echo "5. View logs: journalctl -u valerter -f"
+echo "1. Edit /etc/valerter/config.yaml with your VictoriaLogs URL, notifiers, and alert rules"
+echo "2. Start the service: systemctl start valerter"
+echo "3. Check status: systemctl status valerter"
+echo "4. View logs: journalctl -u valerter -f"

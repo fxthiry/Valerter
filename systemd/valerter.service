@@ -9,9 +9,6 @@ User=valerter
 Group=valerter
 ExecStart=/usr/local/bin/valerter -c /etc/valerter/config.yaml
 
-# Environment - webhook from file for security
-EnvironmentFile=-/etc/valerter/environment
-
 # Restart on failure with backoff
 Restart=on-failure
 RestartSec=5

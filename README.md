@@ -81,12 +81,20 @@ Minimal configuration to get started:
 victorialogs:
   url: "http://victorialogs:9428"
 
+# Define where to send alerts (recommended: direct value)
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
+
 defaults:
   throttle:
     count: 5
     window: 60s
   notify:
     template: "default_alert"
+    destinations:
+      - mattermost-ops
 
 templates:
   default_alert:
@@ -100,7 +108,7 @@ rules:
       regex: '(?P<message>.*)'
 ```
 
-This sends alerts to `MATTERMOST_WEBHOOK` environment variable (legacy mode).
+This example uses a direct webhook URL (recommended). See [Secrets Management](#secrets-management) for alternatives.
 
 ### Full Example
 
@@ -119,11 +127,12 @@ metrics:
   port: 9090
 
 # Notifiers - define named notification channels
+# Put secrets directly here (file is chmod 600) or use ${VAR} for orchestrators
 notifiers:
-  # Mattermost notifier
+  # Mattermost notifier (direct value - recommended)
   mattermost-ops:
     type: mattermost
-    webhook_url: "${MATTERMOST_WEBHOOK}"
+    webhook_url: "https://mattermost.example.com/hooks/abc123def456"
     channel: ops-alerts
 
   # Generic webhook (e.g., PagerDuty, Slack)
@@ -207,9 +216,11 @@ Valerter supports three notifier types:
 
 **Email:** Send alerts via SMTP with TLS support (none, starttls, tls).
 
-### Environment Variables
+### Secrets Management
 
-Use `${VAR_NAME}` syntax in config for secrets:
+**Recommended:** Put all values (including secrets) directly in `/etc/valerter/config.yaml`. The file is secured with `chmod 600` (owner read/write only).
+
+**Alternative (Kubernetes/Orchestrators):** Use `${VAR_NAME}` syntax in config for secrets that are injected as environment variables.
 
 | Variable | Description |
 |----------|-------------|
@@ -312,11 +323,10 @@ journalctl -u valerter -f
 journalctl -u valerter -n 100
 ```
 
-### Configuration
+### Post-Installation
 
 1. Edit configuration: `sudo vim /etc/valerter/config.yaml`
-2. Set environment variables: `sudo vim /etc/valerter/environment`
-3. Restart service: `sudo systemctl restart valerter`
+2. Restart service: `sudo systemctl restart valerter`
 
 ## Contributing
 

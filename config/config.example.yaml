@@ -3,11 +3,28 @@
 # ==============================================================================
 # Copy to /etc/valerter/config.yaml and customize
 #
-# Environment variable substitution: Use ${VAR_NAME} syntax for secrets.
-# Variables are resolved at startup from the process environment.
-#
 # Quick Start: Uncomment and configure sections as needed.
 # Minimal config requires: victorialogs.url, defaults, templates, rules
+# ==============================================================================
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ CONFIGURATION APPROACHES                                                    │
+# ├─────────────────────────────────────────────────────────────────────────────┤
+# │                                                                             │
+# │ ► RECOMMENDED (Simple deployments):                                         │
+# │   Put all values directly in this file, including secrets.                  │
+# │   Secure with: chmod 600 /etc/valerter/config.yaml                          │
+# │                                                                             │
+# │   webhook_url: "https://mattermost.example.com/hooks/abc123"                │
+# │                                                                             │
+# │ ► ALTERNATIVE (Kubernetes / Orchestrators):                                 │
+# │   Use ${VAR_NAME} syntax for secrets. Variables are resolved at startup     │
+# │   from the process environment (env vars, ConfigMaps, Secrets).             │
+# │                                                                             │
+# │   webhook_url: "${MATTERMOST_WEBHOOK}"                                      │
+# │                                                                             │
+# │ Both approaches can be mixed in the same config file.                       │
+# └─────────────────────────────────────────────────────────────────────────────┘
 # ==============================================================================
 
 # ==============================================================================
@@ -67,7 +84,8 @@ metrics:
 #
 #   mattermost-ops:
 #     type: mattermost
-#     webhook_url: "${MATTERMOST_WEBHOOK}"   # REQUIRED - Use env var for secret
+#     webhook_url: "https://mattermost.example.com/hooks/abc123"  # REQUIRED - direct value (recommended)
+#     # OR: webhook_url: "${MATTERMOST_WEBHOOK}"                  # Alternative: env var for orchestrators
 #     channel: ops-alerts                     # Optional: override default channel
 #     username: valerter                      # Optional: webhook username
 #     icon_url: "https://example.com/icon.png"  # Optional: webhook icon
@@ -75,7 +93,7 @@ metrics:
 #   # Minimal mattermost config (only webhook_url is required)
 #   mattermost-minimal:
 #     type: mattermost
-#     webhook_url: "${MATTERMOST_WEBHOOK}"
+#     webhook_url: "https://mattermost.example.com/hooks/xyz789"
 #
 #   # --------------------------------------------------------------------------
 #   # Webhook Notifier (Generic HTTP)
