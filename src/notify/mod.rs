@@ -299,8 +299,9 @@ pub struct AlertPayload {
     pub message: RenderedMessage,
     /// Rule name for tracing and metrics.
     pub rule_name: String,
-    /// Webhook URL to send the notification to.
-    pub webhook_url: String,
+    /// Notification destinations (notifier names).
+    /// If empty, uses the default notifier.
+    pub destinations: Vec<String>,
 }
 
 // =============================================================================
@@ -455,6 +456,10 @@ impl NotificationWorker {
     }
 
     /// Process a single alert payload.
+    ///
+    /// Implements fan-out routing (Story 6.3):
+    /// - If destinations is empty, sends to default notifier
+    /// - Otherwise, sends to ALL specified destinations in parallel (AC #2)
     async fn process_alert(&self, payload: AlertPayload) {
         let span = tracing::info_span!(
             "process_notification",
@@ -462,27 +467,76 @@ impl NotificationWorker {
         );
         let _guard = span.enter();
 
-        tracing::debug!("Processing alert");
-
-        // Use default notifier for now (future: multi-destination routing)
-        let notifier = match self.registry.get(&self.default_notifier) {
-            Some(n) => n,
-            None => {
-                tracing::error!(
-                    notifier = %self.default_notifier,
-                    "Default notifier not found in registry"
-                );
-                return;
-            }
+        // Determine which destinations to use (Story 6.3)
+        let destinations: Vec<&str> = if payload.destinations.is_empty() {
+            // Backward compatibility: use default notifier
+            vec![&self.default_notifier]
+        } else {
+            // Use configured destinations
+            payload.destinations.iter().map(String::as_str).collect()
         };
 
-        // Pattern Log+Continue: never panic on error
-        if let Err(e) = notifier.send(&payload).await {
-            tracing::error!(
-                error = %e,
-                notifier = %notifier.name(),
-                "Failed to send notification after all retries"
-            );
+        tracing::debug!(
+            destination_count = destinations.len(),
+            destinations = ?destinations,
+            "Processing alert with fan-out"
+        );
+
+        // AC #2: Send to all destinations in PARALLEL
+        // AC #7: each destination failure is independent
+        let futures: Vec<_> = destinations
+            .iter()
+            .filter_map(|dest_name| {
+                match self.registry.get(dest_name) {
+                    Some(notifier) => Some((dest_name.to_string(), notifier, payload.clone())),
+                    None => {
+                        // Should never happen if validation passed at startup
+                        tracing::error!(
+                            notifier = %dest_name,
+                            rule_name = %payload.rule_name,
+                            "Notifier not found in registry (validation should have caught this)"
+                        );
+                        metrics::counter!(
+                            "valerter_notify_errors_total",
+                            "notifier_name" => dest_name.to_string(),
+                            "notifier_type" => "unknown",
+                            "rule_name" => payload.rule_name.clone()
+                        )
+                        .increment(1);
+                        None
+                    }
+                }
+            })
+            .map(|(dest_name, notifier, payload)| async move {
+                let result = notifier.send(&payload).await;
+                (dest_name, notifier.name().to_string(), result)
+            })
+            .collect();
+
+        // Execute all sends in parallel and collect results
+        let results = futures_util::future::join_all(futures).await;
+
+        // Log results (AC #7: each result logged independently)
+        for (dest_name, notifier_name, result) in results {
+            match result {
+                Ok(()) => {
+                    tracing::debug!(
+                        notifier = %notifier_name,
+                        rule_name = %payload.rule_name,
+                        "Notification sent successfully"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        notifier = %notifier_name,
+                        destination = %dest_name,
+                        rule_name = %payload.rule_name,
+                        "Failed to send notification after all retries"
+                    );
+                    // Metrics are already recorded in the notifier implementation
+                }
+            }
         }
     }
 }
@@ -530,7 +584,20 @@ mod tests {
                 icon: None,
             },
             rule_name: rule_name.to_string(),
-            webhook_url: "https://mattermost.example.com/hooks/xxx".to_string(),
+            destinations: vec![], // Uses default notifier
+        }
+    }
+
+    fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
+        AlertPayload {
+            message: RenderedMessage {
+                title: format!("Alert from {}", rule_name),
+                body: "Test body".to_string(),
+                color: Some("#ff0000".to_string()),
+                icon: None,
+            },
+            rule_name: rule_name.to_string(),
+            destinations,
         }
     }
 
@@ -964,12 +1031,13 @@ mod tests {
                 icon: Some(":warning:".to_string()),
             },
             rule_name: "my_rule".to_string(),
-            webhook_url: "https://example.com/hook".to_string(),
+            destinations: vec!["mattermost-infra".to_string()],
         };
 
         let cloned = payload.clone();
         assert_eq!(cloned.rule_name, payload.rule_name);
         assert_eq!(cloned.message.title, payload.message.title);
+        assert_eq!(cloned.destinations, payload.destinations);
     }
 
     #[test]
@@ -1007,5 +1075,26 @@ mod tests {
 
         let msg2 = rx.recv().await.unwrap();
         assert_eq!(msg2.rule_name, "rule_2");
+    }
+
+    // ===================================================================
+    // Story 6.3: Fan-out routing tests
+    // ===================================================================
+
+    #[test]
+    fn alert_payload_with_empty_destinations_uses_default() {
+        let payload = make_payload("test_rule");
+        assert!(payload.destinations.is_empty());
+    }
+
+    #[test]
+    fn alert_payload_with_destinations() {
+        let payload = make_payload_with_destinations(
+            "test_rule",
+            vec!["dest-a".to_string(), "dest-b".to_string()],
+        );
+        assert_eq!(payload.destinations.len(), 2);
+        assert_eq!(payload.destinations[0], "dest-a");
+        assert_eq!(payload.destinations[1], "dest-b");
     }
 }

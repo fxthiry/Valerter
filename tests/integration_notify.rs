@@ -19,7 +19,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
             icon: None,
         },
         rule_name: rule_name.to_string(),
-        webhook_url: "unused".to_string(), // Webhook URL is now in the notifier
+        destinations: vec![], // Empty = use default notifier (Story 6.3)
     }
 }
 
@@ -310,4 +310,160 @@ async fn test_multiple_messages_in_sequence() {
     worker_handle.await.unwrap();
 
     mock_server.verify().await;
+}
+
+// ============================================================================
+// Story 6.3: Test fan-out to multiple destinations in parallel
+// ============================================================================
+
+fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
+    AlertPayload {
+        message: RenderedMessage {
+            title: format!("Alert from {}", rule_name),
+            body: "Test body content".to_string(),
+            color: Some("#ff0000".to_string()),
+            icon: None,
+        },
+        rule_name: rule_name.to_string(),
+        destinations,
+    }
+}
+
+/// Create a test registry with multiple notifiers pointing to different mock servers.
+fn make_multi_notifier_registry(
+    client: reqwest::Client,
+    notifiers: Vec<(&str, &str)>, // (name, webhook_url)
+) -> Arc<NotifierRegistry> {
+    let mut registry = NotifierRegistry::new();
+    for (name, url) in notifiers {
+        let notifier = MattermostNotifier::new(
+            name.to_string(),
+            SecretString::new(url.to_string()),
+            client.clone(),
+        );
+        registry.register(Arc::new(notifier)).unwrap();
+    }
+    Arc::new(registry)
+}
+
+#[tokio::test]
+async fn test_fanout_to_multiple_destinations() {
+    // Create two separate mock servers to simulate different notifiers
+    let mock_server_infra = MockServer::start().await;
+    let mock_server_ops = MockServer::start().await;
+
+    // Both servers expect exactly 1 call each
+    Mock::given(method("POST"))
+        .and(path("/hooks/infra"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server_infra)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hooks/ops"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server_ops)
+        .await;
+
+    let webhook_infra = format!("{}/hooks/infra", mock_server_infra.uri());
+    let webhook_ops = format!("{}/hooks/ops", mock_server_ops.uri());
+
+    let queue = NotificationQueue::new(10);
+    let client = make_client();
+    let registry = make_multi_notifier_registry(
+        client,
+        vec![
+            ("mattermost-infra", &webhook_infra),
+            ("mattermost-ops", &webhook_ops),
+        ],
+    );
+
+    let mut worker = NotificationWorker::new(&queue, registry, "mattermost-infra".to_string());
+
+    // Send one alert with two destinations
+    let payload = make_payload_with_destinations(
+        "critical_alert",
+        vec!["mattermost-infra".to_string(), "mattermost-ops".to_string()],
+    );
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    // Give worker time to process
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cancel.cancel();
+
+    worker_handle.await.unwrap();
+
+    // Verify BOTH mock servers were called exactly once
+    mock_server_infra.verify().await;
+    mock_server_ops.verify().await;
+}
+
+#[tokio::test]
+async fn test_fanout_partial_failure_continues() {
+    // One server succeeds, one fails - both should be attempted
+    let mock_server_success = MockServer::start().await;
+    let mock_server_fail = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/hooks/success"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server_success)
+        .await;
+
+    // This one returns 500 - will fail after retries
+    Mock::given(method("POST"))
+        .and(path("/hooks/fail"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(3) // 3 retry attempts
+        .mount(&mock_server_fail)
+        .await;
+
+    let webhook_success = format!("{}/hooks/success", mock_server_success.uri());
+    let webhook_fail = format!("{}/hooks/fail", mock_server_fail.uri());
+
+    let queue = NotificationQueue::new(10);
+    let client = make_client();
+    let registry = make_multi_notifier_registry(
+        client,
+        vec![
+            ("notifier-success", &webhook_success),
+            ("notifier-fail", &webhook_fail),
+        ],
+    );
+
+    let mut worker = NotificationWorker::new(&queue, registry, "notifier-success".to_string());
+
+    // Send alert to both destinations
+    let payload = make_payload_with_destinations(
+        "partial_fail_test",
+        vec!["notifier-success".to_string(), "notifier-fail".to_string()],
+    );
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    // Wait for retries on failing server (3 attempts with backoff)
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    cancel.cancel();
+
+    worker_handle.await.unwrap();
+
+    // Both servers should have been called - failure on one doesn't stop the other
+    mock_server_success.verify().await;
+    mock_server_fail.verify().await;
 }
