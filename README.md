@@ -1,41 +1,27 @@
 # Valerter
 
-Real-time log alerting for VictoriaLogs with multi-channel notifications.
+Real-time log alerting for VictoriaLogs with full log context in notifications.
 
 ![CI](https://github.com/fxthiry/valerter/actions/workflows/ci.yml/badge.svg)
 [![codecov](https://codecov.io/gh/fxthiry/valerter/branch/main/graph/badge.svg)](https://codecov.io/gh/fxthiry/valerter)
 
 ## Features
 
-- **Streaming VictoriaLogs** - Real-time connection to `/select/logsql/tail` API
-- **YAML Alert Rules** - Declarative configuration with regex/JSON parsing
-- **Multi-Notifiers** - Mattermost, Generic Webhook, Email SMTP
-- **Multi-Destinations** - Fan-out alerts to multiple channels per rule
-- **Intelligent Throttling** - LRU cache with template key and time window
-- **Jinja2 Templating** - Formatted messages with minijinja
-- **Prometheus Metrics** - `/metrics` endpoint for monitoring
-- **Resilience** - Auto-reconnect, retry with backoff, error isolation
-- **Graceful Shutdown** - Clean stop on SIGTERM
-- **Static Binary** - Musl compilation, zero runtime dependencies
+- **Zero intrusion** - No modification to existing infrastructure required
+- **Declarative rules** - YAML configuration with regex/JSON parsing, no hardcoded logic
+- **Full log context** - Alerts include the actual log line and extracted fields, not just aggregated metrics
+- **Multi-channel notifications** - Mattermost, Email SMTP, Generic Webhook (PagerDuty, Slack, etc.)
+- **Intelligent throttling** - Avoid alert spam with configurable rate limiting per key
+- **Real-time alerting** - Less than 5 seconds from log event to notification
+- **Prometheus metrics** - Built-in `/metrics` endpoint for monitoring
 
 ## Table of Contents
 
 - [Installation](#installation)
-  - [From GitHub Releases](#from-github-releases)
-  - [From Sources](#from-sources)
 - [Configuration](#configuration)
-  - [Notifiers](#notifiers)
-  - [Environment Variables](#environment-variables)
 - [Usage](#usage)
-  - [CLI Arguments](#cli-arguments)
-  - [Common Commands](#common-commands)
 - [Prometheus Metrics](#prometheus-metrics)
 - [systemd Deployment](#systemd-deployment)
-- [Development](#development)
-  - [Prerequisites](#prerequisites)
-  - [Build](#build)
-  - [Testing](#testing)
-  - [Code Quality](#code-quality)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -293,59 +279,6 @@ journalctl -u valerter -n 100
 1. Edit configuration: `sudo vim /etc/valerter/config.yaml`
 2. Set environment variables: `sudo vim /etc/valerter/environment`
 3. Restart service: `sudo systemctl restart valerter`
-
-## Development
-
-### Prerequisites
-
-- Rust toolchain (edition 2024)
-- musl target for static builds: `rustup target add x86_64-unknown-linux-musl`
-- Docker (for SMTP integration tests)
-
-### Build
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Static binary (production)
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-### Testing
-
-```bash
-# Run unit tests
-cargo test
-
-# Run all tests including integration
-cargo test --all
-
-# Run SMTP integration tests (requires Mailhog)
-docker run -d -p 1025:1025 -p 8025:8025 mailhog/mailhog
-TEST_SMTP_HOST=localhost TEST_SMTP_PORT=1025 cargo test --ignored
-
-# Generate coverage report (target: 80%)
-cargo tarpaulin --out Html
-```
-
-**Mailhog UI:** Open http://localhost:8025 to view sent emails during testing.
-
-### Code Quality
-
-```bash
-# Format check
-cargo fmt --check
-
-# Apply formatting
-cargo fmt
-
-# Lint with clippy (warnings are errors)
-cargo clippy -- -D warnings
-```
 
 ## Contributing
 

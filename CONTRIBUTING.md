@@ -2,6 +2,17 @@
 
 Thank you for your interest in contributing to Valerter!
 
+## Technical Overview
+
+Valerter is built with these key technical choices:
+
+- **Streaming VictoriaLogs** - Real-time connection to `/select/logsql/tail` API with HTTP chunked encoding
+- **Async fan-out architecture** - Each alert rule runs as independent Tokio task, errors are isolated
+- **LRU throttling cache** - Moka cache with TTL for memory-bounded rate limiting
+- **Jinja2 templating** - Minijinja for flexible message formatting
+- **Resilience** - Auto-reconnect with exponential backoff, retry on failures
+- **Static binary** - Musl compilation for zero runtime dependencies
+
 ## Development Prerequisites
 
 - **Rust toolchain** (edition 2024) with musl target: `rustup target add x86_64-unknown-linux-musl`
