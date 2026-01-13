@@ -45,6 +45,7 @@ jobs:
           cp config/config.example.yaml release/valerter-linux-${{ matrix.arch }}/
           cd release
           tar -czvf valerter-linux-${{ matrix.arch }}.tar.gz valerter-linux-${{ matrix.arch }}
+          rm -rf valerter-linux-${{ matrix.arch }}
 
       - name: Copy Debian package to release
         run: cp target/${{ matrix.target }}/debian/*.deb release/
