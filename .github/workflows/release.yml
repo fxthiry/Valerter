@@ -33,7 +33,7 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Build Debian package
-        run: cargo deb --no-build --target ${{ matrix.target }}
+        run: cargo deb --no-build --no-strip --target ${{ matrix.target }}
 
       - name: Create archive
         run: |
