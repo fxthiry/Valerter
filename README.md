@@ -13,6 +13,21 @@
   <img src="https://img.shields.io/badge/rust-1.85+-orange.svg" alt="Rust 1.85+">
 </p>
 
+## Why Valerter?
+
+Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which evaluates queries periodically and returns aggregated statistics, Valerter provides **real-time, per-event alerting**:
+
+| | vmalert | Valerter |
+|---|---------|----------|
+| **Mode** | Periodic queries | Real-time streaming |
+| **API** | `/stats_query` | `/tail` |
+| **Alert content** | Aggregated stats ("500 errors in 5min") | **Full log line with context** |
+| **Latency** | Evaluation interval (e.g., 1min) | < 5 seconds |
+
+**Use vmalert**: "More than 100 errors in the last 5 minutes"
+
+**Use Valerter**: "Payment failed for user X: connection timeout to stripe.com"
+
 ## Features
 
 - **Zero intrusion** - No modification to existing infrastructure required
