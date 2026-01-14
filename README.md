@@ -335,6 +335,7 @@ When `metrics.enabled: true`, valerter exposes a `/metrics` endpoint on the conf
 | `valerter_last_query_timestamp` | Gauge | `rule_name` | Unix timestamp of last successful query chunk |
 | `valerter_victorialogs_up` | Gauge | `rule_name` | VictoriaLogs connection status (1=up, 0=down) |
 | `valerter_uptime_seconds` | Gauge | - | Time since valerter started |
+| `valerter_build_info` | Gauge | `version` | Build information (always 1) |
 | `valerter_query_duration_seconds` | Histogram | `rule_name` | VictoriaLogs query latency (time to first chunk) |
 
 ### Example Prometheus Alerts
