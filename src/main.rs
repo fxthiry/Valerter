@@ -256,26 +256,47 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
+    // Collect rule and notifier names for metric initialization
+    let rule_names: Vec<&str> = runtime_config
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.name.as_str())
+        .collect();
+    let notifier_names: Vec<&str> = registry.names().collect();
+
     // Start metrics server if enabled (FR37)
     let metrics_handle = if runtime_config.metrics.enabled {
-        let server = MetricsServer::new(runtime_config.metrics.port);
+        // Create a channel to signal when the recorder is ready
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = MetricsServer::with_ready_signal(runtime_config.metrics.port, ready_tx);
         let cancel_metrics = cancel.clone();
         info!(
             port = runtime_config.metrics.port,
             "Starting metrics server"
         );
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = server.run(cancel_metrics).await {
                 error!(error = %e, "Metrics server error");
             }
-        }))
+        });
+
+        // Wait for the recorder to be installed before emitting any metrics
+        // This fixes the race condition where metrics were lost if emitted
+        // before the Prometheus recorder was ready
+        if ready_rx.await.is_err() {
+            error!("Metrics recorder failed to initialize");
+            return Err(anyhow::anyhow!("Metrics recorder failed to initialize"));
+        }
+
+        // Initialize all known metrics to zero now that recorder is ready
+        valerter::initialize_metrics(&rule_names, &notifier_names);
+
+        Some(handle)
     } else {
         info!("Metrics server disabled");
         None
     };
-
-    // Set build_info metric with version label (always 1)
-    metrics::gauge!("valerter_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
 
     // Start uptime metric updater (updates every 15 seconds)
     let uptime_cancel = cancel.clone();
