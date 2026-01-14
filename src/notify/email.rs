@@ -403,12 +403,12 @@ impl EmailNotifier {
     /// Render the body template with alert context.
     ///
     /// Uses `body_html` from the template engine (already HTML-escaped) if available,
-    /// otherwise falls back to `body`. The body_html is injected with `| safe` in the
-    /// email template because HTML escaping was already done in TemplateEngine.
+    /// otherwise falls back to `body`. The body is marked as "safe" (pre-escaped) so
+    /// the template doesn't need `| safe` filter - this prevents user errors if they
+    /// edit the email template and accidentally remove the filter.
     fn render_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
         let mut env = Environment::new();
-        // HTML auto-escape for title/rule_name/etc, but body uses | safe
-        // because body_html is already escaped by TemplateEngine
+        // HTML auto-escape for title/rule_name/etc
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         env.add_template("body", &self.body_template_source)
             .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
@@ -424,9 +424,12 @@ impl EmailNotifier {
             .as_ref()
             .unwrap_or(&alert.message.body);
 
+        // Mark body as pre-escaped (safe) so template doesn't need | safe filter
+        let body_safe = minijinja::Value::from_safe_string(body_content.clone());
+
         tmpl.render(context! {
             title => &alert.message.title,
-            body => body_content,
+            body => body_safe,
             rule_name => &alert.rule_name,
             color => &alert.message.color,
             icon => &alert.message.icon,
