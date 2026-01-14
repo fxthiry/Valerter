@@ -83,6 +83,10 @@ pub fn register_metric_descriptions() {
         "valerter_uptime_seconds",
         "Time in seconds since valerter started"
     );
+    describe_gauge!(
+        "valerter_build_info",
+        "Build information with version label (always 1)"
+    );
 
     // Histograms
     describe_histogram!(

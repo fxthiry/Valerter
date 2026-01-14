@@ -274,6 +274,9 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
         None
     };
 
+    // Set build_info metric with version label (always 1)
+    metrics::gauge!("valerter_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+
     // Start uptime metric updater (updates every 15 seconds)
     let uptime_cancel = cancel.clone();
     tokio::spawn(async move {
