@@ -31,19 +31,20 @@ use minijinja::{Environment, UndefinedBehavior};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Rendered message ready for Mattermost notification.
+/// Rendered message ready for notification.
 ///
-/// Contains all fields needed to construct a Mattermost attachment.
+/// Contains all fields needed to construct a Mattermost attachment or email.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedMessage {
     /// Title of the message (attachment fallback and title).
     pub title: String,
-    /// Body text of the message (attachment text).
+    /// Body text of the message (attachment text for Mattermost).
     pub body: String,
-    /// Optional hex color for the attachment (e.g., "#ff0000").
-    pub color: Option<String>,
-    /// Optional icon for the message (emoji or URL).
-    pub icon: Option<String>,
+    /// Optional HTML body for email notifications (rendered with HTML auto-escape).
+    pub body_html: Option<String>,
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    /// Used for email colored dot and Mattermost sidebar color.
+    pub accent_color: Option<String>,
 }
 
 /// Template engine for rendering messages with Jinja2 syntax.
@@ -58,6 +59,8 @@ pub struct RenderedMessage {
 pub struct TemplateEngine {
     /// Pre-created Jinja environment (created once, reused for performance).
     env: Environment<'static>,
+    /// Pre-created Jinja environment with HTML auto-escape (for body_html rendering).
+    html_env: Environment<'static>,
     /// Compiled templates indexed by name.
     templates: HashMap<String, CompiledTemplate>,
 }
@@ -84,7 +87,16 @@ impl TemplateEngine {
         // This returns empty string instead of erroring on undefined variables
         env.set_undefined_behavior(UndefinedBehavior::Lenient);
 
-        Self { env, templates }
+        // Pre-create HTML environment for body_html rendering (performance optimization)
+        let mut html_env = Environment::new();
+        html_env.set_undefined_behavior(UndefinedBehavior::Lenient);
+        html_env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+
+        Self {
+            env,
+            html_env,
+            templates,
+        }
     }
 
     /// Render a template with the given fields.
@@ -123,19 +135,40 @@ impl TemplateEngine {
         let title = self.render_string(&template.title, fields)?;
         let body = self.render_string(&template.body, fields)?;
 
-        // Color and icon are passed through (no template rendering)
-        // They are static values from config
+        // Render body_html with HTML auto-escape if present
+        let body_html = if let Some(body_html_template) = &template.body_html {
+            Some(self.render_string_html_escaped(body_html_template, fields)?)
+        } else {
+            None
+        };
+
+        // accent_color is passed through (no template rendering)
+        // It is a static value from config
         Ok(RenderedMessage {
             title,
             body,
-            color: template.color.clone(),
-            icon: template.icon.clone(),
+            body_html,
+            accent_color: template.accent_color.clone(),
         })
     }
 
-    /// Render a single template string with fields.
+    /// Render a single template string with fields (no auto-escape).
     fn render_string(&self, template_str: &str, fields: &Value) -> Result<String, TemplateError> {
         self.env
+            .render_str(template_str, fields)
+            .map_err(|e| TemplateError::RenderFailed {
+                message: e.to_string(),
+            })
+    }
+
+    /// Render a single template string with HTML auto-escape for security.
+    /// Used for body_html to prevent XSS from log data injected into emails.
+    fn render_string_html_escaped(
+        &self,
+        template_str: &str,
+        fields: &Value,
+    ) -> Result<String, TemplateError> {
+        self.html_env
             .render_str(template_str, fields)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
@@ -179,8 +212,8 @@ impl TemplateEngine {
                 RenderedMessage {
                     title: format!("[{}] Alert", rule_name),
                     body: format!("Template render failed: {}\n\nCheck logs for details.", e),
-                    color: Some("#ff0000".to_string()), // Red for error
-                    icon: None,
+                    body_html: None,
+                    accent_color: Some("#ff0000".to_string()), // Red for error
                 }
             }
         }
@@ -205,22 +238,21 @@ mod tests {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
-            color: None,
-            icon: None,
+            body_html: None,
+            accent_color: None,
         }
     }
 
-    fn make_template_with_style(
+    fn make_template_with_accent_color(
         title: &str,
         body: &str,
-        color: Option<&str>,
-        icon: Option<&str>,
+        accent_color: Option<&str>,
     ) -> CompiledTemplate {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
-            color: color.map(String::from),
-            icon: icon.map(String::from),
+            body_html: None,
+            accent_color: accent_color.map(String::from),
         }
     }
 
@@ -334,7 +366,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 5.5: Test rendu template avec tous les champs (title, body, color, icon)
+    // Task 5.5: Test rendu template avec tous les champs (title, body, accent_color)
     // ===================================================================
 
     #[test]
@@ -342,12 +374,7 @@ mod tests {
         let mut templates = HashMap::new();
         templates.insert(
             "full_alert".to_string(),
-            make_template_with_style(
-                "{{ title }}",
-                "{{ body }}",
-                Some("#ff0000"),
-                Some(":warning:"),
-            ),
+            make_template_with_accent_color("{{ title }}", "{{ body }}", Some("#ff0000")),
         );
 
         let engine = TemplateEngine::new(templates);
@@ -360,8 +387,7 @@ mod tests {
 
         assert_eq!(result.title, "Critical Alert");
         assert_eq!(result.body, "Something went wrong");
-        assert_eq!(result.color, Some("#ff0000".to_string()));
-        assert_eq!(result.icon, Some(":warning:".to_string()));
+        assert_eq!(result.accent_color, Some("#ff0000".to_string()));
     }
 
     // ===================================================================
@@ -408,7 +434,7 @@ mod tests {
         assert!(fallback.body.contains("Check logs for details"));
         // Should NOT contain raw fields (security: avoid exposing sensitive data)
         assert!(!fallback.body.contains("server-01"));
-        assert_eq!(fallback.color, Some("#ff0000".to_string()));
+        assert_eq!(fallback.accent_color, Some("#ff0000".to_string()));
     }
 
     // ===================================================================
@@ -491,8 +517,8 @@ mod tests {
         // Should return rendered message, NOT fallback
         assert_eq!(result.title, "Alert: server-01");
         assert_eq!(result.body, "Message from server-01");
-        // No fallback color (None from template)
-        assert_eq!(result.color, None);
+        // No fallback accent_color (None from template)
+        assert_eq!(result.accent_color, None);
     }
 
     #[test]
@@ -514,15 +540,15 @@ mod tests {
         let msg1 = RenderedMessage {
             title: "Title".to_string(),
             body: "Body".to_string(),
-            color: Some("#000".to_string()),
-            icon: None,
+            body_html: None,
+            accent_color: Some("#000000".to_string()),
         };
 
         let msg2 = RenderedMessage {
             title: "Title".to_string(),
             body: "Body".to_string(),
-            color: Some("#000".to_string()),
-            icon: None,
+            body_html: None,
+            accent_color: Some("#000000".to_string()),
         };
 
         assert_eq!(msg1, msg2);
@@ -588,5 +614,91 @@ mod tests {
 
         let result = engine.render("deep", &fields).unwrap();
         assert_eq!(result.title, "deep_value");
+    }
+
+    // ===================================================================
+    // Task 9: Tests body_html rendering with HTML auto-escape
+    // ===================================================================
+
+    fn make_template_with_body_html(title: &str, body: &str, body_html: &str) -> CompiledTemplate {
+        CompiledTemplate {
+            title: title.to_string(),
+            body: body.to_string(),
+            body_html: Some(body_html.to_string()),
+            accent_color: None,
+        }
+    }
+
+    #[test]
+    fn render_body_html_is_populated() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "email_alert".to_string(),
+            make_template_with_body_html(
+                "Alert: {{ host }}",
+                "Host {{ host }} down",
+                "<p><strong>Host:</strong> {{ host }}</p>",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"host": "server-01"});
+
+        let result = engine.render("email_alert", &fields).unwrap();
+
+        assert_eq!(result.title, "Alert: server-01");
+        assert_eq!(result.body, "Host server-01 down");
+        assert!(result.body_html.is_some());
+        assert_eq!(
+            result.body_html.unwrap(),
+            "<p><strong>Host:</strong> server-01</p>"
+        );
+    }
+
+    #[test]
+    fn render_body_html_escapes_html_in_variables() {
+        // AC3: Variables with HTML should be escaped
+        let mut templates = HashMap::new();
+        templates.insert(
+            "email_alert".to_string(),
+            make_template_with_body_html("Alert", "body", "<p>Hostname: {{ hostname }}</p>"),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"hostname": "<script>alert(1)</script>"});
+
+        let result = engine.render("email_alert", &fields).unwrap();
+
+        let body_html = result.body_html.unwrap();
+        // HTML should be escaped
+        assert!(
+            body_html.contains("&lt;script&gt;"),
+            "Script tags should be escaped: {}",
+            body_html
+        );
+        assert!(
+            !body_html.contains("<script>"),
+            "Raw script tags should NOT be present: {}",
+            body_html
+        );
+    }
+
+    #[test]
+    fn render_body_html_none_when_template_has_no_body_html() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "mattermost_alert".to_string(),
+            make_template("Alert", "Body text"),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"host": "server-01"});
+
+        let result = engine.render("mattermost_alert", &fields).unwrap();
+
+        assert!(
+            result.body_html.is_none(),
+            "body_html should be None when template doesn't have it"
+        );
     }
 }

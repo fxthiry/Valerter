@@ -28,8 +28,6 @@ struct MattermostAttachment {
     title: String,
     text: String,
     footer: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    footer_icon: Option<String>,
 }
 
 /// Mattermost webhook payload structure.
@@ -58,11 +56,10 @@ fn build_mattermost_payload(
         icon_url: icon_url.map(String::from),
         attachments: vec![MattermostAttachment {
             fallback: message.title.clone(),
-            color: message.color.clone(),
+            color: message.accent_color.clone(),
             title: message.title.clone(),
             text: message.body.clone(),
             footer: format!("valerter | {}", rule_name),
-            footer_icon: message.icon.clone(),
         }],
     }
 }
@@ -290,8 +287,8 @@ mod tests {
         let message = RenderedMessage {
             title: "Test Alert".to_string(),
             body: "Something happened".to_string(),
-            color: Some("#ff0000".to_string()),
-            icon: Some(":warning:".to_string()),
+            body_html: None,
+            accent_color: Some("#ff0000".to_string()),
         };
 
         let payload = build_mattermost_payload(&message, "test_rule", None, None, None);
@@ -303,7 +300,6 @@ mod tests {
         assert_eq!(attachment.text, "Something happened");
         assert_eq!(attachment.color, Some("#ff0000".to_string()));
         assert_eq!(attachment.footer, "valerter | test_rule");
-        assert_eq!(attachment.footer_icon, Some(":warning:".to_string()));
         // Optional fields should be None
         assert!(payload.channel.is_none());
         assert!(payload.username.is_none());
@@ -315,15 +311,14 @@ mod tests {
         let message = RenderedMessage {
             title: "Simple Alert".to_string(),
             body: "Body text".to_string(),
-            color: None,
-            icon: None,
+            body_html: None,
+            accent_color: None,
         };
 
         let payload = build_mattermost_payload(&message, "simple_rule", None, None, None);
 
         let attachment = &payload.attachments[0];
         assert_eq!(attachment.color, None);
-        assert_eq!(attachment.footer_icon, None);
     }
 
     #[test]
@@ -331,8 +326,8 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            color: None,
-            icon: None,
+            body_html: None,
+            accent_color: None,
         };
 
         let payload = build_mattermost_payload(
@@ -356,8 +351,8 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            color: Some("#00ff00".to_string()),
-            icon: None,
+            body_html: None,
+            accent_color: Some("#00ff00".to_string()),
         };
 
         let payload = build_mattermost_payload(&message, "rule", None, None, None);
@@ -370,7 +365,6 @@ mod tests {
         assert!(json.contains("\"color\":\"#00ff00\""));
         assert!(json.contains("\"footer\":\"valerter | rule\""));
         // Optional fields should be omitted when None
-        assert!(!json.contains("footer_icon"));
         assert!(!json.contains("channel"));
         assert!(!json.contains("username"));
         assert!(!json.contains("icon_url"));
@@ -381,8 +375,8 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            color: None,
-            icon: None,
+            body_html: None,
+            accent_color: None,
         };
 
         let payload = build_mattermost_payload(&message, "rule", Some("alerts"), Some("bot"), None);

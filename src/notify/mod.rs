@@ -30,6 +30,7 @@ use crate::error::{ConfigError, NotifyError, QueueError};
 use crate::template::RenderedMessage;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -206,18 +207,19 @@ impl NotifierRegistry {
     /// ```ignore
     /// let config = Config::load("config.yaml")?;
     /// if let Some(notifiers_config) = config.notifiers {
-    ///     let registry = NotifierRegistry::from_config(&notifiers_config, http_client)?;
+    ///     let registry = NotifierRegistry::from_config(&notifiers_config, http_client, config_dir)?;
     /// }
     /// ```
     pub fn from_config(
         notifiers_config: &NotifiersConfig,
         http_client: reqwest::Client,
+        config_dir: &Path,
     ) -> Result<Self, Vec<ConfigError>> {
         let mut registry = NotifierRegistry::new();
         let mut errors = Vec::new();
 
         for (name, config) in notifiers_config {
-            match Self::create_notifier(name, config, &http_client) {
+            match Self::create_notifier(name, config, &http_client, config_dir) {
                 Ok(notifier) => {
                     if let Err(e) = registry.register(notifier) {
                         errors.push(e);
@@ -239,6 +241,7 @@ impl NotifierRegistry {
         name: &str,
         config: &NotifierConfig,
         http_client: &reqwest::Client,
+        config_dir: &Path,
     ) -> Result<Arc<dyn Notifier>, ConfigError> {
         match config {
             NotifierConfig::Mattermost(mm_config) => {
@@ -288,7 +291,7 @@ impl NotifierRegistry {
                 Ok(Arc::new(notifier))
             }
             NotifierConfig::Email(email_config) => {
-                let notifier = EmailNotifier::from_config(name, email_config)?;
+                let notifier = EmailNotifier::from_config(name, email_config, config_dir)?;
 
                 tracing::info!(
                     notifier_name = %name,
@@ -324,7 +327,7 @@ impl std::fmt::Debug for dyn Notifier {
 /// Must implement `Clone` as required by `broadcast::Sender`.
 #[derive(Debug, Clone)]
 pub struct AlertPayload {
-    /// Rendered message content (title, body, color, icon).
+    /// Rendered message content (title, body, accent_color).
     pub message: RenderedMessage,
     /// Rule name for tracing and metrics.
     pub rule_name: String,
@@ -604,13 +607,17 @@ pub fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
 mod tests {
     use super::*;
 
+    fn test_config_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
     fn make_payload(rule_name: &str) -> AlertPayload {
         AlertPayload {
             message: RenderedMessage {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                body_html: None,
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations: vec![], // Uses default notifier
@@ -622,8 +629,8 @@ mod tests {
             message: RenderedMessage {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                body_html: None,
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations,
@@ -844,7 +851,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -883,7 +891,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -935,7 +944,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(result.is_err());
                 let errors = result.unwrap_err();
@@ -952,7 +962,7 @@ mod tests {
     fn registry_from_config_empty_config_returns_empty_registry() {
         let notifiers_config = HashMap::new();
         let client = reqwest::Client::new();
-        let result = NotifierRegistry::from_config(&notifiers_config, client);
+        let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
         assert!(result.is_ok());
         let registry = result.unwrap();
@@ -988,7 +998,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(
                 result.is_ok(),
@@ -1022,7 +1033,7 @@ mod tests {
         );
 
         let client = reqwest::Client::new();
-        let result = NotifierRegistry::from_config(&notifiers_config, client);
+        let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
         assert!(result.is_ok());
         let registry = result.unwrap();
@@ -1057,7 +1068,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -1115,7 +1127,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -1247,8 +1260,8 @@ mod tests {
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
-                color: Some("#ff0000".to_string()),
-                icon: Some(":warning:".to_string()),
+                body_html: None,
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: "my_rule".to_string(),
             destinations: vec!["mattermost-infra".to_string()],
@@ -1324,7 +1337,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_creates_email_notifiers() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         let mut notifiers_config = HashMap::new();
         notifiers_config.insert(
@@ -1341,12 +1354,13 @@ mod tests {
                 from: "valerter@example.com".to_string(),
                 to: vec!["ops@example.com".to_string()],
                 subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-                body_format: BodyFormat::Text,
+                body_template: None,
+                body_template_file: None,
             }),
         );
 
         let client = reqwest::Client::new();
-        let result = NotifierRegistry::from_config(&notifiers_config, client);
+        let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
         assert!(result.is_ok(), "Should create email notifier: {:?}", result);
         let registry = result.unwrap();
@@ -1361,7 +1375,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_with_auth() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         temp_env::with_vars(
             [
@@ -1384,12 +1398,14 @@ mod tests {
                         from: "valerter@example.com".to_string(),
                         to: vec!["ops@example.com".to_string()],
                         subject_template: "{{ title }}".to_string(),
-                        body_format: BodyFormat::Text,
+                        body_template: None,
+                        body_template_file: None,
                     }),
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -1404,7 +1420,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_fails_on_undefined_env_var() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         temp_env::with_var("UNDEFINED_SMTP_VAR_REG", None::<&str>, || {
             let mut notifiers_config = HashMap::new();
@@ -1422,12 +1438,14 @@ mod tests {
                     from: "valerter@example.com".to_string(),
                     to: vec!["ops@example.com".to_string()],
                     subject_template: "{{ title }}".to_string(),
-                    body_format: BodyFormat::Text,
+                    body_template: None,
+                    body_template_file: None,
                 }),
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client);
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -1445,7 +1463,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_fails_on_invalid_from_address() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         let mut notifiers_config = HashMap::new();
         notifiers_config.insert(
@@ -1462,12 +1480,13 @@ mod tests {
                 from: "not-an-email".to_string(),
                 to: vec!["ops@example.com".to_string()],
                 subject_template: "{{ title }}".to_string(),
-                body_format: BodyFormat::Text,
+                body_template: None,
+                body_template_file: None,
             }),
         );
 
         let client = reqwest::Client::new();
-        let result = NotifierRegistry::from_config(&notifiers_config, client);
+        let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -1485,8 +1504,8 @@ mod tests {
     #[test]
     fn registry_from_config_all_three_notifier_types() {
         use crate::config::{
-            BodyFormat, EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig,
-            TlsMode, WebhookNotifierConfig,
+            EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig, TlsMode,
+            WebhookNotifierConfig,
         };
 
         temp_env::with_var(
@@ -1532,12 +1551,14 @@ mod tests {
                         from: "valerter@example.com".to_string(),
                         to: vec!["ops@example.com".to_string()],
                         subject_template: "{{ title }}".to_string(),
-                        body_format: BodyFormat::Text,
+                        body_template: None,
+                        body_template_file: None,
                     }),
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client);
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),

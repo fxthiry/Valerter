@@ -108,12 +108,13 @@ fn create_notifier_registry(
 
         // Create registry from config
         let registry =
-            NotifierRegistry::from_config(notifiers_config, http_client).map_err(|errors| {
-                for e in &errors {
-                    error!(error = %e, "Notifier configuration error");
-                }
-                anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
-            })?;
+            NotifierRegistry::from_config(notifiers_config, http_client, &config.config_dir)
+                .map_err(|errors| {
+                    for e in &errors {
+                        error!(error = %e, "Notifier configuration error");
+                    }
+                    anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
+                })?;
 
         // Use first notifier alphabetically as default for deterministic behavior (Fix L3)
         let default_name = registry
@@ -150,6 +151,82 @@ fn create_notifier_registry(
          - Set the MATTERMOST_WEBHOOK environment variable"
     );
     Err(anyhow::anyhow!("No notifiers configured"))
+}
+
+/// Validate that templates used with email destinations have body_html.
+///
+/// For each enabled rule, if any of its destinations is an email notifier,
+/// the template must have body_html defined. This is a fail-fast validation
+/// to prevent runtime errors.
+fn validate_email_templates(
+    config: &valerter::config::RuntimeConfig,
+    registry: &NotifierRegistry,
+    default_notifier: &str,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    for rule in &config.rules {
+        if !rule.enabled {
+            continue;
+        }
+
+        // Determine which destinations this rule uses
+        let destinations: Vec<&str> = rule
+            .notify
+            .as_ref()
+            .and_then(|n| n.destinations.as_ref())
+            .map(|d| d.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_else(|| vec![default_notifier]);
+
+        // Check if any destination is email
+        let has_email_destination = destinations.iter().any(|dest| {
+            registry
+                .get(dest)
+                .map(|n| n.notifier_type() == "email")
+                .unwrap_or(false)
+        });
+
+        if !has_email_destination {
+            continue;
+        }
+
+        // Get the template name for this rule
+        let template_name = rule
+            .notify
+            .as_ref()
+            .and_then(|n| n.template.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or(&config.defaults.notify.template);
+
+        // Check if template has body_html
+        if let Some(template) = config.templates.get(template_name)
+            && template.body_html.is_none()
+        {
+            let email_dests: Vec<_> = destinations
+                .iter()
+                .filter(|dest| {
+                    registry
+                        .get(dest)
+                        .map(|n| n.notifier_type() == "email")
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            errors.push(format!(
+                "template '{}' requires body_html field when used with email destination{} {} (rule '{}')",
+                template_name,
+                if email_dests.len() > 1 { "s" } else { "" },
+                email_dests.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
+                rule.name
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn main() -> Result<()> {
@@ -205,7 +282,7 @@ fn main() -> Result<()> {
     }
 
     // Compile configuration for runtime (FR15)
-    let runtime_config = config.compile()?;
+    let runtime_config = config.compile(&cli.config)?;
 
     info!(config_path = %cli.config.display(), "valerter starting");
 
@@ -247,6 +324,18 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
         ));
     }
     info!("All rule destinations validated successfully");
+
+    // Validate that templates used with email destinations have body_html (fail-fast)
+    if let Err(errors) = validate_email_templates(&runtime_config, &registry, &default_notifier) {
+        for e in &errors {
+            error!(error = %e, "Email template validation error");
+        }
+        return Err(anyhow::anyhow!(
+            "Email template validation failed: {} errors",
+            errors.len()
+        ));
+    }
+    info!("All email templates validated successfully");
 
     let registry = Arc::new(registry);
 

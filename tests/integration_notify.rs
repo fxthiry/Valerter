@@ -19,8 +19,8 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
-            color: Some("#ff0000".to_string()),
-            icon: None,
+            body_html: None,
+            accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
         destinations: vec![], // Empty = use default notifier (Story 6.3)
@@ -325,8 +325,8 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
-            color: Some("#ff0000".to_string()),
-            icon: None,
+            body_html: None,
+            accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
         destinations,

@@ -610,8 +610,8 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        color: None,
-                        icon: None,
+                        body_html: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -620,6 +620,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             notifiers: None,
             mattermost_webhook: None,
+            config_dir: std::path::PathBuf::from("."),
         }
     }
 
@@ -809,8 +810,8 @@ mod tests {
             CompiledTemplate {
                 title: "Alert: {{ _msg }}".to_string(),
                 body: "Log: {{ _msg }}".to_string(),
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                body_html: None,
+                accent_color: Some("#ff0000".to_string()),
             },
         );
         t

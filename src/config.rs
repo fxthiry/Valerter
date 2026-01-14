@@ -4,7 +4,7 @@
 //! parsing CLI arguments, and managing environment variables.
 
 use crate::error::ConfigError;
-use minijinja::Environment;
+use minijinja::{Environment, UndefinedBehavior};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -219,12 +219,14 @@ pub struct TemplateConfig {
     pub title: String,
     /// Body template.
     pub body: String,
-    /// Optional color for the message.
+    /// Optional HTML body template for email notifications.
+    /// If a rule sends to an email destination, this field is required.
     #[serde(default)]
-    pub color: Option<String>,
-    /// Optional icon for the message.
+    pub body_html: Option<String>,
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    /// Used for email colored dot and Mattermost sidebar color.
     #[serde(default)]
-    pub icon: Option<String>,
+    pub accent_color: Option<String>,
 }
 
 /// Alert rule configuration.
@@ -378,7 +380,15 @@ pub struct WebhookNotifierConfig {
 /// - TLS modes (none, starttls, tls)
 /// - Certificate verification options
 /// - Environment variable substitution for credentials
-/// - Custom subject templates
+/// - Custom subject and body templates (minijinja)
+///
+/// # Body Template Options
+///
+/// - `body_template`: Inline template string (mutually exclusive with body_template_file)
+/// - `body_template_file`: Path to template file (relative to config or absolute)
+/// - If neither specified: uses embedded default HTML template
+///
+/// Available template variables: `title`, `body`, `rule_name`, `accent_color`
 ///
 /// # Example YAML
 ///
@@ -396,7 +406,10 @@ pub struct WebhookNotifierConfig {
 ///     from: valerter@example.com
 ///     to: [ops@example.com, admin@example.com]
 ///     subject_template: "[{{ rule_name | upper }}] {{ title }}"
-///     body_format: text
+///     body_template: |
+///       <h1>{{ title }}</h1>
+///       <p>{{ body }}</p>
+///       <small>Rule: {{ rule_name }}</small>
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailNotifierConfig {
@@ -407,11 +420,16 @@ pub struct EmailNotifierConfig {
     /// Recipient email addresses.
     pub to: Vec<String>,
     /// Subject line template (minijinja).
-    /// Available variables: title, body, rule_name, color, icon.
+    /// Available variables: title, body, rule_name, accent_color.
     pub subject_template: String,
-    /// Body format (text or html). Defaults to text.
+    /// Body template (inline minijinja).
+    /// Available variables: title, body, rule_name, accent_color.
     #[serde(default)]
-    pub body_format: BodyFormat,
+    pub body_template: Option<String>,
+    /// Path to body template file (relative to config file or absolute).
+    /// Available variables: title, body, rule_name, accent_color.
+    #[serde(default)]
+    pub body_template_file: Option<String>,
 }
 
 /// SMTP server configuration.
@@ -448,17 +466,6 @@ pub enum TlsMode {
     Starttls,
     /// Direct TLS connection (port 465).
     Tls,
-}
-
-/// Body format for email messages.
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BodyFormat {
-    /// Plain text body.
-    #[default]
-    Text,
-    /// HTML body.
-    Html,
 }
 
 fn default_post() -> String {
@@ -529,6 +536,101 @@ pub fn resolve_env_vars(value: &str) -> Result<String, ConfigError> {
     }
 }
 
+/// Maximum size for body_template_file (1MB).
+const MAX_BODY_TEMPLATE_SIZE: u64 = 1024 * 1024;
+
+/// Resolve the body template for an email notifier.
+///
+/// Resolves the body template source based on priority:
+/// 1. `body_template_file` - read from file (relative to config_dir or absolute)
+/// 2. `body_template` - inline template string
+/// 3. `None` - use embedded default template
+///
+/// # Arguments
+///
+/// * `config` - Email notifier configuration
+/// * `config_dir` - Directory containing the config file (for relative path resolution)
+///
+/// # Returns
+///
+/// * `Ok(Some(template))` - Template content from file or inline
+/// * `Ok(None)` - No template specified, use embedded default
+/// * `Err(ConfigError)` - File not found, too large, or not UTF-8
+pub fn resolve_body_template(
+    config: &EmailNotifierConfig,
+    config_dir: &Path,
+) -> Result<Option<String>, ConfigError> {
+    // Warn if both are defined
+    if config.body_template.is_some() && config.body_template_file.is_some() {
+        tracing::warn!(
+            "both body_template and body_template_file defined, using body_template_file"
+        );
+    }
+
+    // Priority 1: body_template_file
+    if let Some(ref file_path) = config.body_template_file {
+        let path = if Path::new(file_path).is_absolute() {
+            std::path::PathBuf::from(file_path)
+        } else {
+            config_dir.join(file_path)
+        };
+
+        // Check file exists
+        if !path.exists() {
+            return Err(ConfigError::ValidationError(format!(
+                "body_template_file not found: {}",
+                path.display()
+            )));
+        }
+
+        // Check file size (F14)
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            ConfigError::ValidationError(format!(
+                "cannot read body_template_file '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        if metadata.len() > MAX_BODY_TEMPLATE_SIZE {
+            return Err(ConfigError::ValidationError(format!(
+                "body_template_file '{}' exceeds maximum size of 1MB ({} bytes)",
+                path.display(),
+                metadata.len()
+            )));
+        }
+
+        // Read file content (F8: UTF-8 validation via read_to_string)
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                ConfigError::ValidationError(format!(
+                    "body_template_file '{}' must be valid UTF-8",
+                    path.display()
+                ))
+            } else {
+                ConfigError::ValidationError(format!(
+                    "cannot read body_template_file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            }
+        })?;
+
+        tracing::debug!("body template source: file");
+        return Ok(Some(content));
+    }
+
+    // Priority 2: body_template (inline)
+    if let Some(ref template) = config.body_template {
+        tracing::debug!("body template source: inline");
+        return Ok(Some(template.clone()));
+    }
+
+    // Priority 3: None (use embedded default)
+    tracing::debug!("body template source: embedded");
+    Ok(None)
+}
+
 // ============================================================
 // RuntimeConfig - Pre-compiled configuration for runtime use
 // ============================================================
@@ -553,6 +655,8 @@ pub struct RuntimeConfig {
     pub notifiers: Option<NotifiersConfig>,
     /// Mattermost webhook URL (legacy - for backward compatibility).
     pub mattermost_webhook: Option<SecretString>,
+    /// Directory containing the config file (for relative path resolution).
+    pub config_dir: std::path::PathBuf,
 }
 
 /// Compiled alert rule with pre-compiled regex.
@@ -599,10 +703,10 @@ pub struct CompiledTemplate {
     pub title: String,
     /// Body template string.
     pub body: String,
-    /// Optional color for the message.
-    pub color: Option<String>,
-    /// Optional icon for the message.
-    pub icon: Option<String>,
+    /// Optional HTML body template string for email notifications.
+    pub body_html: Option<String>,
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    pub accent_color: Option<String>,
 }
 
 /// Default configuration file path (AD-08).
@@ -807,7 +911,7 @@ impl Config {
             });
         }
 
-        // Validate named templates
+        // Validate named templates (syntax)
         for (name, template) in &self.templates {
             if let Err(e) = validate_jinja_template(&template.title) {
                 errors.push(ConfigError::InvalidTemplate {
@@ -820,6 +924,50 @@ impl Config {
                     rule: format!("template:{}", name),
                     message: format!("body: {}", e),
                 });
+            }
+            if let Some(body_html) = &template.body_html
+                && let Err(e) = validate_jinja_template(body_html)
+            {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body_html: {}", e),
+                });
+            }
+        }
+
+        // Validate named templates (render test to detect unknown filters)
+        for (name, template) in &self.templates {
+            if let Err(e) = validate_template_render(&template.title) {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("title render: {}", e),
+                });
+            }
+            if let Err(e) = validate_template_render(&template.body) {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body render: {}", e),
+                });
+            }
+            if let Some(body_html) = &template.body_html
+                && let Err(e) = validate_template_render(body_html)
+            {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body_html render: {}", e),
+                });
+            }
+        }
+
+        // Validate accent_color hex format (fail-fast)
+        for (name, template) in &self.templates {
+            if let Some(accent_color) = &template.accent_color
+                && let Err(e) = validate_hex_color(accent_color)
+            {
+                errors.push(ConfigError::ValidationError(format!(
+                    "template '{}': {}",
+                    name, e
+                )));
             }
         }
 
@@ -844,9 +992,10 @@ impl Config {
     /// ```ignore
     /// let config = Config::load(&path)?;
     /// config.validate()?;
-    /// let runtime_config = config.compile()?;
+    /// let runtime_config = config.compile(&path)?;
     /// ```
-    pub fn compile(self) -> Result<RuntimeConfig, ConfigError> {
+    pub fn compile(self, config_path: &Path) -> Result<RuntimeConfig, ConfigError> {
+        let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let rules =
             self.rules
                 .into_iter()
@@ -882,8 +1031,8 @@ impl Config {
                     CompiledTemplate {
                         title: template.title,
                         body: template.body,
-                        color: template.color,
-                        icon: template.icon,
+                        body_html: template.body_html,
+                        accent_color: template.accent_color,
                     },
                 )
             })
@@ -897,12 +1046,40 @@ impl Config {
             metrics: self.metrics,
             notifiers: self.notifiers,
             mattermost_webhook: self.mattermost_webhook,
+            config_dir,
         })
     }
 }
 
 /// Validate a Jinja template string.
 ///
+/// Validates a hex color string in the format #rrggbb.
+///
+/// # Arguments
+///
+/// * `color` - The color string to validate
+///
+/// # Returns
+///
+/// * `Ok(())` - Color is valid hex format (#rrggbb)
+/// * `Err(String)` - Validation error with descriptive message
+fn validate_hex_color(color: &str) -> Result<(), String> {
+    use std::sync::LazyLock;
+
+    // Compile regex once (lazy initialization on first use)
+    static HEX_COLOR_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^#[0-9a-fA-F]{6}$").expect("valid regex"));
+
+    if HEX_COLOR_REGEX.is_match(color) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid hex color '{}': must be in format #rrggbb (e.g., #ff0000)",
+            color
+        ))
+    }
+}
+
 /// Validates any string that might contain Jinja syntax by attempting to parse it
 /// as a minijinja template. This catches:
 /// - Unclosed blocks (`{% if %}` without `{% endif %}`)
@@ -918,6 +1095,35 @@ fn validate_jinja_template(source: &str) -> Result<(), String> {
     // - Stray delimiters: }} without {{
     // - Plain text (always valid)
     env.add_template("_validate", source)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Validate a Jinja template by performing a test render with empty data.
+///
+/// This goes beyond syntax validation to detect runtime errors like unknown filters.
+/// Uses lenient undefined behavior so missing variables return "" instead of erroring,
+/// since the available fields vary depending on the log format.
+///
+/// # Arguments
+///
+/// * `source` - The template string to validate
+///
+/// # Returns
+///
+/// * `Ok(())` - Template renders successfully
+/// * `Err(String)` - Render error (e.g., unknown filter)
+pub fn validate_template_render(source: &str) -> Result<(), String> {
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    env.add_template("_render_test", source)
+        .map_err(|e| e.to_string())?;
+
+    let tmpl = env
+        .get_template("_render_test")
+        .map_err(|e| e.to_string())?;
+    tmpl.render(serde_json::json!({}))
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -952,7 +1158,7 @@ mod tests {
         assert!(config.templates.contains_key("default_alert"));
         assert!(config.templates.contains_key("custom_template"));
         let default_template = config.templates.get("default_alert").unwrap();
-        assert_eq!(default_template.color, Some("#ff0000".to_string()));
+        assert_eq!(default_template.accent_color, Some("#ff0000".to_string()));
 
         // Rules
         assert_eq!(config.rules.len(), 3);
@@ -1180,8 +1386,8 @@ mod tests {
                     TemplateConfig {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        color: None,
-                        icon: None,
+                        body_html: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -1260,10 +1466,11 @@ mod tests {
     // Test: Config compiles to RuntimeConfig with pre-compiled regex
     #[test]
     fn compile_creates_runtime_config_with_compiled_regex() {
-        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        let path = fixture_path("config_valid.yaml");
+        let config = Config::load(&path).unwrap();
         config.validate().expect("Valid config should validate");
 
-        let runtime = config.compile().expect("Valid config should compile");
+        let runtime = config.compile(&path).expect("Valid config should compile");
 
         // Check rules are transferred
         assert_eq!(runtime.rules.len(), 3);
@@ -1290,10 +1497,11 @@ mod tests {
     // Test: RuntimeConfig preserves all config values
     #[test]
     fn compile_preserves_config_values() {
-        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        let path = fixture_path("config_valid.yaml");
+        let config = Config::load(&path).unwrap();
         config.validate().unwrap();
 
-        let runtime = config.compile().unwrap();
+        let runtime = config.compile(&path).unwrap();
 
         // VictoriaLogs config
         assert_eq!(runtime.victorialogs.url, "http://victorialogs:9428");
@@ -1439,8 +1647,8 @@ mod tests {
                     TemplateConfig {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        color: None,
-                        icon: None,
+                        body_html: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -2160,8 +2368,8 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        color: None,
-                        icon: None,
+                        body_html: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -2184,6 +2392,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             notifiers: Some(HashMap::new()), // Notifiers section exists
             mattermost_webhook: None,
+            config_dir: std::path::PathBuf::from("."),
         }
     }
 
@@ -2301,8 +2510,8 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        color: None,
-                        icon: None,
+                        body_html: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -2342,6 +2551,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             notifiers: Some(HashMap::new()),
             mattermost_webhook: None,
+            config_dir: std::path::PathBuf::from("."),
         };
 
         let valid_notifiers = vec!["valid-notifier"];
@@ -2487,7 +2697,6 @@ mod tests {
               - ops@example.com
               - admin@example.com
             subject_template: "[{{ rule_name | upper }}] {{ title }}"
-            body_format: text
         "#;
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
@@ -2503,7 +2712,6 @@ mod tests {
                 assert_eq!(cfg.to[0], "ops@example.com");
                 assert_eq!(cfg.to[1], "admin@example.com");
                 assert!(cfg.subject_template.contains("{{ rule_name"));
-                assert_eq!(cfg.body_format, BodyFormat::Text);
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2530,7 +2738,6 @@ mod tests {
                 assert!(cfg.smtp.password.is_none());
                 assert_eq!(cfg.smtp.tls, TlsMode::Starttls); // default
                 assert!(cfg.smtp.tls_verify); // default true
-                assert_eq!(cfg.body_format, BodyFormat::Text); // default
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2595,27 +2802,6 @@ mod tests {
         match config {
             NotifierConfig::Email(cfg) => {
                 assert!(!cfg.smtp.tls_verify);
-            }
-            _ => panic!("Expected Email variant"),
-        }
-    }
-
-    #[test]
-    fn email_notifier_config_body_format_html() {
-        let yaml = r#"
-            type: email
-            smtp:
-              host: smtp.example.com
-              port: 587
-            from: test@example.com
-            to: [dest@example.com]
-            subject_template: "{{ title }}"
-            body_format: html
-        "#;
-        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
-        match config {
-            NotifierConfig::Email(cfg) => {
-                assert_eq!(cfg.body_format, BodyFormat::Html);
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2695,9 +2881,404 @@ mod tests {
         assert_eq!(tls, TlsMode::Starttls);
     }
 
+    // ===================================================================
+    // Body template config tests (Task 14 - Tech Spec email-body-template)
+    // ===================================================================
+
     #[test]
-    fn body_format_defaults_to_text() {
-        let format: BodyFormat = serde_yaml::from_str("~").unwrap_or_default();
-        assert_eq!(format, BodyFormat::Text);
+    fn email_config_with_body_template_inline() {
+        // Task 14: Test parsing config with inline body_template
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+            body_template: |
+              <html><body>{{ title }}: {{ body }}</body></html>
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert!(cfg.body_template.is_some());
+                assert!(cfg.body_template.as_ref().unwrap().contains("{{ title }}"));
+                assert!(cfg.body_template_file.is_none());
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_config_body_template_file_not_found_fails() {
+        // Task 14: Test that non-existent body_template_file fails
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: None,
+            body_template_file: Some("nonexistent/template.html".to_string()),
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_err(), "Non-existent file should fail");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("not found"),
+                    "Error should mention file not found: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("body_template_file"),
+                    "Error should mention body_template_file: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected ValidationError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_inline() {
+        // Task 14: Test resolve_body_template returns inline template
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: Some("<p>Inline: {{ body }}</p>".to_string()),
+            body_template_file: None,
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok());
+        let template = result.unwrap();
+        assert!(template.is_some());
+        assert_eq!(template.unwrap(), "<p>Inline: {{ body }}</p>");
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_returns_none_for_default() {
+        // Task 14: Test resolve_body_template returns None when no template specified
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: None,
+            body_template_file: None,
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok());
+        let template = result.unwrap();
+        assert!(
+            template.is_none(),
+            "Should return None for embedded default"
+        );
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_file_success() {
+        // Task 14: Test resolve_body_template reads file successfully
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: None,
+            body_template_file: Some("templates/default-email.html.j2".to_string()),
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok(), "Should read existing template file");
+        let template = result.unwrap();
+        assert!(template.is_some());
+        assert!(
+            template.as_ref().unwrap().contains("<!DOCTYPE html>"),
+            "Should contain HTML content"
+        );
+    }
+
+    // ===================================================================
+    // Task 9: Tests validation templates (body_html, render test)
+    // ===================================================================
+
+    #[test]
+    fn validate_template_render_detects_unknown_filter() {
+        // Template with unknown filter should fail render validation
+        let result = validate_template_render("{{ name | truncate(50) }}");
+
+        assert!(result.is_err(), "Unknown filter 'truncate' should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("truncate"),
+            "Error should mention 'truncate': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_template_render_allows_builtin_filters() {
+        // Template with built-in filters should pass
+        let result = validate_template_render("{{ name | upper | default('unknown') }}");
+
+        assert!(result.is_ok(), "Built-in filters should pass: {:?}", result);
+    }
+
+    #[test]
+    fn validate_template_render_allows_missing_variables() {
+        // Missing variables should return "" with lenient behavior, not error
+        let result = validate_template_render("Hello {{ undefined_var }}!");
+
+        assert!(
+            result.is_ok(),
+            "Missing variables should pass with lenient: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_body_html_syntax_error_detected() {
+        // Create a config with invalid body_html syntax
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Test body"
+    body_html: "{% if unclosed"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Invalid body_html syntax should fail");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                if let ConfigError::InvalidTemplate { message, .. } = e {
+                    message.contains("body_html")
+                } else {
+                    false
+                }
+            }),
+            "Error should mention body_html: {:?}",
+            errors
+        );
+    }
+
+    // ===================================================================
+    // Hex color validation tests
+    // ===================================================================
+
+    #[test]
+    fn validate_hex_color_valid_formats() {
+        // Valid #rrggbb formats
+        assert!(validate_hex_color("#ff0000").is_ok());
+        assert!(validate_hex_color("#FF0000").is_ok());
+        assert!(validate_hex_color("#123456").is_ok());
+        assert!(validate_hex_color("#abcdef").is_ok());
+        assert!(validate_hex_color("#ABCDEF").is_ok());
+        assert!(validate_hex_color("#000000").is_ok());
+        assert!(validate_hex_color("#ffffff").is_ok());
+    }
+
+    #[test]
+    fn validate_hex_color_invalid_formats() {
+        // Missing #
+        assert!(validate_hex_color("ff0000").is_err());
+
+        // Too short (3 hex digits - not supported)
+        assert!(validate_hex_color("#fff").is_err());
+
+        // Too long (8 hex digits)
+        assert!(validate_hex_color("#ff000000").is_err());
+
+        // Invalid characters
+        assert!(validate_hex_color("#gggggg").is_err());
+        assert!(validate_hex_color("#12345g").is_err());
+
+        // Named colors (not supported)
+        assert!(validate_hex_color("red").is_err());
+        assert!(validate_hex_color("blue").is_err());
+
+        // Empty
+        assert!(validate_hex_color("").is_err());
+        assert!(validate_hex_color("#").is_err());
+    }
+
+    #[test]
+    fn validate_config_with_invalid_accent_color_fails() {
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "red"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(
+            result.is_err(),
+            "Invalid accent_color should fail validation"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                matches!(e, ConfigError::ValidationError(msg) if msg.contains("invalid hex color"))
+            }),
+            "Error should mention invalid hex color: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_config_with_short_hex_fails() {
+        let yaml = r##"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "#fff"
+rules: []
+"##;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Short hex (#fff) should fail validation");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                matches!(e, ConfigError::ValidationError(msg) if msg.contains("#rrggbb"))
+            }),
+            "Error should mention required format: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_config_with_valid_accent_color_passes() {
+        let yaml = r##"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "#ff5500"
+rules: []
+"##;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_ok(), "Valid accent_color should pass validation");
+    }
+
+    #[test]
+    fn validate_template_render_in_body_detects_unknown_filter() {
+        // Create a config with unknown filter in body
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "{{ _msg | truncate(50) }}"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Unknown filter in body should fail");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                if let ConfigError::InvalidTemplate { message, .. } = e {
+                    message.contains("body render") && message.contains("truncate")
+                } else {
+                    false
+                }
+            }),
+            "Error should mention body render and truncate: {:?}",
+            errors
+        );
     }
 }

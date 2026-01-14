@@ -21,6 +21,12 @@ case "$1" in
             chown root:valerter /etc/valerter/config.yaml
             chmod 640 /etc/valerter/config.yaml
         fi
+        # Set permissions on templates directory
+        if [ -d /etc/valerter/templates ]; then
+            chown -R valerter:valerter /etc/valerter/templates
+            chmod 755 /etc/valerter/templates
+            find /etc/valerter/templates -type f -exec chmod 644 {} \;
+        fi
         # Reload systemd (if available)
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true

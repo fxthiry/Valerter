@@ -25,7 +25,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
-use valerter::config::{BodyFormat, EmailNotifierConfig, SmtpConfig, TlsMode};
+use valerter::config::{EmailNotifierConfig, SmtpConfig, TlsMode};
 use valerter::notify::email::EmailNotifier;
 use valerter::notify::{AlertPayload, Notifier};
 use valerter::template::RenderedMessage;
@@ -84,6 +84,12 @@ struct MailhogMime {
 // =============================================================================
 // Mailhog helper functions
 // =============================================================================
+
+/// Decode quoted-printable soft line breaks for assertion purposes.
+/// This removes `=\r\n` sequences that split words in quoted-printable encoding.
+fn decode_qp_soft_breaks(input: &str) -> String {
+    input.replace("=\r\n", "").replace("=\n", "")
+}
 
 /// Get the Mailhog API base URL from environment variables.
 fn mailhog_api_url() -> String {
@@ -163,10 +169,13 @@ fn create_mailhog_notifier(name: &str) -> EmailNotifier {
         from: "valerter-test@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-        body_format: BodyFormat::Text,
+        body_template: None,
+        body_template_file: None,
     };
 
-    EmailNotifier::from_config(name, &config).expect("Failed to create EmailNotifier for Mailhog")
+    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    EmailNotifier::from_config(name, &config, &config_dir)
+        .expect("Failed to create EmailNotifier for Mailhog")
 }
 
 /// Create an EmailNotifier with multiple recipients.
@@ -189,36 +198,13 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
         from: "valerter-test@example.com".to_string(),
         to: recipients.into_iter().map(String::from).collect(),
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-        body_format: BodyFormat::Text,
+        body_template: None,
+        body_template_file: None,
     };
 
-    EmailNotifier::from_config(name, &config).expect("Failed to create EmailNotifier for Mailhog")
-}
-
-/// Create an EmailNotifier with HTML body format.
-fn create_mailhog_notifier_html(name: &str) -> EmailNotifier {
-    let host = std::env::var("TEST_SMTP_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port: u16 = std::env::var("TEST_SMTP_PORT")
-        .unwrap_or_else(|_| "1025".to_string())
-        .parse()
-        .unwrap_or(1025);
-
-    let config = EmailNotifierConfig {
-        smtp: SmtpConfig {
-            host,
-            port,
-            username: None,
-            password: None,
-            tls: TlsMode::None,
-            tls_verify: false,
-        },
-        from: "valerter-html@example.com".to_string(),
-        to: vec!["recipient@example.com".to_string()],
-        subject_template: "{{ title }}".to_string(),
-        body_format: BodyFormat::Html,
-    };
-
-    EmailNotifier::from_config(name, &config).expect("Failed to create HTML EmailNotifier")
+    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    EmailNotifier::from_config(name, &config, &config_dir)
+        .expect("Failed to create EmailNotifier for Mailhog")
 }
 
 /// Create a test alert payload.
@@ -227,8 +213,8 @@ fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload 
         message: RenderedMessage {
             title: title.to_string(),
             body: body.to_string(),
-            color: Some("#ff0000".to_string()),
-            icon: Some(":warning:".to_string()),
+            body_html: None,
+            accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
         destinations: vec![],
@@ -354,7 +340,7 @@ async fn test_send_email_multiple_recipients() {
     );
 
     // Verify each recipient received an email
-    let mut recipients_found = vec![false, false, false];
+    let mut recipients_found = [false, false, false];
     for message in &response.items {
         let to = message
             .content
@@ -389,8 +375,8 @@ async fn test_send_email_multiple_recipients() {
     );
 }
 
-/// Test sending HTML formatted email.
-/// AC #4: Verify HTML body format is preserved
+/// Test sending HTML formatted email with body_html (pre-escaped HTML content).
+/// AC #4: Verify body_html content is included in email
 #[tokio::test]
 #[ignore] // Requires running Mailhog
 async fn test_send_email_html_format() {
@@ -402,15 +388,18 @@ async fn test_send_email_html_format() {
         .expect("Failed to clear Mailhog inbox");
 
     // Create notifier with HTML format
-    let notifier = create_mailhog_notifier_html("html-test");
+    let notifier = create_mailhog_notifier("html-test");
 
+    // body_html is used for pre-rendered HTML content (from TemplateEngine)
+    // This simulates what TemplateEngine produces when rendering body_html
     let alert = AlertPayload {
         message: RenderedMessage {
             title: "HTML Alert".to_string(),
-            body: "<h1>Alert!</h1><p>Something <strong>important</strong> happened.</p>"
-                .to_string(),
-            color: Some("#ff0000".to_string()),
-            icon: None,
+            body: "Fallback plain text".to_string(),
+            body_html: Some(
+                "<h1>Alert!</h1><p>Something <strong>important</strong> happened.</p>".to_string(),
+            ),
+            accent_color: Some("#ff0000".to_string()),
         },
         rule_name: "html_rule".to_string(),
         destinations: vec![],
@@ -442,20 +431,21 @@ async fn test_send_email_html_format() {
         content_type
     );
 
-    // Verify HTML content is preserved
+    // Verify HTML content from body_html is in the email body
+    // body_html is injected as safe (pre-escaped) into the default template
+    // Check for content that appears in body_html (may be quoted-printable encoded)
     assert!(
-        message.content.body.contains("<h1>Alert!</h1>"),
-        "HTML body should be preserved, got: {}",
-        message.content.body
+        message.content.body.contains("Alert!"),
+        "Body should contain the alert content from body_html"
     );
     assert!(
-        message.content.body.contains("<strong>important</strong>"),
-        "HTML tags should be preserved"
+        message.content.body.contains("important"),
+        "Body should contain content from body_html"
     );
 }
 
-/// Test sending plain text email.
-/// AC #4: Verify text body format
+/// Test sending email with plain text body (no body_html).
+/// AC #4: Verify plain text body is included in HTML email template
 #[tokio::test]
 #[ignore] // Requires running Mailhog
 async fn test_send_email_text_format() {
@@ -466,13 +456,14 @@ async fn test_send_email_text_format() {
         .await
         .expect("Failed to clear Mailhog inbox");
 
-    // Create notifier with text format (default)
+    // Create notifier - all emails are now HTML with the default template
     let notifier = create_mailhog_notifier("text-test");
 
+    // No body_html - the plain text body will be used in the HTML template
     let alert = make_alert_payload(
         "text_rule",
         "Plain Text Alert",
-        "This is a plain text message.\nWith multiple lines.",
+        "This is a plain text message.",
     );
 
     let result = notifier.send(&alert).await;
@@ -487,7 +478,7 @@ async fn test_send_email_text_format() {
         .await
         .expect("Text message not received in Mailhog");
 
-    // Verify Content-Type is plain text
+    // All emails are now HTML (using the default body template)
     let content_type = message
         .content
         .headers
@@ -496,18 +487,15 @@ async fn test_send_email_text_format() {
 
     assert!(content_type.is_some(), "Content-Type header missing");
     assert!(
-        content_type.unwrap().contains("text/plain"),
-        "Content-Type should be text/plain, got: {:?}",
+        content_type.unwrap().contains("text/html"),
+        "Content-Type should be text/html (all emails use HTML template), got: {:?}",
         content_type
     );
 
-    // Verify body content
+    // Verify body content is included in the HTML email
     assert!(
-        message
-            .content
-            .body
-            .contains("This is a plain text message"),
-        "Body should contain the message"
+        message.content.body.contains("plain text message"),
+        "Body should contain the message content"
     );
 }
 
@@ -542,11 +530,13 @@ async fn test_tls_mode_none_with_mailhog() {
         from: "tls-test@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "{{ title }}".to_string(),
-        body_format: BodyFormat::Text,
+        body_template: None,
+        body_template_file: None,
     };
 
-    let notifier =
-        EmailNotifier::from_config("tls-none-test", &config).expect("Failed to create notifier");
+    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let notifier = EmailNotifier::from_config("tls-none-test", &config, &config_dir)
+        .expect("Failed to create notifier");
 
     let alert = make_alert_payload("tls_test", "TLS None Test", "Testing TLS mode none");
 
@@ -607,4 +597,225 @@ async fn test_mailhog_api_helpers() {
         .expect("Failed to get final messages");
 
     assert_eq!(final_messages.total, 1, "Should have exactly 1 message");
+}
+
+// =============================================================================
+// Body template integration tests (Task 13/M4 - Tech Spec email-body-template)
+// =============================================================================
+
+/// Test sending HTML email with inline body_template.
+/// Verifies that body_template is rendered and sent correctly.
+#[tokio::test]
+#[ignore] // Requires running Mailhog
+async fn test_send_email_with_body_template_inline() {
+    let client = Client::new();
+
+    // Clear inbox before test
+    clear_mailhog_inbox(&client)
+        .await
+        .expect("Failed to clear Mailhog inbox");
+
+    // Create notifier with inline body_template
+    let host = std::env::var("TEST_SMTP_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("TEST_SMTP_PORT")
+        .unwrap_or_else(|_| "1025".to_string())
+        .parse()
+        .unwrap_or(1025);
+
+    let config = EmailNotifierConfig {
+        smtp: SmtpConfig {
+            host,
+            port,
+            username: None,
+            password: None,
+            tls: TlsMode::None,
+            tls_verify: false,
+        },
+        from: "template-test@example.com".to_string(),
+        to: vec!["recipient@example.com".to_string()],
+        subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
+        body_template: Some(
+            r#"<html>
+<body>
+<h1>CUSTOM TEMPLATE</h1>
+<p>Title: {{ title }}</p>
+<p>Body: {{ body }}</p>
+<p>Rule: {{ rule_name }}</p>
+<p>Color: {{ color }}</p>
+</body>
+</html>"#
+                .to_string(),
+        ),
+        body_template_file: None,
+    };
+
+    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let notifier = EmailNotifier::from_config("body-template-test", &config, &config_dir)
+        .expect("Failed to create notifier with body_template");
+
+    let alert = make_alert_payload("template_rule", "Template Test", "Testing body template");
+
+    let result = notifier.send(&alert).await;
+    assert!(
+        result.is_ok(),
+        "Failed to send email with body_template: {:?}",
+        result.err()
+    );
+
+    // Wait for message
+    let message = wait_for_message(&client, Duration::from_secs(5))
+        .await
+        .expect("Message with body_template not received");
+
+    // Verify Content-Type is HTML
+    let content_type = message
+        .content
+        .headers
+        .get("Content-Type")
+        .and_then(|v| v.first());
+
+    assert!(content_type.is_some(), "Content-Type header missing");
+    assert!(
+        content_type.unwrap().contains("text/html"),
+        "Content-Type should be text/html"
+    );
+
+    // Verify body contains rendered template markers
+    assert!(
+        message.content.body.contains("CUSTOM TEMPLATE"),
+        "Body should contain custom template marker"
+    );
+    assert!(
+        message.content.body.contains("Title: Template Test"),
+        "Body should contain rendered title"
+    );
+    assert!(
+        message.content.body.contains("Rule: template_rule"),
+        "Body should contain rendered rule_name"
+    );
+}
+
+/// Test sending HTML email with body_template_file.
+/// Verifies that external template file is loaded and rendered correctly.
+#[tokio::test]
+#[ignore] // Requires running Mailhog
+async fn test_send_email_with_body_template_file() {
+    let client = Client::new();
+
+    // Clear inbox before test
+    clear_mailhog_inbox(&client)
+        .await
+        .expect("Failed to clear Mailhog inbox");
+
+    // Create notifier with body_template_file pointing to default template
+    let host = std::env::var("TEST_SMTP_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("TEST_SMTP_PORT")
+        .unwrap_or_else(|_| "1025".to_string())
+        .parse()
+        .unwrap_or(1025);
+
+    let config = EmailNotifierConfig {
+        smtp: SmtpConfig {
+            host,
+            port,
+            username: None,
+            password: None,
+            tls: TlsMode::None,
+            tls_verify: false,
+        },
+        from: "file-template@example.com".to_string(),
+        to: vec!["recipient@example.com".to_string()],
+        subject_template: "{{ title }}".to_string(),
+        body_template: None,
+        body_template_file: Some("templates/default-email.html.j2".to_string()),
+    };
+
+    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let notifier = EmailNotifier::from_config("file-template-test", &config, &config_dir)
+        .expect("Failed to create notifier with body_template_file");
+
+    let alert = make_alert_payload("file_rule", "File Template Test", "Testing file template");
+
+    let result = notifier.send(&alert).await;
+    assert!(
+        result.is_ok(),
+        "Failed to send email with body_template_file: {:?}",
+        result.err()
+    );
+
+    // Wait for message
+    let message = wait_for_message(&client, Duration::from_secs(5))
+        .await
+        .expect("Message with body_template_file not received");
+
+    // Decode quoted-printable soft breaks for reliable assertions
+    let body = decode_qp_soft_breaks(&message.content.body);
+
+    // Verify body contains default template structure
+    assert!(
+        body.contains("<!DOCTYPE html>"),
+        "Body should contain HTML doctype from file template"
+    );
+    assert!(
+        body.contains("File Template Test"),
+        "Body should contain rendered title"
+    );
+    assert!(
+        body.contains("file_rule"),
+        "Body should contain rendered rule_name"
+    );
+    assert!(
+        body.contains("Valerter"),
+        "Body should contain Valerter branding from default template"
+    );
+}
+
+/// Test default body template is used when neither body_template nor body_template_file specified.
+#[tokio::test]
+#[ignore] // Requires running Mailhog
+async fn test_send_email_with_default_body_template() {
+    let client = Client::new();
+
+    // Clear inbox before test
+    clear_mailhog_inbox(&client)
+        .await
+        .expect("Failed to clear Mailhog inbox");
+
+    // Create notifier WITHOUT body_template - should use embedded default
+    let notifier = create_mailhog_notifier("default-body-test");
+
+    let alert = make_alert_payload(
+        "default_body_rule",
+        "Default Body Test",
+        "Testing default body template",
+    );
+
+    let result = notifier.send(&alert).await;
+    assert!(
+        result.is_ok(),
+        "Failed to send email with default body template: {:?}",
+        result.err()
+    );
+
+    // Wait for message
+    let message = wait_for_message(&client, Duration::from_secs(5))
+        .await
+        .expect("Message with default body template not received");
+
+    // Decode quoted-printable soft breaks for reliable assertions
+    let body = decode_qp_soft_breaks(&message.content.body);
+
+    // Verify body contains default template structure (embedded default-email.html.j2)
+    assert!(
+        body.contains("<!DOCTYPE html>"),
+        "Body should contain HTML doctype from embedded default template"
+    );
+    assert!(
+        body.contains("Default Body Test"),
+        "Body should contain rendered title"
+    );
+    assert!(
+        body.contains("default_body_rule"),
+        "Body should contain rendered rule_name"
+    );
 }

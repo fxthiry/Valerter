@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>{{ title }}</title>
+    <style>
+        /* RESET & BASE */
+        body { margin: 0; padding: 0; width: 100% !important; background-color: #f4f6f8; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+        img { border: 0; height: auto; line-height: 100%; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }
+        body, td, th { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+        
+        /* CONTENT STYLING */
+        .body-content p { margin: 0 0 16px 0; color: #374151; font-size: 16px; line-height: 1.6; }
+        .body-content a { color: #2563eb; text-decoration: underline; }
+        .body-content strong { font-weight: 700; color: #111827; }
+        
+        /* LOGS / CODE BLOCKS DESIGN */
+        pre {
+            background-color: #1f2937; /* Dark theme background */
+            color: #e5e7eb;            /* Light text */
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            padding: 16px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 13px;
+            line-height: 1.5;
+            margin: 16px 0;
+            border: 1px solid #374151;
+            white-space: pre-wrap;     /* Wrap long log lines */
+            word-break: break-all;     /* Prevent layout breaking */
+        }
+        code {
+            background-color: #f3f4f6;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            color: #b91c1c;
+            font-size: 0.9em;
+        }
+        pre code { background-color: transparent; padding: 0; color: inherit; border: none; }
+
+        /* RESPONSIVE & MOBILE */
+        @media only screen and (max-width: 620px) {
+            .wrapper { width: 100% !important; max-width: 100% !important; }
+            .content-padding { padding: 20px !important; }
+            .header-padding { padding: 25px 20px !important; }
+            /* Stack Logo and Title on mobile */
+            .header-table td { display: block !important; width: 100% !important; text-align: center !important; }
+            .logo-container { padding-right: 0 !important; padding-bottom: 15px !important; margin: 0 auto !important; }
+        }
+    </style>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f6f8;">
+    
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f4f6f8;">
+        <tr>
+            <td align="center" style="padding: 40px 10px;">
+                
+                <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+                    
+                    <tr>
+                        <td class="header-padding" style="background-color: #111827; padding: 30px 40px;">
+                            <table class="header-table" role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                <tr>
+                                    <td class="logo-container" valign="middle" width="50" style="padding-right: 20px;">
+                                        <img src="https://raw.githubusercontent.com/fxthiry/Valerter/refs/heads/main/assets/png/valerter-mark-light-256.png" 
+                                             alt="Valerter" 
+                                             width="40" 
+                                             height="40"
+                                             style="display: block; width: 40px; height: auto; border: 0;">
+                                    </td>
+                                    
+                                    <td valign="middle" style="color: #ffffff; font-size: 20px; font-weight: 700; letter-spacing: -0.5px; line-height: 1.3;">
+                                        {% if accent_color %}<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background-color:{{ accent_color }};margin-right:8px;vertical-align:middle;"></span>{% endif %}{{ title }}
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td class="content-padding" style="padding: 40px; background-color: #ffffff;">
+                            <div class="body-content">
+                                {{ body }}
+                            </div>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="background-color: #f9fafb; padding: 16px 40px; border-top: 1px solid #e5e7eb;">
+                            <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                <tr>
+                                    <td valign="middle" style="color: #6b7280; font-size: 12px; line-height: 1.5;">
+                                        Rule matched: <span style="font-family: monospace; background-color: #e5e7eb; padding: 2px 6px; border-radius: 4px; color: #374151; font-weight: 600; border: 1px solid #d1d5db;">{{ rule_name }}</span>
+                                    </td>
+                                    <td valign="middle" align="right">
+                                        <span style="color: #9ca3af; font-size: 12px; font-weight: 600; letter-spacing: 0.5px;">VALERTER</span>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    
+                </table>
+                <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px;">
+                    <tr>
+                        <td align="center" style="padding-top: 24px; color: #9ca3af; font-size: 11px;">
+                            <p style="margin: 0;">
+                                <a href="https://github.com/fxthiry/valerter" style="color: #9ca3af; text-decoration: none;">Valerter</a> 
+                                &bull; Real-time log alerting
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+
+            </td>
+        </tr>
+    </table>
+
+</body>
+</html>

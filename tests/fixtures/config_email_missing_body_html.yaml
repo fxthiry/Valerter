@@ -1,0 +1,43 @@
+# Configuration fixture: email notifier with template missing body_html
+# This should fail validation at startup (AC7)
+
+victorialogs:
+  url: "http://victorialogs:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "alert"
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+    # body_html is missing - should fail validation when used with email
+    accent_color: "#ff0000"
+
+notifiers:
+  email-alerts:
+    type: email
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+      tls: starttls
+    from: "alerts@example.com"
+    to:
+      - "team@example.com"
+    subject_template: "[Alert] {{ title }}"
+
+rules:
+  - name: "error_alert"
+    enabled: true
+    query: '_stream:{level="error"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - email-alerts

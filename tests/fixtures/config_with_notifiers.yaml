@@ -13,7 +13,7 @@ templates:
   default_alert:
     title: "{{ title | default('Alert') }}"
     body: "{{ body }}"
-    color: "#ff0000"
+    accent_color: "#ff0000"
 
 # Story 6.2: Named notifiers configuration
 notifiers:

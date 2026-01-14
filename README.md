@@ -266,7 +266,7 @@ Valerter supports three notifier types:
 
 **Webhook:** Send alerts to any HTTP endpoint (PagerDuty, Slack, custom APIs). Supports custom headers and body templates.
 
-**Email:** Send alerts via SMTP with TLS support (none, starttls, tls).
+**Email:** Send alerts via SMTP with TLS support (none, starttls, tls). Supports custom HTML templates - see [templates/README.md](templates/README.md).
 
 ### Secrets Management
 
