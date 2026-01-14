@@ -239,6 +239,7 @@ fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload 
         message: RenderedMessage {
             title: title.to_string(),
             body: body.to_string(),
+            body_html: None,
             color: Some("#ff0000".to_string()),
             icon: Some(":warning:".to_string()),
         },
@@ -421,6 +422,7 @@ async fn test_send_email_html_format() {
             title: "HTML Alert".to_string(),
             body: "<h1>Alert!</h1><p>Something <strong>important</strong> happened.</p>"
                 .to_string(),
+            body_html: None,
             color: Some("#ff0000".to_string()),
             icon: None,
         },

@@ -610,6 +610,7 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
+                        body_html: None,
                         color: None,
                         icon: None,
                     },
@@ -810,6 +811,7 @@ mod tests {
             CompiledTemplate {
                 title: "Alert: {{ _msg }}".to_string(),
                 body: "Log: {{ _msg }}".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: None,
             },

@@ -19,6 +19,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
+            body_html: None,
             color: Some("#ff0000".to_string()),
             icon: None,
         },
@@ -325,6 +326,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
+            body_html: None,
             color: Some("#ff0000".to_string()),
             icon: None,
         },

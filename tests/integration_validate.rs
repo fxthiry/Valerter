@@ -149,3 +149,41 @@ fn validate_disabled_rule_with_invalid_regex_exits_failure() {
         stderr
     );
 }
+
+// Test: email destination with template missing body_html fails startup
+// This validates AC2: fail-fast validation prevents runtime errors
+// Note: This test runs valerter normally (not --validate) because the body_html
+// validation happens after config compilation when creating the NotifierRegistry.
+#[test]
+fn validate_email_missing_body_html_exits_failure() {
+    ensure_binary_built();
+
+    let output = Command::new(valerter_binary())
+        .args(["-c"])
+        .arg(fixture_path("config_email_missing_body_html.yaml"))
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        !output.status.success(),
+        "valerter should exit with non-zero code for email destination without body_html"
+    );
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 1,
+        "Exit code should be 1 for missing body_html validation failure"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("body_html"),
+        "Error message should mention body_html requirement: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("email"),
+        "Error message should mention email destination: {}",
+        stderr
+    );
+}

@@ -4,7 +4,7 @@
 //! parsing CLI arguments, and managing environment variables.
 
 use crate::error::ConfigError;
-use minijinja::Environment;
+use minijinja::{Environment, UndefinedBehavior};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -219,6 +219,10 @@ pub struct TemplateConfig {
     pub title: String,
     /// Body template.
     pub body: String,
+    /// Optional HTML body template for email notifications.
+    /// If a rule sends to an email destination, this field is required.
+    #[serde(default)]
+    pub body_html: Option<String>,
     /// Optional color for the message.
     #[serde(default)]
     pub color: Option<String>,
@@ -747,6 +751,8 @@ pub struct CompiledTemplate {
     pub title: String,
     /// Body template string.
     pub body: String,
+    /// Optional HTML body template string for email notifications.
+    pub body_html: Option<String>,
     /// Optional color for the message.
     pub color: Option<String>,
     /// Optional icon for the message.
@@ -955,7 +961,7 @@ impl Config {
             });
         }
 
-        // Validate named templates
+        // Validate named templates (syntax)
         for (name, template) in &self.templates {
             if let Err(e) = validate_jinja_template(&template.title) {
                 errors.push(ConfigError::InvalidTemplate {
@@ -967,6 +973,38 @@ impl Config {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
                     message: format!("body: {}", e),
+                });
+            }
+            if let Some(body_html) = &template.body_html
+                && let Err(e) = validate_jinja_template(body_html)
+            {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body_html: {}", e),
+                });
+            }
+        }
+
+        // Validate named templates (render test to detect unknown filters)
+        for (name, template) in &self.templates {
+            if let Err(e) = validate_template_render(&template.title) {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("title render: {}", e),
+                });
+            }
+            if let Err(e) = validate_template_render(&template.body) {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body render: {}", e),
+                });
+            }
+            if let Some(body_html) = &template.body_html
+                && let Err(e) = validate_template_render(body_html)
+            {
+                errors.push(ConfigError::InvalidTemplate {
+                    rule: format!("template:{}", name),
+                    message: format!("body_html render: {}", e),
                 });
             }
         }
@@ -995,10 +1033,7 @@ impl Config {
     /// let runtime_config = config.compile(&path)?;
     /// ```
     pub fn compile(self, config_path: &Path) -> Result<RuntimeConfig, ConfigError> {
-        let config_dir = config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let rules =
             self.rules
                 .into_iter()
@@ -1034,6 +1069,7 @@ impl Config {
                     CompiledTemplate {
                         title: template.title,
                         body: template.body,
+                        body_html: template.body_html,
                         color: template.color,
                         icon: template.icon,
                     },
@@ -1071,6 +1107,35 @@ fn validate_jinja_template(source: &str) -> Result<(), String> {
     // - Stray delimiters: }} without {{
     // - Plain text (always valid)
     env.add_template("_validate", source)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Validate a Jinja template by performing a test render with empty data.
+///
+/// This goes beyond syntax validation to detect runtime errors like unknown filters.
+/// Uses lenient undefined behavior so missing variables return "" instead of erroring,
+/// since the available fields vary depending on the log format.
+///
+/// # Arguments
+///
+/// * `source` - The template string to validate
+///
+/// # Returns
+///
+/// * `Ok(())` - Template renders successfully
+/// * `Err(String)` - Render error (e.g., unknown filter)
+pub fn validate_template_render(source: &str) -> Result<(), String> {
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    env.add_template("_render_test", source)
+        .map_err(|e| e.to_string())?;
+
+    let tmpl = env
+        .get_template("_render_test")
+        .map_err(|e| e.to_string())?;
+    tmpl.render(serde_json::json!({}))
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -1333,6 +1398,7 @@ mod tests {
                     TemplateConfig {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
+                        body_html: None,
                         color: None,
                         icon: None,
                     },
@@ -1594,6 +1660,7 @@ mod tests {
                     TemplateConfig {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
+                        body_html: None,
                         color: None,
                         icon: None,
                     },
@@ -2315,6 +2382,7 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
+                        body_html: None,
                         color: None,
                         icon: None,
                     },
@@ -2457,6 +2525,7 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
+                        body_html: None,
                         color: None,
                         icon: None,
                     },
@@ -2910,7 +2979,10 @@ mod tests {
 
         let result = validate_body_template_format(&config, "test-notifier");
 
-        assert!(result.is_err(), "body_template with text format should fail");
+        assert!(
+            result.is_err(),
+            "body_template with text format should fail"
+        );
         let err = result.unwrap_err();
         match err {
             ConfigError::InvalidNotifier { name, message } => {
@@ -3140,5 +3212,116 @@ mod tests {
         let result = validate_body_template_format(&config, "no-template");
 
         assert!(result.is_ok(), "No template should allow text format");
+    }
+
+    // ===================================================================
+    // Task 9: Tests validation templates (body_html, render test)
+    // ===================================================================
+
+    #[test]
+    fn validate_template_render_detects_unknown_filter() {
+        // Template with unknown filter should fail render validation
+        let result = validate_template_render("{{ name | truncate(50) }}");
+
+        assert!(result.is_err(), "Unknown filter 'truncate' should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("truncate"),
+            "Error should mention 'truncate': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_template_render_allows_builtin_filters() {
+        // Template with built-in filters should pass
+        let result = validate_template_render("{{ name | upper | default('unknown') }}");
+
+        assert!(result.is_ok(), "Built-in filters should pass: {:?}", result);
+    }
+
+    #[test]
+    fn validate_template_render_allows_missing_variables() {
+        // Missing variables should return "" with lenient behavior, not error
+        let result = validate_template_render("Hello {{ undefined_var }}!");
+
+        assert!(
+            result.is_ok(),
+            "Missing variables should pass with lenient: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_body_html_syntax_error_detected() {
+        // Create a config with invalid body_html syntax
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Test body"
+    body_html: "{% if unclosed"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Invalid body_html syntax should fail");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                if let ConfigError::InvalidTemplate { message, .. } = e {
+                    message.contains("body_html")
+                } else {
+                    false
+                }
+            }),
+            "Error should mention body_html: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_template_render_in_body_detects_unknown_filter() {
+        // Create a config with unknown filter in body
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "{{ _msg | truncate(50) }}"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Unknown filter in body should fail");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                if let ConfigError::InvalidTemplate { message, .. } = e {
+                    message.contains("body render") && message.contains("truncate")
+                } else {
+                    false
+                }
+            }),
+            "Error should mention body render and truncate: {:?}",
+            errors
+        );
     }
 }

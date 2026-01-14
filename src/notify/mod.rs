@@ -616,6 +616,7 @@ mod tests {
             message: RenderedMessage {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: None,
             },
@@ -629,6 +630,7 @@ mod tests {
             message: RenderedMessage {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: None,
             },
@@ -851,7 +853,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -890,7 +893,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -942,7 +946,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(result.is_err());
                 let errors = result.unwrap_err();
@@ -995,7 +1000,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(
                 result.is_ok(),
@@ -1064,7 +1070,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -1122,7 +1129,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -1254,6 +1262,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: Some(":warning:".to_string()),
             },
@@ -1400,7 +1409,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),
@@ -1440,7 +1450,8 @@ mod tests {
             );
 
             let client = reqwest::Client::new();
-            let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+            let result =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
             assert!(result.is_err());
             let errors = result.unwrap_err();
@@ -1554,7 +1565,8 @@ mod tests {
                 );
 
                 let client = reqwest::Client::new();
-                let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+                let result =
+                    NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
 
                 assert!(
                     result.is_ok(),

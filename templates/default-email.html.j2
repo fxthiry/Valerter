@@ -81,7 +81,7 @@
             </div>
         </div>
         <div class="body">
-            {{ body }}
+            {{ body | safe }}
         </div>
         <div class="footer">
             Alert from rule <span class="rule-name">{{ rule_name }}</span> &bull; Sent by Valerter

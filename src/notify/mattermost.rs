@@ -290,6 +290,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test Alert".to_string(),
             body: "Something happened".to_string(),
+            body_html: None,
             color: Some("#ff0000".to_string()),
             icon: Some(":warning:".to_string()),
         };
@@ -315,6 +316,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Simple Alert".to_string(),
             body: "Body text".to_string(),
+            body_html: None,
             color: None,
             icon: None,
         };
@@ -331,6 +333,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
+            body_html: None,
             color: None,
             icon: None,
         };
@@ -356,6 +359,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
+            body_html: None,
             color: Some("#00ff00".to_string()),
             icon: None,
         };
@@ -381,6 +385,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
+            body_html: None,
             color: None,
             icon: None,
         };

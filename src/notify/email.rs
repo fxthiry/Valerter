@@ -13,7 +13,6 @@ use crate::config::{
     BodyFormat, EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars,
     validate_body_template_format,
 };
-use std::path::Path;
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
@@ -23,12 +22,15 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use minijinja::{Environment, context};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Default HTML template for email body, embedded at compile time.
-const DEFAULT_BODY_TEMPLATE: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/default-email.html.j2"));
+const DEFAULT_BODY_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/templates/default-email.html.j2"
+));
 
 /// Backoff base delay for email retries (AD-07).
 /// Longer than HTTP because SMTP connections are slower.
@@ -200,11 +202,19 @@ impl EmailNotifier {
             });
         }
 
-        // 5. Validate the subject template
+        // 5. Validate the subject template (syntax)
         Self::validate_template(&config.subject_template).map_err(|e| {
             ConfigError::InvalidNotifier {
                 name: name.to_string(),
                 message: format!("subject_template: {}", e),
+            }
+        })?;
+
+        // 5b. Validate the subject template (render test for unknown filters)
+        crate::config::validate_template_render(&config.subject_template).map_err(|e| {
+            ConfigError::InvalidNotifier {
+                name: name.to_string(),
+                message: format!("subject_template render: {}", e),
             }
         })?;
 
@@ -361,13 +371,14 @@ impl EmailNotifier {
         Ok(builder.build())
     }
 
-    /// Validate a minijinja template.
+    /// Validate a minijinja template syntax.
     fn validate_template(source: &str) -> Result<(), String> {
         let mut env = Environment::new();
         env.add_template("_validate", source)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
 
     /// Render the subject template with alert context.
     fn render_subject(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
@@ -390,9 +401,14 @@ impl EmailNotifier {
     }
 
     /// Render the body template with alert context.
+    ///
+    /// Uses `body_html` from the template engine (already HTML-escaped) if available,
+    /// otherwise falls back to `body`. The body_html is injected with `| safe` in the
+    /// email template because HTML escaping was already done in TemplateEngine.
     fn render_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
         let mut env = Environment::new();
-        // Enable HTML auto-escape for security (prevents XSS from log data)
+        // HTML auto-escape for title/rule_name/etc, but body uses | safe
+        // because body_html is already escaped by TemplateEngine
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         env.add_template("body", &self.body_template_source)
             .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
@@ -401,9 +417,16 @@ impl EmailNotifier {
             .get_template("body")
             .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
 
+        // Use body_html if available (already HTML-escaped), otherwise fall back to body
+        let body_content = alert
+            .message
+            .body_html
+            .as_ref()
+            .unwrap_or(&alert.message.body);
+
         tmpl.render(context! {
             title => &alert.message.title,
-            body => &alert.message.body,
+            body => body_content,
             rule_name => &alert.rule_name,
             color => &alert.message.color,
             icon => &alert.message.icon,
@@ -775,6 +798,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: Some(":warning:".to_string()),
             },
@@ -1112,7 +1136,8 @@ mod tests {
     #[test]
     fn debug_output_does_not_expose_transport_details() {
         let config = make_test_config();
-        let notifier = EmailNotifier::from_config("secure-email", &config, &test_config_dir()).unwrap();
+        let notifier =
+            EmailNotifier::from_config("secure-email", &config, &test_config_dir()).unwrap();
 
         let debug = format!("{:?}", notifier);
 
@@ -1138,7 +1163,8 @@ mod tests {
                 config.smtp.username = Some("${TEST_DBG_USER}".to_string());
                 config.smtp.password = Some("${TEST_DBG_PASS}".to_string());
 
-                let notifier = EmailNotifier::from_config("cred-email", &config, &test_config_dir()).unwrap();
+                let notifier =
+                    EmailNotifier::from_config("cred-email", &config, &test_config_dir()).unwrap();
                 let debug = format!("{:?}", notifier);
 
                 // Credentials must NOT appear
@@ -1302,19 +1328,20 @@ mod tests {
         );
 
         let mut alert = make_alert_payload("html_test");
-        // HTML in body is auto-escaped for security (XSS prevention)
-        alert.message.body = "<h1>Alert!</h1><p>Something happened</p>".to_string();
+        // body_html is pre-escaped by TemplateEngine, injected with | safe
+        // Using pre-escaped content simulates what TemplateEngine produces
+        alert.message.body_html =
+            Some("&lt;h1&gt;Alert!&lt;/h1&gt;&lt;p&gt;Something happened&lt;/p&gt;".to_string());
 
         let result = notifier.send(&alert).await;
 
         assert!(result.is_ok());
         let emails = mock.sent_emails();
         assert_eq!(emails.len(), 1);
-        // HTML tags in alert.message.body are escaped (security feature)
-        // Note: minijinja escapes / as &#x2f; in HTML mode
+        // body_html content (pre-escaped) is injected directly with | safe
         assert!(
             emails[0].body.contains("&lt;h1&gt;Alert!&lt;"),
-            "HTML in body should be escaped for security, got: {}",
+            "Pre-escaped body_html should be in email, got: {}",
             emails[0].body
         );
         assert!(
@@ -1575,7 +1602,9 @@ Icon: {{ icon }}"#;
         assert_eq!(emails.len(), 1);
         // The body should contain the RENDERED template, not raw alert.message.body
         assert!(
-            emails[0].body.contains("RENDERED: Test Alert - render_test"),
+            emails[0]
+                .body
+                .contains("RENDERED: Test Alert - render_test"),
             "Body should contain rendered template, got: {}",
             emails[0].body
         );
@@ -1615,6 +1644,82 @@ Icon: {{ icon }}"#;
         assert!(
             body.contains("Valerter"),
             "Default template should contain Valerter branding"
+        );
+    }
+
+    // ===================================================================
+    // Task 9: Tests subject_template render validation (unknown filters)
+    // ===================================================================
+
+    #[test]
+    fn from_config_fails_on_subject_template_unknown_filter() {
+        // AC6: subject_template with unknown filter should fail at config time
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "[TEST] {{ _msg | truncate(50) }}".to_string(), // Unknown filter
+            body_format: BodyFormat::Text,
+            body_template: None,
+            body_template_file: None,
+        };
+
+        let result = EmailNotifier::from_config("bad-subject", &config, &test_config_dir());
+
+        assert!(result.is_err(), "Unknown filter should fail validation");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-subject");
+                assert!(
+                    message.contains("subject_template render"),
+                    "Error should mention subject_template render: {}",
+                    message
+                );
+                assert!(
+                    message.contains("truncate"),
+                    "Error should mention truncate filter: {}",
+                    message
+                );
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_config_allows_builtin_filters_in_subject() {
+        // Built-in filters should pass validation
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "[{{ rule_name | upper }}] {{ title | default('Alert') }}"
+                .to_string(),
+            body_format: BodyFormat::Text,
+            body_template: None,
+            body_template_file: None,
+        };
+
+        let result = EmailNotifier::from_config("good-subject", &config, &test_config_dir());
+
+        assert!(
+            result.is_ok(),
+            "Built-in filters should pass: {:?}",
+            result.err()
         );
     }
 }

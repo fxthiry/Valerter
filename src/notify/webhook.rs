@@ -374,6 +374,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
+                body_html: None,
                 color: Some("#ff0000".to_string()),
                 icon: Some(":warning:".to_string()),
             },
@@ -633,6 +634,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Simple".to_string(),
                 body: "Body".to_string(),
+                body_html: None,
                 color: None,
                 icon: None,
             },
@@ -778,6 +780,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
+                body_html: None,
                 color: None,
                 icon: None,
             },
