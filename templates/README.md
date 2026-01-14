@@ -24,8 +24,7 @@ You can provide your own template via:
 | `title` | string | Alert title (from message template) |
 | `body` | string | Alert body (from message template) |
 | `rule_name` | string | Name of the rule that triggered |
-| `color` | string \| null | Color from template (e.g., `#ff0000`) |
-| `icon` | string \| null | Icon from template |
+| `accent_color` | string \| null | Accent color from template (e.g., `#ff0000`) |
 
 ## Jinja2 Syntax
 
@@ -36,14 +35,14 @@ Common patterns:
 {{ title }}
 
 {# With default value #}
-{{ color | default('#ff0000') }}
+{{ accent_color | default('#ff0000') }}
 
 {# Filters #}
 {{ rule_name | upper }}
 {{ title | lower }}
 
 {# Conditionals #}
-{% if icon %}<span>{{ icon }}</span>{% endif %}
+{% if accent_color %}<span style="color: {{ accent_color }}">●</span>{% endif %}
 
 {# Comments (not rendered) #}
 {# This is a comment #}
@@ -98,7 +97,7 @@ notifiers:
     body_template: |
       <html>
         <body>
-          <h1 style="color: {{ color | default('#cc0000') }}">{{ title }}</h1>
+          <h1 style="color: {{ accent_color | default('#cc0000') }}">{{ title }}</h1>
           <p>{{ body }}</p>
           <hr>
           <small>Rule: {{ rule_name }}</small>
@@ -118,8 +117,7 @@ notifiers:
     <title>{{ title }}</title>
 </head>
 <body>
-    <div style="padding: 20px; border-left: 4px solid {{ color | default('#ff0000') }};">
-        {% if icon %}<span>{{ icon }}</span>{% endif %}
+    <div style="padding: 20px; border-left: 4px solid {{ accent_color | default('#ff0000') }};">
         <h1>{{ title }}</h1>
         <p>{{ body }}</p>
         <small>Rule: <code>{{ rule_name }}</code></small>
