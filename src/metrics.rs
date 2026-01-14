@@ -113,7 +113,10 @@ impl MetricsServer {
     ///
     /// Use port 0 to let the OS assign an available port (useful for testing).
     pub fn new(port: u16) -> Self {
-        Self { port, ready_tx: None }
+        Self {
+            port,
+            ready_tx: None,
+        }
     }
 
     /// Create a new metrics server with a ready signal channel.
@@ -122,7 +125,10 @@ impl MetricsServer {
     /// and ready to receive metrics. This prevents the race condition where
     /// metrics emitted before the recorder is ready are silently lost.
     pub fn with_ready_signal(port: u16, ready_tx: tokio::sync::oneshot::Sender<()>) -> Self {
-        Self { port, ready_tx: Some(ready_tx) }
+        Self {
+            port,
+            ready_tx: Some(ready_tx),
+        }
     }
 
     /// Returns the configured port.
@@ -206,7 +212,8 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
     for rule_name in rule_names {
         counter!("valerter_logs_matched_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_alerts_sent_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_alerts_throttled_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_alerts_throttled_total", "rule_name" => rule_name.to_string())
+            .absolute(0);
         counter!("valerter_alerts_passed_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_alerts_dropped_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_parse_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
@@ -216,8 +223,10 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
 
     // Initialize per-notifier counters
     for notifier_name in notifier_names {
-        counter!("valerter_alerts_failed_total", "notifier" => notifier_name.to_string()).absolute(0);
-        counter!("valerter_notify_errors_total", "notifier" => notifier_name.to_string()).absolute(0);
+        counter!("valerter_alerts_failed_total", "notifier" => notifier_name.to_string())
+            .absolute(0);
+        counter!("valerter_notify_errors_total", "notifier" => notifier_name.to_string())
+            .absolute(0);
     }
 
     tracing::info!(
