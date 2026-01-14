@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/svg/valerter-lockup-standard.svg" alt="Valerter" width="400">
+  <img src="assets/svg/valerter-lockup-vertical.svg" alt="Valerter" height="180">
 </p>
 
 <p align="center">
