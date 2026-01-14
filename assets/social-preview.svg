@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <!-- Background -->
+  <rect width="1280" height="640" fill="#fafafa"/>
+
+  <!-- Logo icon (centered, scaled up) -->
+  <g transform="translate(640, 220)">
+    <!-- Waves -->
+    <path d="M-120 40c60 0 60-60 120-60s60 60 120 60" fill="none" stroke="#111827" stroke-width="22" stroke-linecap="round" opacity="0.90"/>
+    <path d="M-120 80c60 0 60-60 120-60s60 60 120 60" fill="none" stroke="#111827" stroke-width="22" stroke-linecap="round" opacity="0.65"/>
+    <path d="M-120 120c60 0 60-60 120-60s60 60 120 60" fill="none" stroke="#111827" stroke-width="22" stroke-linecap="round" opacity="0.40"/>
+    <!-- Alert dot -->
+    <circle cx="0" cy="-20" r="20" fill="#111827"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="640" y="440"
+        font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+        font-size="72" font-weight="600" letter-spacing="-2"
+        text-anchor="middle"
+        fill="#111827">Valerter</text>
+
+  <!-- Tagline -->
+  <text x="640" y="500"
+        font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="400"
+        text-anchor="middle"
+        fill="#6b7280">Real-time log alerting for VictoriaLogs</text>
+
+  <!-- Key differentiator -->
+  <text x="640" y="545"
+        font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+        font-size="22" font-weight="500"
+        text-anchor="middle"
+        fill="#374151">Full log context in every notification</text>
+</svg>
