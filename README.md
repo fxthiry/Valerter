@@ -43,15 +43,12 @@
 The easiest way to install on Debian-based systems:
 
 ```bash
-# Download from GitHub Releases page:
-# https://github.com/fxthiry/valerter/releases/latest
-
-# Or use curl (replace TAG and VERSION as needed):
-TAG="v1.0.0-alpha.1"      # Git tag (check releases page)
-VERSION="1.0.0~alpha.1"   # Package version (~ for Debian pre-release)
-curl -LO "https://github.com/fxthiry/valerter/releases/download/${TAG}/valerter_${VERSION}-1_amd64.deb"
-sudo dpkg -i "valerter_${VERSION}-1_amd64.deb"
+# Download and install the latest release
+curl -LO https://github.com/fxthiry/valerter/releases/latest/download/valerter_latest_amd64.deb
+sudo dpkg -i valerter_latest_amd64.deb
 ```
+
+For ARM64 systems, use `valerter_latest_arm64.deb` instead.
 
 The .deb package will:
 1. Install binary to `/usr/bin/valerter`
