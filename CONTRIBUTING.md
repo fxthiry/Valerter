@@ -19,10 +19,22 @@ Valerter is built with these key technical choices:
 - **Docker** (for SMTP integration tests with Mailhog)
 - **cargo-tarpaulin** (optional, for coverage): `cargo install cargo-tarpaulin`
 
+## Contribution Workflow
+
+1. **Fork** the repository (external contributors) or **create a branch** directly (collaborators)
+2. **Create a feature branch** from `main`: `git checkout -b feat/my-feature`
+3. **Make your changes** and commit with [conventional commits](#commit-message-format)
+4. **Push** and open a **Pull Request** against `main`
+5. **Wait for review** - at least one approval is required
+6. **CI must pass** - all checks (fmt, clippy, tests) must be green
+7. Once approved, a maintainer will merge your PR
+
+> **Note:** Direct pushes to `main` are disabled. All changes must go through a reviewed PR.
+
 ## Getting Started
 
 ```bash
-# Clone the repository
+# Clone the repository (or your fork)
 git clone https://github.com/fxthiry/valerter.git
 cd valerter
 
