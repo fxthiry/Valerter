@@ -611,8 +611,7 @@ mod tests {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
                         body_html: None,
-                        color: None,
-                        icon: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -812,8 +811,7 @@ mod tests {
                 title: "Alert: {{ _msg }}".to_string(),
                 body: "Log: {{ _msg }}".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                accent_color: Some("#ff0000".to_string()),
             },
         );
         t

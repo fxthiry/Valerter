@@ -107,10 +107,9 @@ metrics:
 #   #   "rule_name": "...",
 #   #   "title": "...",
 #   #   "body": "...",
-#   #   "color": "...",
-#   #   "icon": "...",
 #   #   "timestamp": "<ISO8601>"
 #   # }
+#   # Note: Webhook is generic - accent_color is not included in the payload.
 #
 #   # Example: PagerDuty integration
 #   pagerduty:
@@ -167,7 +166,7 @@ metrics:
 #   #   - body_template: inline Jinja template string
 #   #   - body_template_file: path to template file (relative to config or absolute)
 #   #   - If neither is specified, a default HTML template is used
-#   #   - Available variables: title, body, rule_name, color, icon
+#   #   - Available variables: title, body, rule_name, accent_color
 #
 #   # Example: Full email config with authentication
 #   email-ops:
@@ -228,25 +227,24 @@ defaults:
 # ==============================================================================
 # Reusable message templates for alert formatting.
 # Uses Jinja2-like syntax (minijinja). Available variables depend on parser output.
-# Built-in variables: title, body, rule_name, color, icon
+# Built-in variables: title, body, rule_name, accent_color
 
 templates:
   # Simple default template
   default_alert:
     title: "{{ title | default('Alert') }}"  # REQUIRED
     body: "{{ body }}"                        # REQUIRED
-    color: "#ff0000"                          # Optional
-    # icon: "warning"                         # Optional
+    accent_color: "#ff0000"                   # Optional - hex color (#rrggbb) for visual indicators
+    # Note: accent_color requires quotes in YAML since # is a comment character
 
-  # Example: Template with conditional color
+  # Example: Template with accent_color
   custom_template:
     title: "{{ severity }}: {{ title }}"
     body: |
       **Host:** {{ host }}
       **Message:** {{ message }}
       **Time:** {{ timestamp }}
-    color: "{{ '#ff0000' if severity == 'critical' else '#ffaa00' }}"
-    icon: "warning"
+    accent_color: "#ff0000"                   # Used for email colored dot and Mattermost sidebar
 
 # ==============================================================================
 # SECTION 6: Rules (REQUIRED)

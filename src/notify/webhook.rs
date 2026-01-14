@@ -26,7 +26,9 @@ const WEBHOOK_MAX_RETRIES: u32 = 3;
 
 /// Default webhook payload when no body_template is configured (AC4).
 ///
-/// Contains all standard alert fields in a JSON structure.
+/// Contains standard alert fields in a JSON structure.
+/// This is a generic webhook - no accent_color/icon fields as these are
+/// notifier-specific (use body_template for custom payloads).
 #[derive(Debug, Clone, Serialize)]
 pub struct DefaultWebhookPayload {
     /// Name of the notifier that sent this alert.
@@ -37,12 +39,6 @@ pub struct DefaultWebhookPayload {
     pub title: String,
     /// Alert body (rendered).
     pub body: String,
-    /// Optional color for the alert.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
-    /// Optional icon for the alert.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
     /// ISO 8601 timestamp of when the alert was sent.
     pub timestamp: String,
 }
@@ -55,8 +51,6 @@ impl DefaultWebhookPayload {
             rule_name: alert.rule_name.clone(),
             title: alert.message.title.clone(),
             body: alert.message.body.clone(),
-            color: alert.message.color.clone(),
-            icon: alert.message.icon.clone(),
             timestamp: Utc::now().to_rfc3339(),
         }
     }
@@ -102,6 +96,9 @@ fn validate_body_template(source: &str) -> Result<(), ConfigError> {
 }
 
 /// Render a body template with alert context.
+///
+/// Generic webhook templates only have access to standard fields (title, body, rule_name).
+/// accent_color is not exposed as webhooks are meant to be generic.
 fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
     let mut env = Environment::new();
     env.add_template("body", source)
@@ -115,8 +112,6 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
         title => &alert.message.title,
         body => &alert.message.body,
         rule_name => &alert.rule_name,
-        color => &alert.message.color,
-        icon => &alert.message.icon,
     })
     .map_err(|e| NotifyError::SendFailed(format!("template render error: {}", e)))
 }
@@ -375,8 +370,7 @@ mod tests {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: Some(":warning:".to_string()),
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations: vec![],
@@ -608,8 +602,7 @@ mod tests {
         assert_eq!(payload.rule_name, "test_rule");
         assert_eq!(payload.title, "Test Alert");
         assert_eq!(payload.body, "Something happened");
-        assert_eq!(payload.color, Some("#ff0000".to_string()));
-        assert_eq!(payload.icon, Some(":warning:".to_string()));
+        // Generic webhook - no color/icon fields
         assert!(!payload.timestamp.is_empty());
     }
 
@@ -623,20 +616,20 @@ mod tests {
         assert!(json.contains("\"rule_name\":\"cpu_alert\""));
         assert!(json.contains("\"title\":\"Test Alert\""));
         assert!(json.contains("\"body\":\"Something happened\""));
-        assert!(json.contains("\"color\":\"#ff0000\""));
-        assert!(json.contains("\"icon\":\":warning:\""));
         assert!(json.contains("\"timestamp\":"));
+        // Generic webhook - no color/icon in payload
+        assert!(!json.contains("\"color\""));
+        assert!(!json.contains("\"icon\""));
     }
 
     #[test]
-    fn default_webhook_payload_omits_none_fields() {
+    fn default_webhook_payload_is_generic() {
         let alert = AlertPayload {
             message: RenderedMessage {
                 title: "Simple".to_string(),
                 body: "Body".to_string(),
                 body_html: None,
-                color: None,
-                icon: None,
+                accent_color: None,
             },
             rule_name: "simple_rule".to_string(),
             destinations: vec![],
@@ -644,9 +637,10 @@ mod tests {
         let payload = DefaultWebhookPayload::from_alert(&alert, "webhook");
         let json = serde_json::to_string(&payload).unwrap();
 
-        // color and icon should not appear when None
+        // Generic webhook payload should not contain accent_color or icon
         assert!(!json.contains("\"color\""));
         assert!(!json.contains("\"icon\""));
+        assert!(!json.contains("\"accent_color\""));
     }
 
     // ===================================================================
@@ -762,39 +756,24 @@ mod tests {
     }
 
     #[test]
-    fn body_template_renders_optional_fields() {
-        let source = r#"{"color": "{{ color }}", "icon": "{{ icon }}"}"#;
-
-        let alert = make_alert_payload("test_rule");
-        let result = render_body_template(source, &alert).unwrap();
-
-        assert!(result.contains("\"color\": \"#ff0000\""));
-        assert!(result.contains("\"icon\": \":warning:\""));
-    }
-
-    #[test]
-    fn body_template_handles_none_optional_fields() {
-        let source = r#"{"color": "{{ color }}", "icon": "{{ icon }}"}"#;
+    fn body_template_uses_standard_fields_only() {
+        // Generic webhook templates only have access to title, body, rule_name
+        let source = r#"{"title": "{{ title }}", "rule": "{{ rule_name }}"}"#;
 
         let alert = AlertPayload {
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
                 body_html: None,
-                color: None,
-                icon: None,
+                accent_color: Some("#ff0000".to_string()),
             },
-            rule_name: "test".to_string(),
+            rule_name: "test_rule".to_string(),
             destinations: vec![],
         };
         let result = render_body_template(source, &alert).unwrap();
 
-        // None values render as "none" in minijinja (the literal string)
-        // The template receives the Option value and displays it as-is
-        assert!(result.contains("\"color\":"));
-        assert!(result.contains("\"icon\":"));
-        // Verify the template rendered without error
-        assert!(!result.is_empty());
+        assert!(result.contains("\"title\": \"Test\""));
+        assert!(result.contains("\"rule\": \"test_rule\""));
     }
 
     #[test]

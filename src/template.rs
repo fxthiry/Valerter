@@ -42,10 +42,9 @@ pub struct RenderedMessage {
     pub body: String,
     /// Optional HTML body for email notifications (rendered with HTML auto-escape).
     pub body_html: Option<String>,
-    /// Optional hex color for the attachment (e.g., "#ff0000").
-    pub color: Option<String>,
-    /// Optional icon for the message (emoji or URL).
-    pub icon: Option<String>,
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    /// Used for email colored dot and Mattermost sidebar color.
+    pub accent_color: Option<String>,
 }
 
 /// Template engine for rendering messages with Jinja2 syntax.
@@ -143,14 +142,13 @@ impl TemplateEngine {
             None
         };
 
-        // Color and icon are passed through (no template rendering)
-        // They are static values from config
+        // accent_color is passed through (no template rendering)
+        // It is a static value from config
         Ok(RenderedMessage {
             title,
             body,
             body_html,
-            color: template.color.clone(),
-            icon: template.icon.clone(),
+            accent_color: template.accent_color.clone(),
         })
     }
 
@@ -215,8 +213,7 @@ impl TemplateEngine {
                     title: format!("[{}] Alert", rule_name),
                     body: format!("Template render failed: {}\n\nCheck logs for details.", e),
                     body_html: None,
-                    color: Some("#ff0000".to_string()), // Red for error
-                    icon: None,
+                    accent_color: Some("#ff0000".to_string()), // Red for error
                 }
             }
         }
@@ -242,23 +239,20 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             body_html: None,
-            color: None,
-            icon: None,
+            accent_color: None,
         }
     }
 
-    fn make_template_with_style(
+    fn make_template_with_accent_color(
         title: &str,
         body: &str,
-        color: Option<&str>,
-        icon: Option<&str>,
+        accent_color: Option<&str>,
     ) -> CompiledTemplate {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
             body_html: None,
-            color: color.map(String::from),
-            icon: icon.map(String::from),
+            accent_color: accent_color.map(String::from),
         }
     }
 
@@ -372,7 +366,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 5.5: Test rendu template avec tous les champs (title, body, color, icon)
+    // Task 5.5: Test rendu template avec tous les champs (title, body, accent_color)
     // ===================================================================
 
     #[test]
@@ -380,12 +374,7 @@ mod tests {
         let mut templates = HashMap::new();
         templates.insert(
             "full_alert".to_string(),
-            make_template_with_style(
-                "{{ title }}",
-                "{{ body }}",
-                Some("#ff0000"),
-                Some(":warning:"),
-            ),
+            make_template_with_accent_color("{{ title }}", "{{ body }}", Some("#ff0000")),
         );
 
         let engine = TemplateEngine::new(templates);
@@ -398,8 +387,7 @@ mod tests {
 
         assert_eq!(result.title, "Critical Alert");
         assert_eq!(result.body, "Something went wrong");
-        assert_eq!(result.color, Some("#ff0000".to_string()));
-        assert_eq!(result.icon, Some(":warning:".to_string()));
+        assert_eq!(result.accent_color, Some("#ff0000".to_string()));
     }
 
     // ===================================================================
@@ -446,7 +434,7 @@ mod tests {
         assert!(fallback.body.contains("Check logs for details"));
         // Should NOT contain raw fields (security: avoid exposing sensitive data)
         assert!(!fallback.body.contains("server-01"));
-        assert_eq!(fallback.color, Some("#ff0000".to_string()));
+        assert_eq!(fallback.accent_color, Some("#ff0000".to_string()));
     }
 
     // ===================================================================
@@ -529,8 +517,8 @@ mod tests {
         // Should return rendered message, NOT fallback
         assert_eq!(result.title, "Alert: server-01");
         assert_eq!(result.body, "Message from server-01");
-        // No fallback color (None from template)
-        assert_eq!(result.color, None);
+        // No fallback accent_color (None from template)
+        assert_eq!(result.accent_color, None);
     }
 
     #[test]
@@ -553,16 +541,14 @@ mod tests {
             title: "Title".to_string(),
             body: "Body".to_string(),
             body_html: None,
-            color: Some("#000".to_string()),
-            icon: None,
+            accent_color: Some("#000000".to_string()),
         };
 
         let msg2 = RenderedMessage {
             title: "Title".to_string(),
             body: "Body".to_string(),
             body_html: None,
-            color: Some("#000".to_string()),
-            icon: None,
+            accent_color: Some("#000000".to_string()),
         };
 
         assert_eq!(msg1, msg2);
@@ -639,8 +625,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             body_html: Some(body_html.to_string()),
-            color: None,
-            icon: None,
+            accent_color: None,
         }
     }
 

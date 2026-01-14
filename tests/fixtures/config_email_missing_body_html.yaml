@@ -16,7 +16,7 @@ templates:
     title: "Alert: {{ _msg }}"
     body: "Message: {{ _msg }}"
     # body_html is missing - should fail validation when used with email
-    color: "#ff0000"
+    accent_color: "#ff0000"
 
 notifiers:
   email-alerts:

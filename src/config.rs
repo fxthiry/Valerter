@@ -223,12 +223,10 @@ pub struct TemplateConfig {
     /// If a rule sends to an email destination, this field is required.
     #[serde(default)]
     pub body_html: Option<String>,
-    /// Optional color for the message.
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    /// Used for email colored dot and Mattermost sidebar color.
     #[serde(default)]
-    pub color: Option<String>,
-    /// Optional icon for the message.
-    #[serde(default)]
-    pub icon: Option<String>,
+    pub accent_color: Option<String>,
 }
 
 /// Alert rule configuration.
@@ -390,7 +388,7 @@ pub struct WebhookNotifierConfig {
 /// - `body_template_file`: Path to template file (relative to config or absolute)
 /// - If neither specified: uses embedded default HTML template
 ///
-/// Available template variables: `title`, `body`, `rule_name`, `color`, `icon`
+/// Available template variables: `title`, `body`, `rule_name`, `accent_color`
 ///
 /// # Example YAML
 ///
@@ -422,14 +420,14 @@ pub struct EmailNotifierConfig {
     /// Recipient email addresses.
     pub to: Vec<String>,
     /// Subject line template (minijinja).
-    /// Available variables: title, body, rule_name, color, icon.
+    /// Available variables: title, body, rule_name, accent_color.
     pub subject_template: String,
     /// Body template (inline minijinja).
-    /// Available variables: title, body, rule_name, color, icon.
+    /// Available variables: title, body, rule_name, accent_color.
     #[serde(default)]
     pub body_template: Option<String>,
     /// Path to body template file (relative to config file or absolute).
-    /// Available variables: title, body, rule_name, color, icon.
+    /// Available variables: title, body, rule_name, accent_color.
     #[serde(default)]
     pub body_template_file: Option<String>,
 }
@@ -707,10 +705,8 @@ pub struct CompiledTemplate {
     pub body: String,
     /// Optional HTML body template string for email notifications.
     pub body_html: Option<String>,
-    /// Optional color for the message.
-    pub color: Option<String>,
-    /// Optional icon for the message.
-    pub icon: Option<String>,
+    /// Optional accent color for visual indicators (hex format: #rrggbb).
+    pub accent_color: Option<String>,
 }
 
 /// Default configuration file path (AD-08).
@@ -963,6 +959,18 @@ impl Config {
             }
         }
 
+        // Validate accent_color hex format (fail-fast)
+        for (name, template) in &self.templates {
+            if let Some(accent_color) = &template.accent_color
+                && let Err(e) = validate_hex_color(accent_color)
+            {
+                errors.push(ConfigError::ValidationError(format!(
+                    "template '{}': {}",
+                    name, e
+                )));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1024,8 +1032,7 @@ impl Config {
                         title: template.title,
                         body: template.body,
                         body_html: template.body_html,
-                        color: template.color,
-                        icon: template.icon,
+                        accent_color: template.accent_color,
                     },
                 )
             })
@@ -1046,6 +1053,33 @@ impl Config {
 
 /// Validate a Jinja template string.
 ///
+/// Validates a hex color string in the format #rrggbb.
+///
+/// # Arguments
+///
+/// * `color` - The color string to validate
+///
+/// # Returns
+///
+/// * `Ok(())` - Color is valid hex format (#rrggbb)
+/// * `Err(String)` - Validation error with descriptive message
+fn validate_hex_color(color: &str) -> Result<(), String> {
+    use std::sync::LazyLock;
+
+    // Compile regex once (lazy initialization on first use)
+    static HEX_COLOR_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^#[0-9a-fA-F]{6}$").expect("valid regex"));
+
+    if HEX_COLOR_REGEX.is_match(color) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid hex color '{}': must be in format #rrggbb (e.g., #ff0000)",
+            color
+        ))
+    }
+}
+
 /// Validates any string that might contain Jinja syntax by attempting to parse it
 /// as a minijinja template. This catches:
 /// - Unclosed blocks (`{% if %}` without `{% endif %}`)
@@ -1124,7 +1158,7 @@ mod tests {
         assert!(config.templates.contains_key("default_alert"));
         assert!(config.templates.contains_key("custom_template"));
         let default_template = config.templates.get("default_alert").unwrap();
-        assert_eq!(default_template.color, Some("#ff0000".to_string()));
+        assert_eq!(default_template.accent_color, Some("#ff0000".to_string()));
 
         // Rules
         assert_eq!(config.rules.len(), 3);
@@ -1353,8 +1387,7 @@ mod tests {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
                         body_html: None,
-                        color: None,
-                        icon: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -1615,8 +1648,7 @@ mod tests {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
                         body_html: None,
-                        color: None,
-                        icon: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -2337,8 +2369,7 @@ mod tests {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
                         body_html: None,
-                        color: None,
-                        icon: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -2480,8 +2511,7 @@ mod tests {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
                         body_html: None,
-                        color: None,
-                        icon: None,
+                        accent_color: None,
                     },
                 );
                 t
@@ -3083,6 +3113,137 @@ rules: []
             "Error should mention body_html: {:?}",
             errors
         );
+    }
+
+    // ===================================================================
+    // Hex color validation tests
+    // ===================================================================
+
+    #[test]
+    fn validate_hex_color_valid_formats() {
+        // Valid #rrggbb formats
+        assert!(validate_hex_color("#ff0000").is_ok());
+        assert!(validate_hex_color("#FF0000").is_ok());
+        assert!(validate_hex_color("#123456").is_ok());
+        assert!(validate_hex_color("#abcdef").is_ok());
+        assert!(validate_hex_color("#ABCDEF").is_ok());
+        assert!(validate_hex_color("#000000").is_ok());
+        assert!(validate_hex_color("#ffffff").is_ok());
+    }
+
+    #[test]
+    fn validate_hex_color_invalid_formats() {
+        // Missing #
+        assert!(validate_hex_color("ff0000").is_err());
+
+        // Too short (3 hex digits - not supported)
+        assert!(validate_hex_color("#fff").is_err());
+
+        // Too long (8 hex digits)
+        assert!(validate_hex_color("#ff000000").is_err());
+
+        // Invalid characters
+        assert!(validate_hex_color("#gggggg").is_err());
+        assert!(validate_hex_color("#12345g").is_err());
+
+        // Named colors (not supported)
+        assert!(validate_hex_color("red").is_err());
+        assert!(validate_hex_color("blue").is_err());
+
+        // Empty
+        assert!(validate_hex_color("").is_err());
+        assert!(validate_hex_color("#").is_err());
+    }
+
+    #[test]
+    fn validate_config_with_invalid_accent_color_fails() {
+        let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "red"
+rules: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(
+            result.is_err(),
+            "Invalid accent_color should fail validation"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                matches!(e, ConfigError::ValidationError(msg) if msg.contains("invalid hex color"))
+            }),
+            "Error should mention invalid hex color: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_config_with_short_hex_fails() {
+        let yaml = r##"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "#fff"
+rules: []
+"##;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err(), "Short hex (#fff) should fail validation");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                matches!(e, ConfigError::ValidationError(msg) if msg.contains("#rrggbb"))
+            }),
+            "Error should mention required format: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_config_with_valid_accent_color_passes() {
+        let yaml = r##"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+    accent_color: "#ff5500"
+rules: []
+"##;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_ok(), "Valid accent_color should pass validation");
     }
 
     #[test]

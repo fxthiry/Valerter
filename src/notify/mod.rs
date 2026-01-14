@@ -327,7 +327,7 @@ impl std::fmt::Debug for dyn Notifier {
 /// Must implement `Clone` as required by `broadcast::Sender`.
 #[derive(Debug, Clone)]
 pub struct AlertPayload {
-    /// Rendered message content (title, body, color, icon).
+    /// Rendered message content (title, body, accent_color).
     pub message: RenderedMessage,
     /// Rule name for tracing and metrics.
     pub rule_name: String,
@@ -617,8 +617,7 @@ mod tests {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations: vec![], // Uses default notifier
@@ -631,8 +630,7 @@ mod tests {
                 title: format!("Alert from {}", rule_name),
                 body: "Test body".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: None,
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations,
@@ -1263,8 +1261,7 @@ mod tests {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: Some(":warning:".to_string()),
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: "my_rule".to_string(),
             destinations: vec!["mattermost-infra".to_string()],

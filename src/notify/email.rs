@@ -367,7 +367,6 @@ impl EmailNotifier {
         Ok(())
     }
 
-
     /// Render the subject template with alert context.
     fn render_subject(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
         let mut env = Environment::new();
@@ -382,8 +381,7 @@ impl EmailNotifier {
             title => &alert.message.title,
             body => &alert.message.body,
             rule_name => &alert.rule_name,
-            color => &alert.message.color,
-            icon => &alert.message.icon,
+            accent_color => &alert.message.accent_color,
         })
         .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
     }
@@ -419,8 +417,7 @@ impl EmailNotifier {
             title => &alert.message.title,
             body => body_safe,
             rule_name => &alert.rule_name,
-            color => &alert.message.color,
-            icon => &alert.message.icon,
+            accent_color => &alert.message.accent_color,
         })
         .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
     }
@@ -779,8 +776,7 @@ mod tests {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
                 body_html: None,
-                color: Some("#ff0000".to_string()),
-                icon: Some(":warning:".to_string()),
+                accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
             destinations: vec![],
@@ -1041,7 +1037,8 @@ mod tests {
     #[test]
     fn render_subject_with_complex_template() {
         let mut config = make_test_config();
-        config.subject_template = "[{{ rule_name | upper }}] {{ title }} ({{ color }})".to_string();
+        config.subject_template =
+            "[{{ rule_name | upper }}] {{ title }} ({{ accent_color }})".to_string();
 
         let notifier = EmailNotifier::from_config("test", &config, &test_config_dir()).unwrap();
         let alert = make_alert_payload("my_rule");
@@ -1459,13 +1456,12 @@ mod tests {
 
     #[test]
     fn render_body_with_all_variables() {
-        // Task 13: Test render_body with all variables (title, body, rule_name, color, icon)
+        // Task 13: Test render_body with all variables (title, body, rule_name, accent_color)
         let mock = Arc::new(MockEmailTransport::new());
         let custom_template = r#"Title: {{ title }}
 Body: {{ body }}
 Rule: {{ rule_name }}
-Color: {{ color }}
-Icon: {{ icon }}"#;
+Accent Color: {{ accent_color }}"#;
 
         let notifier = EmailNotifier::with_transport(
             "body-test",
@@ -1485,8 +1481,10 @@ Icon: {{ icon }}"#;
             "Should contain body"
         );
         assert!(body.contains("Rule: test_rule"), "Should contain rule_name");
-        assert!(body.contains("Color: #ff0000"), "Should contain color");
-        assert!(body.contains("Icon: :warning:"), "Should contain icon");
+        assert!(
+            body.contains("Accent Color: #ff0000"),
+            "Should contain accent_color"
+        );
     }
 
     #[test]

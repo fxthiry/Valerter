@@ -13,11 +13,10 @@ templates:
   default_alert:
     title: "{{ title | default('Alert') }}"
     body: "{{ body }}"
-    color: "#ff0000"
+    accent_color: "#ff0000"
   custom_template:
     title: "Custom: {{ title }}"
     body: "{{ message }}"
-    icon: "warning"
 
 rules:
   - name: "high_cpu_alert"
