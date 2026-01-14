@@ -1,0 +1,6 @@
+# Optional: ignore design exports
+*.sketch
+*.fig
+*.xd
+*.ai
+*.psd
