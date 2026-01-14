@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-01-14
+
+### Added
+- **Email body template system** - HTML email templates with `body_html` field
+- **Default email template** - Built-in `templates/default-email.html.j2`
+- **Fail-fast validation** - Startup error if email destination uses template without `body_html`
+- **Modular documentation** - New `docs/` folder with detailed guides (getting-started, configuration, notifiers, metrics, architecture)
+
+### Fixed
+- **Metrics recorder race condition** - Resolved startup race in Prometheus recorder initialization
+
+### Changed
+- **BREAKING: `color` → `accent_color`** - Template field renamed for clarity
+- **BREAKING: `icon` removed** - Template field no longer supported
+- **README refactored** - Reduced from 445 to ~110 lines, now a showcase with links to docs/
+- **Pipeline diagram** - Mermaid replaced with static SVG (no overlay controls)
+
 ## [1.0.0-beta.1] - 2025-01-14
 
 ### Added
@@ -49,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-beta.1...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.1...HEAD
+[1.0.0-rc.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-beta.1...v1.0.0-rc.1
 [1.0.0-beta.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.2...v1.0.0-beta.1
 [1.0.0-alpha.2]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.1...v1.0.0-alpha.2
 [1.0.0-alpha.1]: https://github.com/fxthiry/valerter/releases/tag/v1.0.0-alpha.1
