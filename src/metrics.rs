@@ -18,12 +18,20 @@ static RECORDER_INSTALLED: OnceLock<()> = OnceLock::new();
 /// This should be called once at startup after the recorder is installed.
 /// Descriptions provide HELP text in the Prometheus output.
 pub fn register_metric_descriptions() {
-    use metrics::{describe_counter, describe_gauge};
+    use metrics::{describe_counter, describe_gauge, describe_histogram};
 
     // Counters
     describe_counter!(
+        "valerter_logs_matched_total",
+        "Total number of log lines successfully matched by rules (before throttling)"
+    );
+    describe_counter!(
+        "valerter_alerts_failed_total",
+        "Total number of alerts that permanently failed after all retries exhausted"
+    );
+    describe_counter!(
         "valerter_alerts_sent_total",
-        "Total number of alerts successfully sent to Mattermost"
+        "Total number of alerts successfully sent to notification channels"
     );
     describe_counter!(
         "valerter_alerts_throttled_total",
@@ -62,6 +70,24 @@ pub fn register_metric_descriptions() {
     describe_gauge!(
         "valerter_queue_size",
         "Current number of alerts in the notification queue"
+    );
+    describe_gauge!(
+        "valerter_last_query_timestamp",
+        "Unix timestamp of last successful VictoriaLogs query chunk received"
+    );
+    describe_gauge!(
+        "valerter_victorialogs_up",
+        "VictoriaLogs connection status (1=connected, 0=disconnected)"
+    );
+    describe_gauge!(
+        "valerter_uptime_seconds",
+        "Time in seconds since valerter started"
+    );
+
+    // Histograms
+    describe_histogram!(
+        "valerter_query_duration_seconds",
+        "Time to receive first chunk from VictoriaLogs after sending request"
     );
 }
 

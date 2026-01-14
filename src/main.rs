@@ -1,7 +1,7 @@
 //! Valerter - Real-time alerting from VictoriaLogs to Mattermost.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -220,6 +220,9 @@ fn main() -> Result<()> {
 
 /// Main async entry point.
 async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
+    // Capture start time for uptime metric
+    let start_time = Instant::now();
+
     // Create shared HTTP client for connection pooling (AD-03)
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -270,6 +273,21 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
         info!("Metrics server disabled");
         None
     };
+
+    // Start uptime metric updater (updates every 15 seconds)
+    let uptime_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = uptime_cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let uptime = start_time.elapsed().as_secs_f64();
+                    metrics::gauge!("valerter_uptime_seconds").set(uptime);
+                }
+            }
+        }
+    });
 
     // Create rule engine
     let engine = RuleEngine::new(runtime_config, http_client, queue.clone());

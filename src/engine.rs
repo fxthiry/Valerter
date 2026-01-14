@@ -45,7 +45,7 @@ use crate::config::{
 };
 use crate::error::RuleError;
 use crate::notify::{AlertPayload, NotificationQueue};
-use crate::parser::{RuleParser, record_parse_error};
+use crate::parser::{RuleParser, record_log_matched, record_parse_error};
 use crate::tail::{ReconnectCallback, TailClient, TailConfig};
 use crate::template::TemplateEngine;
 use crate::throttle::{ThrottleResult, Throttler};
@@ -498,6 +498,9 @@ async fn process_log_line(
             return Err(ProcessError::Parse);
         }
     };
+
+    // Step 1.5: Record successful match (before throttle check)
+    record_log_matched(rule_name);
 
     // Step 2: Check throttle
     match throttler.check(&fields) {

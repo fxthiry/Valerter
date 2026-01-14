@@ -23,6 +23,37 @@ use crate::error::ParseError;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+/// Record a successful log match with metrics.
+///
+/// This function should be called by the pipeline code when parsing succeeds.
+/// It increments the `valerter_logs_matched_total` counter with proper labels.
+/// This metric counts successful matches BEFORE throttling is applied.
+///
+/// # Arguments
+///
+/// * `rule_name` - The name of the rule that matched the log
+///
+/// # Example
+///
+/// ```ignore
+/// match parser.parse(&line) {
+///     Ok(fields) => {
+///         record_log_matched(&rule.name);
+///         // Continue processing...
+///     }
+///     Err(e) => {
+///         record_parse_error(&rule.name, &e);
+///     }
+/// }
+/// ```
+pub fn record_log_matched(rule_name: &str) {
+    metrics::counter!(
+        "valerter_logs_matched_total",
+        "rule_name" => rule_name.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a parse error with logging and metrics (FR20, FR21).
 ///
 /// This function should be called by the pipeline code when parsing fails.
@@ -567,5 +598,21 @@ mod tests {
         let error = ParseError::InvalidJson("unexpected token".to_string());
         // Should not panic
         super::record_parse_error("test_rule", &error);
+    }
+
+    // Test: record_log_matched does not panic
+    #[test]
+    fn record_log_matched_does_not_panic() {
+        // Should not panic
+        super::record_log_matched("test_rule");
+    }
+
+    // Test: record_log_matched can be called multiple times
+    #[test]
+    fn record_log_matched_multiple_calls() {
+        // Should not panic even with multiple calls
+        super::record_log_matched("rule_a");
+        super::record_log_matched("rule_b");
+        super::record_log_matched("rule_a");
     }
 }

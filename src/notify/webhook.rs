@@ -292,6 +292,14 @@ impl Notifier for WebhookNotifier {
                         "notifier_type" => "webhook"
                     )
                     .increment(1);
+                    // Permanent failure - count as failed alert
+                    metrics::counter!(
+                        "valerter_alerts_failed_total",
+                        "rule_name" => alert.rule_name.clone(),
+                        "notifier_name" => self.name.clone(),
+                        "notifier_type" => "webhook"
+                    )
+                    .increment(1);
                     return Err(NotifyError::SendFailed(format!("client error: {}", status)));
                 }
                 Ok(response) => {
@@ -327,6 +335,14 @@ impl Notifier for WebhookNotifier {
         );
         metrics::counter!(
             "valerter_notify_errors_total",
+            "rule_name" => alert.rule_name.clone(),
+            "notifier_name" => self.name.clone(),
+            "notifier_type" => "webhook"
+        )
+        .increment(1);
+        // Permanent failure after retries exhausted
+        metrics::counter!(
+            "valerter_alerts_failed_total",
             "rule_name" => alert.rule_name.clone(),
             "notifier_name" => self.name.clone(),
             "notifier_type" => "webhook"

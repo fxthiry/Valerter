@@ -21,7 +21,7 @@ pub use notify::{
     AlertPayload, DEFAULT_QUEUE_CAPACITY, MattermostNotifier, NotificationQueue,
     NotificationWorker, Notifier, NotifierRegistry, backoff_delay,
 };
-pub use parser::{RuleParser, record_parse_error};
+pub use parser::{RuleParser, record_log_matched, record_parse_error};
 pub use stream_buffer::StreamBuffer;
 pub use template::{RenderedMessage, TemplateEngine};
 pub use throttle::{ThrottleResult, Throttler};

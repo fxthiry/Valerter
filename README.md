@@ -1,9 +1,15 @@
-# Valerter
+<p align="center">
+  <img src="assets/svg/valerter-lockup-standard.svg" alt="Valerter" width="400">
+</p>
 
-Real-time log alerting for VictoriaLogs with full log context in notifications.
+<p align="center">
+  Real-time log alerting for VictoriaLogs with full log context in notifications.
+</p>
 
-![CI](https://github.com/fxthiry/valerter/actions/workflows/ci.yml/badge.svg)
-[![codecov](https://codecov.io/gh/fxthiry/valerter/branch/main/graph/badge.svg)](https://codecov.io/gh/fxthiry/valerter)
+<p align="center">
+  <a href="https://github.com/fxthiry/valerter/actions/workflows/ci.yml"><img src="https://github.com/fxthiry/valerter/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/fxthiry/valerter"><img src="https://codecov.io/gh/fxthiry/valerter/branch/main/graph/badge.svg" alt="codecov"></a>
+</p>
 
 ## Features
 
@@ -302,11 +308,65 @@ When `metrics.enabled: true`, valerter exposes a `/metrics` endpoint on the conf
 |--------|------|--------|-------------|
 | `valerter_alerts_sent_total` | Counter | `rule_name`, `notifier_name`, `notifier_type` | Alerts sent successfully |
 | `valerter_alerts_throttled_total` | Counter | `rule_name` | Alerts blocked by throttling |
+| `valerter_alerts_passed_total` | Counter | `rule_name` | Alerts that passed throttling (not blocked) |
 | `valerter_alerts_dropped_total` | Counter | `rule_name` | Alerts dropped (queue full) |
+| `valerter_alerts_failed_total` | Counter | `rule_name`, `notifier_name`, `notifier_type` | Alerts that permanently failed (all retries exhausted) |
+| `valerter_logs_matched_total` | Counter | `rule_name` | Logs matched by rule (before throttling) |
 | `valerter_notify_errors_total` | Counter | `rule_name`, `notifier_name`, `notifier_type` | Notification send errors |
-| `valerter_parse_errors_total` | Counter | `rule_name` | Parsing errors (regex no-match, invalid JSON) |
+| `valerter_parse_errors_total` | Counter | `rule_name`, `error_type` | Parsing errors (regex no-match, invalid JSON) |
 | `valerter_reconnections_total` | Counter | `rule_name` | VictoriaLogs reconnections |
+| `valerter_rule_panics_total` | Counter | `rule_name` | Rule task panics (auto-restarted) |
+| `valerter_rule_errors_total` | Counter | `rule_name` | Fatal rule errors (non-recoverable) |
 | `valerter_queue_size` | Gauge | - | Current notification queue size |
+| `valerter_last_query_timestamp` | Gauge | `rule_name` | Unix timestamp of last successful query chunk |
+| `valerter_victorialogs_up` | Gauge | `rule_name` | VictoriaLogs connection status (1=up, 0=down) |
+| `valerter_uptime_seconds` | Gauge | - | Time since valerter started |
+| `valerter_query_duration_seconds` | Histogram | `rule_name` | VictoriaLogs query latency (time to first chunk) |
+
+### Example Prometheus Alerts
+
+Use these alerting rules to monitor valerter itself:
+
+```yaml
+groups:
+  - name: valerter
+    rules:
+      # Valerter not querying VictoriaLogs for 5 minutes
+      - alert: ValerterNotQuerying
+        expr: time() - valerter_last_query_timestamp > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valerter rule {{ $labels.rule_name }} not querying"
+
+      # VictoriaLogs connection down
+      - alert: ValerterVictoriaLogsDown
+        expr: valerter_victorialogs_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Valerter lost connection to VictoriaLogs"
+
+      # Alerts failing to send
+      - alert: ValerterAlertsFailing
+        expr: rate(valerter_alerts_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valerter alerts failing for {{ $labels.notifier_name }}"
+
+      # Too many alerts throttled
+      - alert: ValerterHighThrottleRate
+        expr: rate(valerter_alerts_throttled_total[1h]) > 100
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "High throttle rate on rule {{ $labels.rule_name }}"
+```
 
 ### Prometheus Scrape Configuration
 

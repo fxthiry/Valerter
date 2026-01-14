@@ -29,7 +29,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -275,11 +275,19 @@ impl TailClient {
         loop {
             let url = self.build_url();
 
+            // Start timing for query_duration metric
+            let request_start = Instant::now();
             let connect_result = self.build_request(&url).send().await;
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
-                    // Connection successful
+                    // Connection successful - mark VictoriaLogs as up
+                    metrics::gauge!(
+                        "valerter_victorialogs_up",
+                        "rule_name" => rule_name.to_string()
+                    )
+                    .set(1.0);
+
                     if had_failure {
                         // We recovered from a failure
                         log_reconnection_success(rule_name);
@@ -292,7 +300,13 @@ impl TailClient {
                     resp
                 }
                 Ok(resp) => {
-                    // HTTP error (4xx, 5xx)
+                    // HTTP error (4xx, 5xx) - mark VictoriaLogs as down
+                    metrics::gauge!(
+                        "valerter_victorialogs_up",
+                        "rule_name" => rule_name.to_string()
+                    )
+                    .set(0.0);
+
                     had_failure = true;
                     let delay = backoff_delay_default(attempt);
                     log_reconnection_attempt(rule_name, attempt, delay);
@@ -306,7 +320,13 @@ impl TailClient {
                     continue;
                 }
                 Err(e) => {
-                    // Connection error
+                    // Connection error - mark VictoriaLogs as down
+                    metrics::gauge!(
+                        "valerter_victorialogs_up",
+                        "rule_name" => rule_name.to_string()
+                    )
+                    .set(0.0);
+
                     had_failure = true;
                     let delay = backoff_delay_default(attempt);
                     log_reconnection_attempt(rule_name, attempt, delay);
@@ -319,10 +339,33 @@ impl TailClient {
 
             // Process the stream
             let mut stream = response.bytes_stream();
+            let mut first_chunk_received = false;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // Record query duration on first chunk only
+                        if !first_chunk_received {
+                            first_chunk_received = true;
+                            let duration = request_start.elapsed();
+                            metrics::histogram!(
+                                "valerter_query_duration_seconds",
+                                "rule_name" => rule_name.to_string()
+                            )
+                            .record(duration.as_secs_f64());
+                        }
+
+                        // Update last query timestamp on each successful chunk
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs_f64();
+                        metrics::gauge!(
+                            "valerter_last_query_timestamp",
+                            "rule_name" => rule_name.to_string()
+                        )
+                        .set(now);
+
                         self.buffer.push(&chunk);
                         let lines = self.buffer.drain_complete_lines()?;
 
@@ -334,7 +377,13 @@ impl TailClient {
                         }
                     }
                     Err(e) => {
-                        // Stream error - reconnect
+                        // Stream error - mark VictoriaLogs as down and reconnect
+                        metrics::gauge!(
+                            "valerter_victorialogs_up",
+                            "rule_name" => rule_name.to_string()
+                        )
+                        .set(0.0);
+
                         had_failure = true;
                         let delay = backoff_delay_default(attempt);
                         log_reconnection_attempt(rule_name, attempt, delay);

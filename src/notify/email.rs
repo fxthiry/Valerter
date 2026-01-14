@@ -544,6 +544,14 @@ impl Notifier for EmailNotifier {
                 "notifier_type" => "email"
             )
             .increment(1);
+            // Permanent failure - all recipients failed
+            metrics::counter!(
+                "valerter_alerts_failed_total",
+                "rule_name" => alert.rule_name.clone(),
+                "notifier_name" => self.name.clone(),
+                "notifier_type" => "email"
+            )
+            .increment(1);
             Err(NotifyError::SendFailed(format!(
                 "all {} recipients failed",
                 failure_count
