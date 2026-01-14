@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "valerter"
-version = "1.0.0-alpha.2"
+version = "1.0.0-beta.1"
 dependencies = [
  "anyhow",
  "async-trait",

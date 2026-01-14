@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.1] - 2025-01-14
+
+### Added
+- **`valerter_build_info` metric** - Exposes version label for Prometheus dashboards
+- **CHANGELOG.md** - Document all changes following Keep a Changelog format
+
+### Fixed
+- **Debian package auto-restart** - Service now automatically restarts on upgrade if running
+
+### Changed
+- **CI optimization** - Skip CI for documentation and asset-only changes (`.md`, images)
+
 ## [1.0.0-alpha.2] - 2025-01-14
 
 ### Added
@@ -37,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.2...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-beta.1...HEAD
+[1.0.0-beta.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.2...v1.0.0-beta.1
 [1.0.0-alpha.2]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.1...v1.0.0-alpha.2
 [1.0.0-alpha.1]: https://github.com/fxthiry/valerter/releases/tag/v1.0.0-alpha.1
