@@ -108,7 +108,8 @@ fn create_notifier_registry(
 
         // Create registry from config
         let registry =
-            NotifierRegistry::from_config(notifiers_config, http_client).map_err(|errors| {
+            NotifierRegistry::from_config(notifiers_config, http_client, &config.config_dir)
+                .map_err(|errors| {
                 for e in &errors {
                     error!(error = %e, "Notifier configuration error");
                 }
@@ -205,7 +206,7 @@ fn main() -> Result<()> {
     }
 
     // Compile configuration for runtime (FR15)
-    let runtime_config = config.compile()?;
+    let runtime_config = config.compile(&cli.config)?;
 
     info!(config_path = %cli.config.display(), "valerter starting");
 

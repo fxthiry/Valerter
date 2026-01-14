@@ -155,7 +155,8 @@ metrics:
 #   # Email Notifier (SMTP)
 #   # --------------------------------------------------------------------------
 #   # Required: smtp (host, port), from, to, subject_template
-#   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify, body_format
+#   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify, body_format,
+#   #           body_template, body_template_file
 #   #
 #   # TLS modes:
 #   #   - none: No encryption (port 25, internal networks only)
@@ -165,6 +166,13 @@ metrics:
 #   # Body formats:
 #   #   - text: Plain text (default)
 #   #   - html: HTML formatted email
+#   #
+#   # Body templates (HTML only):
+#   #   - body_template: inline Jinja template string
+#   #   - body_template_file: path to template file (relative to config or absolute)
+#   #   - If neither is specified, a default HTML template is used
+#   #   - Available variables: title, body, rule_name, color, icon
+#   #   - Note: Cannot be used with body_format: text
 #
 #   # Example: Full email config with authentication
 #   email-ops:
@@ -182,6 +190,28 @@ metrics:
 #       - "admin@example.com"
 #     subject_template: "[{{ rule_name | upper }}] {{ title }}"  # REQUIRED
 #     body_format: text                      # Default: text. Options: text, html
+#
+#   # Example: HTML email with custom template
+#   email-html:
+#     type: email
+#     smtp:
+#       host: smtp.example.com
+#       port: 587
+#     from: "valerter@example.com"
+#     to:
+#       - "ops@example.com"
+#     subject_template: "[{{ rule_name }}] {{ title }}"
+#     body_format: html
+#     body_template_file: "templates/custom-email.html.j2"  # Relative to config file
+#     # Or inline:
+#     # body_template: |
+#     #   <html>
+#     #     <body>
+#     #       <h1>{{ title }}</h1>
+#     #       <p>{{ body }}</p>
+#     #       <small>Rule: {{ rule_name }}</small>
+#     #     </body>
+#     #   </html>
 #
 #   # Example: Minimal email config (internal network, no auth)
 #   email-internal:

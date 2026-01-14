@@ -378,7 +378,16 @@ pub struct WebhookNotifierConfig {
 /// - TLS modes (none, starttls, tls)
 /// - Certificate verification options
 /// - Environment variable substitution for credentials
-/// - Custom subject templates
+/// - Custom subject and body templates (minijinja)
+///
+/// # Body Template Options
+///
+/// - `body_template`: Inline template string (mutually exclusive with body_template_file)
+/// - `body_template_file`: Path to template file (relative to config or absolute)
+/// - If neither specified: uses embedded default HTML template
+/// - **Note**: body_template/body_template_file requires `body_format: html`
+///
+/// Available template variables: `title`, `body`, `rule_name`, `color`, `icon`
 ///
 /// # Example YAML
 ///
@@ -396,7 +405,11 @@ pub struct WebhookNotifierConfig {
 ///     from: valerter@example.com
 ///     to: [ops@example.com, admin@example.com]
 ///     subject_template: "[{{ rule_name | upper }}] {{ title }}"
-///     body_format: text
+///     body_format: html
+///     body_template: |
+///       <h1>{{ title }}</h1>
+///       <p>{{ body }}</p>
+///       <small>Rule: {{ rule_name }}</small>
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailNotifierConfig {
@@ -412,6 +425,14 @@ pub struct EmailNotifierConfig {
     /// Body format (text or html). Defaults to text.
     #[serde(default)]
     pub body_format: BodyFormat,
+    /// Body template (inline minijinja).
+    /// Available variables: title, body, rule_name, color, icon.
+    #[serde(default)]
+    pub body_template: Option<String>,
+    /// Path to body template file (relative to config file or absolute).
+    /// Available variables: title, body, rule_name, color, icon.
+    #[serde(default)]
+    pub body_template_file: Option<String>,
 }
 
 /// SMTP server configuration.
@@ -529,6 +550,131 @@ pub fn resolve_env_vars(value: &str) -> Result<String, ConfigError> {
     }
 }
 
+/// Maximum size for body_template_file (1MB).
+const MAX_BODY_TEMPLATE_SIZE: u64 = 1024 * 1024;
+
+/// Resolve the body template for an email notifier.
+///
+/// Resolves the body template source based on priority:
+/// 1. `body_template_file` - read from file (relative to config_dir or absolute)
+/// 2. `body_template` - inline template string
+/// 3. `None` - use embedded default template
+///
+/// # Arguments
+///
+/// * `config` - Email notifier configuration
+/// * `config_dir` - Directory containing the config file (for relative path resolution)
+///
+/// # Returns
+///
+/// * `Ok(Some(template))` - Template content from file or inline
+/// * `Ok(None)` - No template specified, use embedded default
+/// * `Err(ConfigError)` - File not found, too large, or not UTF-8
+pub fn resolve_body_template(
+    config: &EmailNotifierConfig,
+    config_dir: &Path,
+) -> Result<Option<String>, ConfigError> {
+    // Warn if both are defined
+    if config.body_template.is_some() && config.body_template_file.is_some() {
+        tracing::warn!(
+            "both body_template and body_template_file defined, using body_template_file"
+        );
+    }
+
+    // Priority 1: body_template_file
+    if let Some(ref file_path) = config.body_template_file {
+        let path = if Path::new(file_path).is_absolute() {
+            std::path::PathBuf::from(file_path)
+        } else {
+            config_dir.join(file_path)
+        };
+
+        // Check file exists
+        if !path.exists() {
+            return Err(ConfigError::ValidationError(format!(
+                "body_template_file not found: {}",
+                path.display()
+            )));
+        }
+
+        // Check file size (F14)
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            ConfigError::ValidationError(format!(
+                "cannot read body_template_file '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        if metadata.len() > MAX_BODY_TEMPLATE_SIZE {
+            return Err(ConfigError::ValidationError(format!(
+                "body_template_file '{}' exceeds maximum size of 1MB ({} bytes)",
+                path.display(),
+                metadata.len()
+            )));
+        }
+
+        // Read file content (F8: UTF-8 validation via read_to_string)
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                ConfigError::ValidationError(format!(
+                    "body_template_file '{}' must be valid UTF-8",
+                    path.display()
+                ))
+            } else {
+                ConfigError::ValidationError(format!(
+                    "cannot read body_template_file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            }
+        })?;
+
+        tracing::debug!("body template source: file");
+        return Ok(Some(content));
+    }
+
+    // Priority 2: body_template (inline)
+    if let Some(ref template) = config.body_template {
+        tracing::debug!("body template source: inline");
+        return Ok(Some(template.clone()));
+    }
+
+    // Priority 3: None (use embedded default)
+    tracing::debug!("body template source: embedded");
+    Ok(None)
+}
+
+/// Validate that body_template is not used with body_format: text.
+///
+/// Using a body template implies HTML output; plain text format is incompatible.
+///
+/// # Arguments
+///
+/// * `config` - Email notifier configuration
+/// * `notifier_name` - Name of the notifier for error messages
+///
+/// # Returns
+///
+/// * `Ok(())` - Configuration is valid
+/// * `Err(ConfigError)` - body_template used with body_format: text
+pub fn validate_body_template_format(
+    config: &EmailNotifierConfig,
+    notifier_name: &str,
+) -> Result<(), ConfigError> {
+    let has_body_template = config.body_template.is_some() || config.body_template_file.is_some();
+
+    if has_body_template && config.body_format == BodyFormat::Text {
+        return Err(ConfigError::InvalidNotifier {
+            name: notifier_name.to_string(),
+            message: "body_template or body_template_file cannot be used with body_format: text"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 // ============================================================
 // RuntimeConfig - Pre-compiled configuration for runtime use
 // ============================================================
@@ -553,6 +699,8 @@ pub struct RuntimeConfig {
     pub notifiers: Option<NotifiersConfig>,
     /// Mattermost webhook URL (legacy - for backward compatibility).
     pub mattermost_webhook: Option<SecretString>,
+    /// Directory containing the config file (for relative path resolution).
+    pub config_dir: std::path::PathBuf,
 }
 
 /// Compiled alert rule with pre-compiled regex.
@@ -844,9 +992,13 @@ impl Config {
     /// ```ignore
     /// let config = Config::load(&path)?;
     /// config.validate()?;
-    /// let runtime_config = config.compile()?;
+    /// let runtime_config = config.compile(&path)?;
     /// ```
-    pub fn compile(self) -> Result<RuntimeConfig, ConfigError> {
+    pub fn compile(self, config_path: &Path) -> Result<RuntimeConfig, ConfigError> {
+        let config_dir = config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
         let rules =
             self.rules
                 .into_iter()
@@ -897,6 +1049,7 @@ impl Config {
             metrics: self.metrics,
             notifiers: self.notifiers,
             mattermost_webhook: self.mattermost_webhook,
+            config_dir,
         })
     }
 }
@@ -1260,10 +1413,11 @@ mod tests {
     // Test: Config compiles to RuntimeConfig with pre-compiled regex
     #[test]
     fn compile_creates_runtime_config_with_compiled_regex() {
-        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        let path = fixture_path("config_valid.yaml");
+        let config = Config::load(&path).unwrap();
         config.validate().expect("Valid config should validate");
 
-        let runtime = config.compile().expect("Valid config should compile");
+        let runtime = config.compile(&path).expect("Valid config should compile");
 
         // Check rules are transferred
         assert_eq!(runtime.rules.len(), 3);
@@ -1290,10 +1444,11 @@ mod tests {
     // Test: RuntimeConfig preserves all config values
     #[test]
     fn compile_preserves_config_values() {
-        let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+        let path = fixture_path("config_valid.yaml");
+        let config = Config::load(&path).unwrap();
         config.validate().unwrap();
 
-        let runtime = config.compile().unwrap();
+        let runtime = config.compile(&path).unwrap();
 
         // VictoriaLogs config
         assert_eq!(runtime.victorialogs.url, "http://victorialogs:9428");
@@ -2184,6 +2339,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             notifiers: Some(HashMap::new()), // Notifiers section exists
             mattermost_webhook: None,
+            config_dir: std::path::PathBuf::from("."),
         }
     }
 
@@ -2342,6 +2498,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             notifiers: Some(HashMap::new()),
             mattermost_webhook: None,
+            config_dir: std::path::PathBuf::from("."),
         };
 
         let valid_notifiers = vec!["valid-notifier"];
@@ -2699,5 +2856,289 @@ mod tests {
     fn body_format_defaults_to_text() {
         let format: BodyFormat = serde_yaml::from_str("~").unwrap_or_default();
         assert_eq!(format, BodyFormat::Text);
+    }
+
+    // ===================================================================
+    // Body template config tests (Task 14 - Tech Spec email-body-template)
+    // ===================================================================
+
+    #[test]
+    fn email_config_with_body_template_inline() {
+        // Task 14: Test parsing config with inline body_template
+        let yaml = r#"
+            type: email
+            smtp:
+              host: smtp.example.com
+              port: 587
+            from: test@example.com
+            to: [dest@example.com]
+            subject_template: "{{ title }}"
+            body_format: html
+            body_template: |
+              <html><body>{{ title }}: {{ body }}</body></html>
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Email(cfg) => {
+                assert!(cfg.body_template.is_some());
+                assert!(cfg.body_template.as_ref().unwrap().contains("{{ title }}"));
+                assert!(cfg.body_template_file.is_none());
+            }
+            _ => panic!("Expected Email variant"),
+        }
+    }
+
+    #[test]
+    fn email_config_body_template_with_text_format_fails() {
+        // Task 14: Test that body_template + body_format: text fails validation
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Text, // Incompatible with body_template
+            body_template: Some("<p>{{ body }}</p>".to_string()),
+            body_template_file: None,
+        };
+
+        let result = validate_body_template_format(&config, "test-notifier");
+
+        assert!(result.is_err(), "body_template with text format should fail");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "test-notifier");
+                assert!(
+                    message.contains("body_template"),
+                    "Error should mention body_template: {}",
+                    message
+                );
+                assert!(
+                    message.contains("text"),
+                    "Error should mention text format: {}",
+                    message
+                );
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn email_config_body_template_file_with_text_format_fails() {
+        // Task 14: Test that body_template_file + body_format: text fails validation
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Text, // Incompatible with body_template_file
+            body_template: None,
+            body_template_file: Some("templates/custom.html".to_string()),
+        };
+
+        let result = validate_body_template_format(&config, "file-notifier");
+
+        assert!(
+            result.is_err(),
+            "body_template_file with text format should fail"
+        );
+    }
+
+    #[test]
+    fn email_config_body_template_file_not_found_fails() {
+        // Task 14: Test that non-existent body_template_file fails
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Html,
+            body_template: None,
+            body_template_file: Some("nonexistent/template.html".to_string()),
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_err(), "Non-existent file should fail");
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("not found"),
+                    "Error should mention file not found: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("body_template_file"),
+                    "Error should mention body_template_file: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected ValidationError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_inline() {
+        // Task 14: Test resolve_body_template returns inline template
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Html,
+            body_template: Some("<p>Inline: {{ body }}</p>".to_string()),
+            body_template_file: None,
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok());
+        let template = result.unwrap();
+        assert!(template.is_some());
+        assert_eq!(template.unwrap(), "<p>Inline: {{ body }}</p>");
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_returns_none_for_default() {
+        // Task 14: Test resolve_body_template returns None when no template specified
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Html,
+            body_template: None,
+            body_template_file: None,
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok());
+        let template = result.unwrap();
+        assert!(
+            template.is_none(),
+            "Should return None for embedded default"
+        );
+    }
+
+    #[test]
+    fn email_config_resolve_body_template_file_success() {
+        // Task 14: Test resolve_body_template reads file successfully
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Html,
+            body_template: None,
+            body_template_file: Some("templates/default-email.html.j2".to_string()),
+        };
+
+        let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = resolve_body_template(&config, &config_dir);
+
+        assert!(result.is_ok(), "Should read existing template file");
+        let template = result.unwrap();
+        assert!(template.is_some());
+        assert!(
+            template.as_ref().unwrap().contains("<!DOCTYPE html>"),
+            "Should contain HTML content"
+        );
+    }
+
+    #[test]
+    fn email_config_body_format_html_allows_template() {
+        // Task 14: Test that body_format: html allows body_template
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Html, // Compatible with body_template
+            body_template: Some("<p>{{ body }}</p>".to_string()),
+            body_template_file: None,
+        };
+
+        let result = validate_body_template_format(&config, "html-notifier");
+
+        assert!(result.is_ok(), "body_template with html format should pass");
+    }
+
+    #[test]
+    fn email_config_no_template_allows_any_format() {
+        // Task 14: Test that no body_template allows any body_format
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_format: BodyFormat::Text, // OK when no body_template
+            body_template: None,
+            body_template_file: None,
+        };
+
+        let result = validate_body_template_format(&config, "no-template");
+
+        assert!(result.is_ok(), "No template should allow text format");
     }
 }

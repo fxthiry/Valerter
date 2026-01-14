@@ -74,6 +74,7 @@ assets = [
     ["target/release/valerter", "usr/bin/", "755"],
     ["systemd/valerter.service", "lib/systemd/system/", "644"],
     ["config/config.example.yaml", "etc/valerter/config.yaml", "600"],
+    ["templates/default-email.html.j2", "etc/valerter/templates/", "644"],
 ]
 conf-files = ["/etc/valerter/config.yaml"]
 maintainer-scripts = "debian/"
