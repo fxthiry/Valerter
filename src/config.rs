@@ -389,7 +389,6 @@ pub struct WebhookNotifierConfig {
 /// - `body_template`: Inline template string (mutually exclusive with body_template_file)
 /// - `body_template_file`: Path to template file (relative to config or absolute)
 /// - If neither specified: uses embedded default HTML template
-/// - **Note**: body_template/body_template_file requires `body_format: html`
 ///
 /// Available template variables: `title`, `body`, `rule_name`, `color`, `icon`
 ///
@@ -409,7 +408,6 @@ pub struct WebhookNotifierConfig {
 ///     from: valerter@example.com
 ///     to: [ops@example.com, admin@example.com]
 ///     subject_template: "[{{ rule_name | upper }}] {{ title }}"
-///     body_format: html
 ///     body_template: |
 ///       <h1>{{ title }}</h1>
 ///       <p>{{ body }}</p>
@@ -426,9 +424,6 @@ pub struct EmailNotifierConfig {
     /// Subject line template (minijinja).
     /// Available variables: title, body, rule_name, color, icon.
     pub subject_template: String,
-    /// Body format (text or html). Defaults to text.
-    #[serde(default)]
-    pub body_format: BodyFormat,
     /// Body template (inline minijinja).
     /// Available variables: title, body, rule_name, color, icon.
     #[serde(default)]
@@ -473,17 +468,6 @@ pub enum TlsMode {
     Starttls,
     /// Direct TLS connection (port 465).
     Tls,
-}
-
-/// Body format for email messages.
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BodyFormat {
-    /// Plain text body.
-    #[default]
-    Text,
-    /// HTML body.
-    Html,
 }
 
 fn default_post() -> String {
@@ -647,36 +631,6 @@ pub fn resolve_body_template(
     // Priority 3: None (use embedded default)
     tracing::debug!("body template source: embedded");
     Ok(None)
-}
-
-/// Validate that body_template is not used with body_format: text.
-///
-/// Using a body template implies HTML output; plain text format is incompatible.
-///
-/// # Arguments
-///
-/// * `config` - Email notifier configuration
-/// * `notifier_name` - Name of the notifier for error messages
-///
-/// # Returns
-///
-/// * `Ok(())` - Configuration is valid
-/// * `Err(ConfigError)` - body_template used with body_format: text
-pub fn validate_body_template_format(
-    config: &EmailNotifierConfig,
-    notifier_name: &str,
-) -> Result<(), ConfigError> {
-    let has_body_template = config.body_template.is_some() || config.body_template_file.is_some();
-
-    if has_body_template && config.body_format == BodyFormat::Text {
-        return Err(ConfigError::InvalidNotifier {
-            name: notifier_name.to_string(),
-            message: "body_template or body_template_file cannot be used with body_format: text"
-                .to_string(),
-        });
-    }
-
-    Ok(())
 }
 
 // ============================================================
@@ -2713,7 +2667,6 @@ mod tests {
               - ops@example.com
               - admin@example.com
             subject_template: "[{{ rule_name | upper }}] {{ title }}"
-            body_format: text
         "#;
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
@@ -2729,7 +2682,6 @@ mod tests {
                 assert_eq!(cfg.to[0], "ops@example.com");
                 assert_eq!(cfg.to[1], "admin@example.com");
                 assert!(cfg.subject_template.contains("{{ rule_name"));
-                assert_eq!(cfg.body_format, BodyFormat::Text);
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2756,7 +2708,6 @@ mod tests {
                 assert!(cfg.smtp.password.is_none());
                 assert_eq!(cfg.smtp.tls, TlsMode::Starttls); // default
                 assert!(cfg.smtp.tls_verify); // default true
-                assert_eq!(cfg.body_format, BodyFormat::Text); // default
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2821,27 +2772,6 @@ mod tests {
         match config {
             NotifierConfig::Email(cfg) => {
                 assert!(!cfg.smtp.tls_verify);
-            }
-            _ => panic!("Expected Email variant"),
-        }
-    }
-
-    #[test]
-    fn email_notifier_config_body_format_html() {
-        let yaml = r#"
-            type: email
-            smtp:
-              host: smtp.example.com
-              port: 587
-            from: test@example.com
-            to: [dest@example.com]
-            subject_template: "{{ title }}"
-            body_format: html
-        "#;
-        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
-        match config {
-            NotifierConfig::Email(cfg) => {
-                assert_eq!(cfg.body_format, BodyFormat::Html);
             }
             _ => panic!("Expected Email variant"),
         }
@@ -2921,12 +2851,6 @@ mod tests {
         assert_eq!(tls, TlsMode::Starttls);
     }
 
-    #[test]
-    fn body_format_defaults_to_text() {
-        let format: BodyFormat = serde_yaml::from_str("~").unwrap_or_default();
-        assert_eq!(format, BodyFormat::Text);
-    }
-
     // ===================================================================
     // Body template config tests (Task 14 - Tech Spec email-body-template)
     // ===================================================================
@@ -2942,7 +2866,6 @@ mod tests {
             from: test@example.com
             to: [dest@example.com]
             subject_template: "{{ title }}"
-            body_format: html
             body_template: |
               <html><body>{{ title }}: {{ body }}</body></html>
         "#;
@@ -2955,79 +2878,6 @@ mod tests {
             }
             _ => panic!("Expected Email variant"),
         }
-    }
-
-    #[test]
-    fn email_config_body_template_with_text_format_fails() {
-        // Task 14: Test that body_template + body_format: text fails validation
-        let config = EmailNotifierConfig {
-            smtp: SmtpConfig {
-                host: "smtp.example.com".to_string(),
-                port: 587,
-                username: None,
-                password: None,
-                tls: TlsMode::Starttls,
-                tls_verify: true,
-            },
-            from: "test@example.com".to_string(),
-            to: vec!["dest@example.com".to_string()],
-            subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Text, // Incompatible with body_template
-            body_template: Some("<p>{{ body }}</p>".to_string()),
-            body_template_file: None,
-        };
-
-        let result = validate_body_template_format(&config, "test-notifier");
-
-        assert!(
-            result.is_err(),
-            "body_template with text format should fail"
-        );
-        let err = result.unwrap_err();
-        match err {
-            ConfigError::InvalidNotifier { name, message } => {
-                assert_eq!(name, "test-notifier");
-                assert!(
-                    message.contains("body_template"),
-                    "Error should mention body_template: {}",
-                    message
-                );
-                assert!(
-                    message.contains("text"),
-                    "Error should mention text format: {}",
-                    message
-                );
-            }
-            _ => panic!("Expected InvalidNotifier, got {:?}", err),
-        }
-    }
-
-    #[test]
-    fn email_config_body_template_file_with_text_format_fails() {
-        // Task 14: Test that body_template_file + body_format: text fails validation
-        let config = EmailNotifierConfig {
-            smtp: SmtpConfig {
-                host: "smtp.example.com".to_string(),
-                port: 587,
-                username: None,
-                password: None,
-                tls: TlsMode::Starttls,
-                tls_verify: true,
-            },
-            from: "test@example.com".to_string(),
-            to: vec!["dest@example.com".to_string()],
-            subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Text, // Incompatible with body_template_file
-            body_template: None,
-            body_template_file: Some("templates/custom.html".to_string()),
-        };
-
-        let result = validate_body_template_format(&config, "file-notifier");
-
-        assert!(
-            result.is_err(),
-            "body_template_file with text format should fail"
-        );
     }
 
     #[test]
@@ -3045,7 +2895,6 @@ mod tests {
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html,
             body_template: None,
             body_template_file: Some("nonexistent/template.html".to_string()),
         };
@@ -3087,7 +2936,6 @@ mod tests {
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html,
             body_template: Some("<p>Inline: {{ body }}</p>".to_string()),
             body_template_file: None,
         };
@@ -3116,7 +2964,6 @@ mod tests {
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html,
             body_template: None,
             body_template_file: None,
         };
@@ -3147,7 +2994,6 @@ mod tests {
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html,
             body_template: None,
             body_template_file: Some("templates/default-email.html.j2".to_string()),
         };
@@ -3162,56 +3008,6 @@ mod tests {
             template.as_ref().unwrap().contains("<!DOCTYPE html>"),
             "Should contain HTML content"
         );
-    }
-
-    #[test]
-    fn email_config_body_format_html_allows_template() {
-        // Task 14: Test that body_format: html allows body_template
-        let config = EmailNotifierConfig {
-            smtp: SmtpConfig {
-                host: "smtp.example.com".to_string(),
-                port: 587,
-                username: None,
-                password: None,
-                tls: TlsMode::Starttls,
-                tls_verify: true,
-            },
-            from: "test@example.com".to_string(),
-            to: vec!["dest@example.com".to_string()],
-            subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html, // Compatible with body_template
-            body_template: Some("<p>{{ body }}</p>".to_string()),
-            body_template_file: None,
-        };
-
-        let result = validate_body_template_format(&config, "html-notifier");
-
-        assert!(result.is_ok(), "body_template with html format should pass");
-    }
-
-    #[test]
-    fn email_config_no_template_allows_any_format() {
-        // Task 14: Test that no body_template allows any body_format
-        let config = EmailNotifierConfig {
-            smtp: SmtpConfig {
-                host: "smtp.example.com".to_string(),
-                port: 587,
-                username: None,
-                password: None,
-                tls: TlsMode::Starttls,
-                tls_verify: true,
-            },
-            from: "test@example.com".to_string(),
-            to: vec!["dest@example.com".to_string()],
-            subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Text, // OK when no body_template
-            body_template: None,
-            body_template_file: None,
-        };
-
-        let result = validate_body_template_format(&config, "no-template");
-
-        assert!(result.is_ok(), "No template should allow text format");
     }
 
     // ===================================================================

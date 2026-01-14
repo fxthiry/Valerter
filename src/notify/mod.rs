@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_creates_email_notifiers() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         let mut notifiers_config = HashMap::new();
         notifiers_config.insert(
@@ -1357,7 +1357,6 @@ mod tests {
                 from: "valerter@example.com".to_string(),
                 to: vec!["ops@example.com".to_string()],
                 subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-                body_format: BodyFormat::Text,
                 body_template: None,
                 body_template_file: None,
             }),
@@ -1379,7 +1378,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_with_auth() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         temp_env::with_vars(
             [
@@ -1402,7 +1401,6 @@ mod tests {
                         from: "valerter@example.com".to_string(),
                         to: vec!["ops@example.com".to_string()],
                         subject_template: "{{ title }}".to_string(),
-                        body_format: BodyFormat::Text,
                         body_template: None,
                         body_template_file: None,
                     }),
@@ -1425,7 +1423,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_fails_on_undefined_env_var() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         temp_env::with_var("UNDEFINED_SMTP_VAR_REG", None::<&str>, || {
             let mut notifiers_config = HashMap::new();
@@ -1443,7 +1441,6 @@ mod tests {
                     from: "valerter@example.com".to_string(),
                     to: vec!["ops@example.com".to_string()],
                     subject_template: "{{ title }}".to_string(),
-                    body_format: BodyFormat::Text,
                     body_template: None,
                     body_template_file: None,
                 }),
@@ -1469,7 +1466,7 @@ mod tests {
 
     #[test]
     fn registry_from_config_email_fails_on_invalid_from_address() {
-        use crate::config::{BodyFormat, EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
+        use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
         let mut notifiers_config = HashMap::new();
         notifiers_config.insert(
@@ -1486,7 +1483,6 @@ mod tests {
                 from: "not-an-email".to_string(),
                 to: vec!["ops@example.com".to_string()],
                 subject_template: "{{ title }}".to_string(),
-                body_format: BodyFormat::Text,
                 body_template: None,
                 body_template_file: None,
             }),
@@ -1511,8 +1507,8 @@ mod tests {
     #[test]
     fn registry_from_config_all_three_notifier_types() {
         use crate::config::{
-            BodyFormat, EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig,
-            TlsMode, WebhookNotifierConfig,
+            EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig, TlsMode,
+            WebhookNotifierConfig,
         };
 
         temp_env::with_var(
@@ -1558,7 +1554,6 @@ mod tests {
                         from: "valerter@example.com".to_string(),
                         to: vec!["ops@example.com".to_string()],
                         subject_template: "{{ title }}".to_string(),
-                        body_format: BodyFormat::Text,
                         body_template: None,
                         body_template_file: None,
                     }),

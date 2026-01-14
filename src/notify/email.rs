@@ -9,10 +9,7 @@
 //! - Production: Uses `AsyncSmtpTransport<Tokio1Executor>`
 //! - Testing: Uses `MockEmailTransport` for unit tests without SMTP server
 
-use crate::config::{
-    BodyFormat, EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars,
-    validate_body_template_format,
-};
+use crate::config::{EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars};
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
@@ -126,8 +123,6 @@ pub struct EmailNotifier {
     subject_template_source: String,
     /// Body template source (always has a value - defaults to embedded template).
     body_template_source: String,
-    /// Body format (text or html).
-    body_format: BodyFormat,
 }
 
 impl EmailNotifier {
@@ -218,16 +213,13 @@ impl EmailNotifier {
             }
         })?;
 
-        // 6. Validate body_format vs body_template compatibility
-        validate_body_template_format(config, name)?;
-
-        // 7. Resolve body template (file > inline > embedded default)
+        // 6. Resolve body template (file > inline > embedded default)
         let body_template_source = match resolve_body_template(config, config_dir)? {
             Some(template) => template,
             None => DEFAULT_BODY_TEMPLATE.to_string(),
         };
 
-        // 8. Validate the body template
+        // 7. Validate the body template
         Self::validate_template(&body_template_source).map_err(|e| {
             ConfigError::InvalidNotifier {
                 name: name.to_string(),
@@ -242,7 +234,6 @@ impl EmailNotifier {
             to,
             subject_template_source: config.subject_template.clone(),
             body_template_source,
-            body_format: config.body_format,
         })
     }
 
@@ -258,7 +249,7 @@ impl EmailNotifier {
     /// * `from` - Sender email address
     /// * `to` - Recipient email addresses
     /// * `subject_template_source` - Subject line template
-    /// * `body_format` - Body format (text or html)
+    /// * `body_template_source` - Optional body template (uses default if None)
     ///
     /// # Example
     ///
@@ -272,7 +263,6 @@ impl EmailNotifier {
     ///     vec!["dest@test.com".parse().unwrap()],
     ///     "[{{ rule_name }}] {{ title }}",
     ///     None, // Use default body template
-    ///     BodyFormat::Text,
     /// );
     /// ```
     #[cfg(test)]
@@ -283,7 +273,6 @@ impl EmailNotifier {
         to: Vec<Mailbox>,
         subject_template_source: &str,
         body_template_source: Option<&str>,
-        body_format: BodyFormat,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -294,7 +283,6 @@ impl EmailNotifier {
             body_template_source: body_template_source
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| DEFAULT_BODY_TEMPLATE.to_string()),
-            body_format,
         }
     }
 
@@ -447,22 +435,13 @@ impl EmailNotifier {
         body: &str,
         recipient: &Mailbox,
     ) -> Result<Message, NotifyError> {
-        let builder = Message::builder()
+        let message = Message::builder()
             .from(self.from.clone())
             .to(recipient.clone())
-            .subject(subject);
-
-        // Build the body based on format
-        let message = match self.body_format {
-            BodyFormat::Text => builder
-                .header(ContentType::TEXT_PLAIN)
-                .body(body.to_string())
-                .map_err(|e| NotifyError::SendFailed(format!("failed to build email: {}", e)))?,
-            BodyFormat::Html => builder
-                .header(ContentType::TEXT_HTML)
-                .body(body.to_string())
-                .map_err(|e| NotifyError::SendFailed(format!("failed to build email: {}", e)))?,
-        };
+            .subject(subject)
+            .header(ContentType::TEXT_HTML)
+            .body(body.to_string())
+            .map_err(|e| NotifyError::SendFailed(format!("failed to build email: {}", e)))?;
 
         Ok(message)
     }
@@ -653,7 +632,6 @@ impl std::fmt::Debug for EmailNotifier {
             .field("name", &self.name)
             .field("from", &self.from.to_string())
             .field("to_count", &self.to.len())
-            .field("body_format", &self.body_format)
             .finish()
     }
 }
@@ -661,7 +639,7 @@ impl std::fmt::Debug for EmailNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BodyFormat, EmailNotifierConfig, SmtpConfig, TlsMode};
+    use crate::config::{EmailNotifierConfig, SmtpConfig, TlsMode};
     use crate::template::RenderedMessage;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -786,7 +764,6 @@ mod tests {
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-            body_format: BodyFormat::Text,
             body_template: None,
             body_template_file: None,
         }
@@ -1097,8 +1074,7 @@ mod tests {
 
     #[test]
     fn build_message_html_format() {
-        let mut config = make_test_config();
-        config.body_format = BodyFormat::Html;
+        let config = make_test_config();
 
         let notifier = EmailNotifier::from_config("test", &config, &test_config_dir()).unwrap();
         let recipient: Mailbox = "test@example.com".parse().unwrap();
@@ -1149,9 +1125,8 @@ mod tests {
         // From address is OK
         assert!(debug.contains("test@example.com"));
         // Should NOT expose SMTP host, credentials, etc.
-        // The debug impl only shows name, from, to_count, body_format
+        // The debug impl only shows name, from, to_count
         assert!(debug.contains("to_count"));
-        assert!(debug.contains("body_format"));
     }
 
     #[test]
@@ -1190,7 +1165,6 @@ mod tests {
             vec!["dest@test.com".parse().unwrap()],
             "[{{ rule_name }}] {{ title }}",
             None, // Use default body template
-            BodyFormat::Text,
         )
     }
 
@@ -1298,7 +1272,6 @@ mod tests {
             ],
             "{{ title }}",
             None, // Use default body template
-            BodyFormat::Text,
         );
 
         let alert = make_alert_payload("test_rule");
@@ -1327,7 +1300,6 @@ mod tests {
             vec!["dest@test.com".parse().unwrap()],
             "{{ title }}",
             None, // Use default body template
-            BodyFormat::Html,
         );
 
         let mut alert = make_alert_payload("html_test");
@@ -1442,7 +1414,6 @@ mod tests {
             ],
             "{{ title }}",
             None, // Use default body template
-            BodyFormat::Text,
         );
 
         let alert = make_alert_payload("partial_test");
@@ -1474,7 +1445,6 @@ mod tests {
             ],
             "{{ title }}",
             None, // Use default body template
-            BodyFormat::Text,
         );
 
         let alert = make_alert_payload("all_fail_test");
@@ -1504,7 +1474,6 @@ Icon: {{ icon }}"#;
             vec!["dest@test.com".parse().unwrap()],
             "{{ title }}",
             Some(custom_template),
-            BodyFormat::Html,
         );
 
         let alert = make_alert_payload("test_rule");
@@ -1533,7 +1502,6 @@ Icon: {{ icon }}"#;
             vec!["dest@test.com".parse().unwrap()],
             "{{ title }}",
             Some(custom_template),
-            BodyFormat::Html,
         );
 
         let alert = make_alert_payload("custom_rule");
@@ -1560,7 +1528,6 @@ Icon: {{ icon }}"#;
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "{{ title }}".to_string(),
-            body_format: BodyFormat::Html,
             body_template: Some("{% if unclosed".to_string()), // Invalid template
             body_template_file: None,
         };
@@ -1595,7 +1562,6 @@ Icon: {{ icon }}"#;
             vec!["dest@test.com".parse().unwrap()],
             "{{ title }}",
             Some(custom_template),
-            BodyFormat::Html,
         );
 
         let alert = make_alert_payload("render_test");
@@ -1625,7 +1591,6 @@ Icon: {{ icon }}"#;
             vec!["dest@test.com".parse().unwrap()],
             "{{ title }}",
             None, // No custom template - should use DEFAULT_BODY_TEMPLATE
-            BodyFormat::Html,
         );
 
         let alert = make_alert_payload("default_test");
@@ -1669,7 +1634,6 @@ Icon: {{ icon }}"#;
             from: "test@example.com".to_string(),
             to: vec!["dest@example.com".to_string()],
             subject_template: "[TEST] {{ _msg | truncate(50) }}".to_string(), // Unknown filter
-            body_format: BodyFormat::Text,
             body_template: None,
             body_template_file: None,
         };
@@ -1712,7 +1676,6 @@ Icon: {{ icon }}"#;
             to: vec!["dest@example.com".to_string()],
             subject_template: "[{{ rule_name | upper }}] {{ title | default('Alert') }}"
                 .to_string(),
-            body_format: BodyFormat::Text,
             body_template: None,
             body_template_file: None,
         };

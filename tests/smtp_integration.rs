@@ -25,7 +25,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
-use valerter::config::{BodyFormat, EmailNotifierConfig, SmtpConfig, TlsMode};
+use valerter::config::{EmailNotifierConfig, SmtpConfig, TlsMode};
 use valerter::notify::email::EmailNotifier;
 use valerter::notify::{AlertPayload, Notifier};
 use valerter::template::RenderedMessage;
@@ -163,7 +163,6 @@ fn create_mailhog_notifier(name: &str) -> EmailNotifier {
         from: "valerter-test@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-        body_format: BodyFormat::Text,
         body_template: None,
         body_template_file: None,
     };
@@ -193,7 +192,6 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
         from: "valerter-test@example.com".to_string(),
         to: recipients.into_iter().map(String::from).collect(),
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-        body_format: BodyFormat::Text,
         body_template: None,
         body_template_file: None,
     };
@@ -201,36 +199,6 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     EmailNotifier::from_config(name, &config, &config_dir)
         .expect("Failed to create EmailNotifier for Mailhog")
-}
-
-/// Create an EmailNotifier with HTML body format.
-fn create_mailhog_notifier_html(name: &str) -> EmailNotifier {
-    let host = std::env::var("TEST_SMTP_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port: u16 = std::env::var("TEST_SMTP_PORT")
-        .unwrap_or_else(|_| "1025".to_string())
-        .parse()
-        .unwrap_or(1025);
-
-    let config = EmailNotifierConfig {
-        smtp: SmtpConfig {
-            host,
-            port,
-            username: None,
-            password: None,
-            tls: TlsMode::None,
-            tls_verify: false,
-        },
-        from: "valerter-html@example.com".to_string(),
-        to: vec!["recipient@example.com".to_string()],
-        subject_template: "{{ title }}".to_string(),
-        body_format: BodyFormat::Html,
-        body_template: None,
-        body_template_file: None,
-    };
-
-    let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    EmailNotifier::from_config(name, &config, &config_dir)
-        .expect("Failed to create HTML EmailNotifier")
 }
 
 /// Create a test alert payload.
@@ -415,7 +383,7 @@ async fn test_send_email_html_format() {
         .expect("Failed to clear Mailhog inbox");
 
     // Create notifier with HTML format
-    let notifier = create_mailhog_notifier_html("html-test");
+    let notifier = create_mailhog_notifier("html-test");
 
     let alert = AlertPayload {
         message: RenderedMessage {
@@ -556,7 +524,6 @@ async fn test_tls_mode_none_with_mailhog() {
         from: "tls-test@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "{{ title }}".to_string(),
-        body_format: BodyFormat::Text,
         body_template: None,
         body_template_file: None,
     };
@@ -661,7 +628,6 @@ async fn test_send_email_with_body_template_inline() {
         from: "template-test@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
-        body_format: BodyFormat::Html,
         body_template: Some(
             r#"<html>
 <body>
@@ -754,7 +720,6 @@ async fn test_send_email_with_body_template_file() {
         from: "file-template@example.com".to_string(),
         to: vec!["recipient@example.com".to_string()],
         subject_template: "{{ title }}".to_string(),
-        body_format: BodyFormat::Html,
         body_template: None,
         body_template_file: Some("templates/default-email.html.j2".to_string()),
     };
@@ -808,7 +773,7 @@ async fn test_send_email_with_default_body_template() {
         .expect("Failed to clear Mailhog inbox");
 
     // Create notifier WITHOUT body_template - should use embedded default
-    let notifier = create_mailhog_notifier_html("default-body-test");
+    let notifier = create_mailhog_notifier("default-body-test");
 
     let alert = make_alert_payload(
         "default_body_rule",
