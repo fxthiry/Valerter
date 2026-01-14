@@ -101,6 +101,11 @@ pub fn register_metric_descriptions() {
 /// a health check on `/health`.
 pub struct MetricsServer {
     port: u16,
+    /// Optional channel to signal when the recorder is ready.
+    /// This allows callers to wait for the recorder to be installed
+    /// before emitting metrics (avoiding the race condition where
+    /// metrics are lost if emitted before the recorder is ready).
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl MetricsServer {
@@ -108,7 +113,22 @@ impl MetricsServer {
     ///
     /// Use port 0 to let the OS assign an available port (useful for testing).
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            ready_tx: None,
+        }
+    }
+
+    /// Create a new metrics server with a ready signal channel.
+    ///
+    /// The channel will be signaled once the Prometheus recorder is installed
+    /// and ready to receive metrics. This prevents the race condition where
+    /// metrics emitted before the recorder is ready are silently lost.
+    pub fn with_ready_signal(port: u16, ready_tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            port,
+            ready_tx: Some(ready_tx),
+        }
     }
 
     /// Returns the configured port.
@@ -126,7 +146,7 @@ impl MetricsServer {
     ///
     /// Returns an error if the server fails to start or encounters
     /// a fatal error during operation.
-    pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
+    pub async fn run(self, cancel: CancellationToken) -> Result<()> {
         let addr: SocketAddr = ([0, 0, 0, 0], self.port).into();
 
         // Build the Prometheus exporter with HTTP server
@@ -142,6 +162,11 @@ impl MetricsServer {
 
         // Register descriptions after recorder is installed
         register_metric_descriptions();
+
+        // Signal that the recorder is ready (if a channel was provided)
+        if let Some(tx) = self.ready_tx {
+            let _ = tx.send(());
+        }
 
         info!(port = self.port, "Metrics server started on /metrics");
 
@@ -159,6 +184,56 @@ impl MetricsServer {
 /// This is useful for tests to know if metrics will be recorded.
 pub fn is_recorder_installed() -> bool {
     RECORDER_INSTALLED.get().is_some()
+}
+
+/// Initialize all known metrics to their default values.
+///
+/// This function should be called immediately after the Prometheus recorder
+/// is installed to ensure all metrics are visible in `/metrics` from startup,
+/// even before any events occur.
+///
+/// # Arguments
+///
+/// * `rule_names` - List of rule names to initialize per-rule counters
+/// * `notifier_names` - List of notifier names to initialize per-notifier counters
+pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
+    use metrics::{counter, gauge};
+
+    // Initialize gauges with their initial values
+    gauge!("valerter_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+    gauge!("valerter_victorialogs_up").set(0.0);
+    gauge!("valerter_uptime_seconds").set(0.0);
+    gauge!("valerter_queue_size").set(0.0);
+
+    // Initialize counters without labels (global counters)
+    counter!("valerter_reconnections_total").absolute(0);
+
+    // Initialize per-rule counters
+    for rule_name in rule_names {
+        counter!("valerter_logs_matched_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_alerts_sent_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_alerts_throttled_total", "rule_name" => rule_name.to_string())
+            .absolute(0);
+        counter!("valerter_alerts_passed_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_alerts_dropped_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_parse_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_rule_panics_total", "rule_name" => rule_name.to_string()).absolute(0);
+        counter!("valerter_rule_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
+    }
+
+    // Initialize per-notifier counters
+    for notifier_name in notifier_names {
+        counter!("valerter_alerts_failed_total", "notifier" => notifier_name.to_string())
+            .absolute(0);
+        counter!("valerter_notify_errors_total", "notifier" => notifier_name.to_string())
+            .absolute(0);
+    }
+
+    tracing::info!(
+        rule_count = rule_names.len(),
+        notifier_count = notifier_names.len(),
+        "Metrics initialized to zero"
+    );
 }
 
 #[cfg(test)]
