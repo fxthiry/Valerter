@@ -108,7 +108,7 @@ impl TailClient {
     fn build_request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut request = self
             .client
-            .post(url)
+            .get(url)
             .header("Accept", "application/x-ndjson")
             .header("Connection", "keep-alive");
 
@@ -274,6 +274,7 @@ impl TailClient {
 
         loop {
             let url = self.build_url();
+            info!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
 
             // Start timing for query_duration metric
             let request_start = Instant::now();
@@ -281,6 +282,7 @@ impl TailClient {
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
+                    info!(rule_name = %rule_name, status = %resp.status(), "Connection successful, starting to stream");
                     // Connection successful - mark VictoriaLogs as up
                     metrics::gauge!(
                         "valerter_victorialogs_up",
