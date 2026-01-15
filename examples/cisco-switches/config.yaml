@@ -13,6 +13,7 @@ notifiers:
     type: mattermost
     webhook_url: "https://mattermost.example.com/hooks/xxx"
     username: "Valerter"
+    icon_url: "https://github.com/fxthiry/Valerter/blob/main/assets/png/valerter-mark-light-128.png?raw=true"
 
   email-infra:
     type: email
