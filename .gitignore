@@ -4,6 +4,7 @@
 # Local config (secrets)
 config/config.yaml
 config/config.test.yaml
+config/config.prod.yaml
 
 # IDE
 .idea/
