@@ -97,6 +97,7 @@ rules:
 - **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost setup
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
 - **[Architecture](docs/architecture.md)** — How Valerter works
+- **[Examples](examples/)** — Real-world configurations with screenshots
 
 ## Contributing
 

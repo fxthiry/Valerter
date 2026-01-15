@@ -1,0 +1,86 @@
+# Valerter Configuration - Cisco BPDU Guard Alert
+# ================================================
+
+victorialogs:
+  url: "http://victorialogs:9428"
+
+metrics:
+  enabled: true
+  port: 9090
+
+notifiers:
+  mattermost-infra:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/xxx"
+    username: "Valerter"
+    icon_url: "https://github.com/fxthiry/Valerter/blob/main/assets/png/valerter-mark-light-128.png?raw=true"
+
+  email-infra:
+    type: email
+    smtp:
+      host: smtp.example.com
+      port: 587
+      tls: starttls
+      username: "user"
+      password: "password"
+    from: "valerter@example.com"
+    to:
+      - "team@example.com"
+    subject_template: "[Valerter] {{ title }}"
+
+defaults:
+  throttle:
+    count: 10
+    window: 5m
+
+templates:
+  SPANTREE-2-BLOCK_BPDUGUARD:
+    title: "🚨 BPDU Guard | {{ switch_name }} ({{ hostname }})"
+    body: |
+      **Switch:** `{{ switch_name }}` | **IP:** `{{ hostname }}` | **Site:** `{{ site }}`
+
+      ```
+      {{ _msg }}
+      ```
+    body_html: |
+      <div style="border-left: 4px solid #dc3545; padding-left: 16px; margin-bottom: 16px;">
+        <h2 style="color: #dc3545; margin: 0 0 8px 0;">🚨 BPDU Guard Violation</h2>
+        <p style="color: #6b7280; margin: 0;">A port has been disabled due to BPDU reception</p>
+      </div>
+
+      <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+        <tr>
+          <td style="padding: 8px 12px; background: #fef2f2; border: 1px solid #fecaca; font-weight: 600; width: 120px;">Switch</td>
+          <td style="padding: 8px 12px; border: 1px solid #fecaca;"><code>{{ switch_name }}</code></td>
+        </tr>
+        <tr>
+          <td style="padding: 8px 12px; background: #fef2f2; border: 1px solid #fecaca; font-weight: 600;">IP</td>
+          <td style="padding: 8px 12px; border: 1px solid #fecaca;"><code>{{ hostname }}</code></td>
+        </tr>
+        <tr>
+          <td style="padding: 8px 12px; background: #fef2f2; border: 1px solid #fecaca; font-weight: 600;">Site</td>
+          <td style="padding: 8px 12px; border: 1px solid #fecaca;"><code>{{ site }}</code></td>
+        </tr>
+      </table>
+
+      <p style="font-weight: 600;">Log excerpt</p>
+      <pre style="background: #1f2937; color: #f9fafb; padding: 12px; border-radius: 4px; overflow-x: auto;">{{ _msg }}</pre>
+    accent_color: "#dc3545"
+
+rules:
+  - name: "SPANTREE-2-BLOCK_BPDUGUARD"
+    enabled: true
+    query: 'group:"SW" "SPANTREE-2-BLOCK_BPDUGUARD"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+      regex: '^\d+: (?P<switch_name>[A-Z0-9-]+):'
+    throttle:
+      key: "{{ switch_name }}"
+      count: 3
+      window: 5m
+    notify:
+      template: "SPANTREE-2-BLOCK_BPDUGUARD"
+      destinations:
+        - mattermost-infra
+        - email-infra
