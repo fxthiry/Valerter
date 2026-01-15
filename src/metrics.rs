@@ -77,7 +77,7 @@ pub fn register_metric_descriptions() {
     );
     describe_gauge!(
         "valerter_victorialogs_up",
-        "VictoriaLogs connection status (1=connected, 0=disconnected)"
+        "VictoriaLogs data received (1=logs received, 0=waiting or error)"
     );
     describe_gauge!(
         "valerter_uptime_seconds",
@@ -201,9 +201,13 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
 
     // Initialize gauges with their initial values
     gauge!("valerter_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
-    gauge!("valerter_victorialogs_up").set(0.0);
     gauge!("valerter_uptime_seconds").set(0.0);
     gauge!("valerter_queue_size").set(0.0);
+
+    // Initialize per-rule gauges
+    for rule_name in rule_names {
+        gauge!("valerter_victorialogs_up", "rule_name" => rule_name.to_string()).set(0.0);
+    }
 
     // Initialize counters without labels (global counters)
     counter!("valerter_reconnections_total").absolute(0);
