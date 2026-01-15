@@ -41,6 +41,10 @@ pub struct DefaultWebhookPayload {
     pub body: String,
     /// ISO 8601 timestamp of when the alert was sent.
     pub timestamp: String,
+    /// Original log timestamp in ISO 8601 format (for VictoriaLogs search).
+    pub log_timestamp: String,
+    /// Human-readable formatted log timestamp.
+    pub log_timestamp_formatted: String,
 }
 
 impl DefaultWebhookPayload {
@@ -52,6 +56,8 @@ impl DefaultWebhookPayload {
             title: alert.message.title.clone(),
             body: alert.message.body.clone(),
             timestamp: Utc::now().to_rfc3339(),
+            log_timestamp: alert.log_timestamp.clone(),
+            log_timestamp_formatted: alert.log_timestamp_formatted.clone(),
         }
     }
 }
@@ -97,8 +103,8 @@ fn validate_body_template(source: &str) -> Result<(), ConfigError> {
 
 /// Render a body template with alert context.
 ///
-/// Generic webhook templates only have access to standard fields (title, body, rule_name).
-/// accent_color is not exposed as webhooks are meant to be generic.
+/// Generic webhook templates have access to standard fields (title, body, rule_name)
+/// plus log timestamps. accent_color is not exposed as webhooks are meant to be generic.
 fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
     let mut env = Environment::new();
     env.add_template("body", source)
@@ -112,6 +118,8 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
         title => &alert.message.title,
         body => &alert.message.body,
         rule_name => &alert.rule_name,
+        log_timestamp => &alert.log_timestamp,
+        log_timestamp_formatted => &alert.log_timestamp_formatted,
     })
     .map_err(|e| NotifyError::SendFailed(format!("template render error: {}", e)))
 }
@@ -375,6 +383,8 @@ mod tests {
             },
             rule_name: rule_name.to_string(),
             destinations: vec![],
+            log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+            log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
         }
     }
 
@@ -609,6 +619,9 @@ mod tests {
         assert_eq!(payload.body, "Something happened");
         // Generic webhook - no color/icon fields
         assert!(!payload.timestamp.is_empty());
+        // Log timestamp fields
+        assert_eq!(payload.log_timestamp, "2026-01-15T10:49:35.799Z");
+        assert_eq!(payload.log_timestamp_formatted, "15/01/2026 10:49:35 UTC");
     }
 
     #[test]
@@ -622,6 +635,8 @@ mod tests {
         assert!(json.contains("\"title\":\"Test Alert\""));
         assert!(json.contains("\"body\":\"Something happened\""));
         assert!(json.contains("\"timestamp\":"));
+        assert!(json.contains("\"log_timestamp\":\"2026-01-15T10:49:35.799Z\""));
+        assert!(json.contains("\"log_timestamp_formatted\":\"15/01/2026 10:49:35 UTC\""));
         // Generic webhook - no color/icon in payload
         assert!(!json.contains("\"color\""));
         assert!(!json.contains("\"icon\""));
@@ -638,6 +653,8 @@ mod tests {
             },
             rule_name: "simple_rule".to_string(),
             destinations: vec![],
+            log_timestamp: "2026-01-15T10:00:00Z".to_string(),
+            log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
         };
         let payload = DefaultWebhookPayload::from_alert(&alert, "webhook");
         let json = serde_json::to_string(&payload).unwrap();
@@ -764,8 +781,8 @@ mod tests {
 
     #[test]
     fn body_template_uses_standard_fields_only() {
-        // Generic webhook templates only have access to title, body, rule_name
-        let source = r#"{"title": "{{ title }}", "rule": "{{ rule_name }}"}"#;
+        // Generic webhook templates have access to title, body, rule_name, and log timestamps
+        let source = r#"{"title": "{{ title }}", "rule": "{{ rule_name }}", "log_time": "{{ log_timestamp_formatted }}"}"#;
 
         let alert = AlertPayload {
             message: RenderedMessage {
@@ -776,11 +793,14 @@ mod tests {
             },
             rule_name: "test_rule".to_string(),
             destinations: vec![],
+            log_timestamp: "2026-01-15T10:00:00Z".to_string(),
+            log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
         };
         let result = render_body_template(source, &alert).unwrap();
 
         assert!(result.contains("\"title\": \"Test\""));
         assert!(result.contains("\"rule\": \"test_rule\""));
+        assert!(result.contains("\"log_time\": \"15/01/2026 10:00:00 UTC\""));
     }
 
     #[test]

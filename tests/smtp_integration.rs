@@ -218,6 +218,8 @@ fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload 
         },
         rule_name: rule_name.to_string(),
         destinations: vec![],
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
 }
 
@@ -403,6 +405,8 @@ async fn test_send_email_html_format() {
         },
         rule_name: "html_rule".to_string(),
         destinations: vec![],
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     };
 
     let result = notifier.send(&alert).await;

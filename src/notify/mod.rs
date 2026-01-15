@@ -18,7 +18,7 @@ pub mod webhook;
 // Re-exports
 pub use email::EmailNotifier;
 pub use mattermost::MattermostNotifier;
-pub use payload::AlertPayload;
+pub use payload::{AlertPayload, format_log_timestamp};
 pub use queue::{DEFAULT_QUEUE_CAPACITY, NotificationQueue, NotificationWorker, backoff_delay};
 pub use registry::NotifierRegistry;
 pub use traits::Notifier;

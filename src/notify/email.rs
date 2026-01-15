@@ -382,6 +382,8 @@ impl EmailNotifier {
             body => &alert.message.body,
             rule_name => &alert.rule_name,
             accent_color => &alert.message.accent_color,
+            log_timestamp => &alert.log_timestamp,
+            log_timestamp_formatted => &alert.log_timestamp_formatted,
         })
         .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
     }
@@ -418,6 +420,8 @@ impl EmailNotifier {
             body => body_safe,
             rule_name => &alert.rule_name,
             accent_color => &alert.message.accent_color,
+            log_timestamp => &alert.log_timestamp,
+            log_timestamp_formatted => &alert.log_timestamp_formatted,
         })
         .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
     }
@@ -781,6 +785,8 @@ mod tests {
             },
             rule_name: rule_name.to_string(),
             destinations: vec![],
+            log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+            log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
         }
     }
 
