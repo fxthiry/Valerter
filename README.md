@@ -47,8 +47,10 @@ Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which e
 
 ## Quick Start
 
+### Debian/Ubuntu (.deb) - Recommended
+
 ```bash
-# Install (Debian/Ubuntu)
+# Install
 curl -LO https://github.com/fxthiry/valerter/releases/latest/download/valerter_latest_amd64.deb
 sudo dpkg -i valerter_latest_amd64.deb
 
@@ -59,6 +61,21 @@ sudo vim /etc/valerter/config.yaml
 sudo systemctl start valerter
 sudo systemctl enable valerter
 ```
+
+### Static Binary (any Linux)
+
+```bash
+# Download (x86_64, or aarch64 for ARM)
+curl -LO https://github.com/fxthiry/valerter/releases/latest/download/valerter-linux-x86_64.tar.gz
+tar -xzf valerter-linux-x86_64.tar.gz
+cd valerter-linux-x86_64
+
+# Validate and run
+./valerter --validate -c config.example.yaml
+./valerter -c config.example.yaml
+```
+
+> For production installation with systemd, see [Getting Started](docs/getting-started.md).
 
 Minimal configuration:
 

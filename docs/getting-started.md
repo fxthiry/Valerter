@@ -25,21 +25,26 @@ The .deb package will:
 3. Install systemd service to `/lib/systemd/system/`
 4. Create config directory `/etc/valerter/` with example configuration
 
-### From GitHub Releases (Tarball)
+### Static Binary (any Linux)
+
+For non-Debian systems, containers, or quick testing:
 
 ```bash
-# Download the latest release
+# Download (x86_64, or aarch64 for ARM)
 curl -LO https://github.com/fxthiry/valerter/releases/latest/download/valerter-linux-x86_64.tar.gz
 
 # Optional: Verify checksum
 curl -LO https://github.com/fxthiry/valerter/releases/latest/download/checksums-sha256.txt
 sha256sum -c checksums-sha256.txt --ignore-missing
 
-# Extract and install
+# Extract and run
 tar -xzf valerter-linux-x86_64.tar.gz
 cd valerter-linux-x86_64
-sudo ./install.sh
+./valerter --validate -c config.example.yaml
+./valerter -c config.example.yaml
 ```
+
+The tarball contains a statically-linked musl binary that runs on any Linux distribution (Alpine, Arch, RHEL, containers, etc.). For systemd integration, see [`systemd/valerter.service`](https://github.com/fxthiry/valerter/blob/main/systemd/valerter.service) in the repository.
 
 ### From Source
 
@@ -52,8 +57,11 @@ cd valerter
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 
-# Install
-sudo ./scripts/install.sh
+# Run directly
+./target/x86_64-unknown-linux-musl/release/valerter -c config/config.example.yaml
+
+# Or copy binary to PATH
+sudo cp ./target/x86_64-unknown-linux-musl/release/valerter /usr/local/bin/
 ```
 
 ## Post-Installation
@@ -132,28 +140,11 @@ sudo systemctl restart valerter
 
 **Note:** Configuration is preserved during upgrades - dpkg will prompt if you've modified `/etc/valerter/config.yaml`.
 
-### Tarball
-
-```bash
-sudo systemctl stop valerter
-# Download and extract new version
-sudo ./install.sh
-sudo systemctl start valerter
-```
-
 ## Uninstalling
-
-### .deb Package
 
 ```bash
 sudo dpkg -r valerter        # Remove (keeps config)
 sudo dpkg --purge valerter   # Purge (removes everything)
-```
-
-### Tarball
-
-```bash
-sudo ./uninstall.sh
 ```
 
 ## Next Steps
