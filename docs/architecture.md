@@ -81,7 +81,7 @@ main.rs
 When VictoriaLogs connection fails:
 
 1. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max)
-2. **Metric update:** `valerter_victorialogs_up` set to 0
+2. **Metric update:** `valerter_victorialogs_up` set to 0 (restored to 1 on successful reconnection)
 3. **Reconnection metric:** `valerter_reconnections_total` incremented
 4. **On success:** Throttle cache is reset (prevents stale state)
 

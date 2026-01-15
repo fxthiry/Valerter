@@ -77,7 +77,7 @@ pub fn register_metric_descriptions() {
     );
     describe_gauge!(
         "valerter_victorialogs_up",
-        "VictoriaLogs data received (1=logs received, 0=waiting or error)"
+        "VictoriaLogs connection status (1=connected, 0=disconnected or error)"
     );
     describe_gauge!(
         "valerter_uptime_seconds",
