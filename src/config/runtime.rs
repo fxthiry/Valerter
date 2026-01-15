@@ -126,6 +126,9 @@ impl RuntimeConfig {
 
 impl Config {
     /// Compile configuration into runtime-ready format (FR15).
+    ///
+    /// # Panics
+    /// Panics if validation was skipped and a regex is invalid.
     pub fn compile(self, config_path: &Path) -> Result<RuntimeConfig, ConfigError> {
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 

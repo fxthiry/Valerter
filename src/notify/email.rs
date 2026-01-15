@@ -638,6 +638,7 @@ mod tests {
     use super::*;
     use crate::config::{EmailNotifierConfig, SmtpConfig, TlsMode};
     use crate::template::RenderedMessage;
+    use serial_test::serial;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -925,6 +926,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_config_resolves_env_vars_for_credentials() {
         temp_env::with_vars(
             [
@@ -950,6 +952,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_config_fails_on_undefined_env_var() {
         temp_env::with_var("UNDEFINED_SMTP_VAR", None::<&str>, || {
             let mut config = make_test_config();
@@ -1127,6 +1130,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn debug_output_with_credentials_does_not_leak() {
         temp_env::with_vars(
             [

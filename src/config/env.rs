@@ -119,8 +119,10 @@ pub fn resolve_body_template(
 mod tests {
     use super::*;
     use crate::config::notifiers::{SmtpConfig, TlsMode};
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn resolve_env_vars_substitutes_single_variable() {
         temp_env::with_var(
             "TEST_WEBHOOK_VAR",
@@ -133,6 +135,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_substitutes_multiple_variables() {
         temp_env::with_vars(
             [
@@ -157,6 +160,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_error_on_undefined_variable() {
         temp_env::with_var("UNDEFINED_VAR_XYZ_123", None::<&str>, || {
             let result = resolve_env_vars("https://${UNDEFINED_VAR_XYZ_123}/path");
@@ -216,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_error_lists_all_undefined_variables() {
         temp_env::with_vars(
             [("UNDEFINED_A", None::<&str>), ("UNDEFINED_B", None::<&str>)],
@@ -230,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_preserves_text_around_variables() {
         temp_env::with_var("TEST_MIDDLE", Some("REPLACED"), || {
             let result = resolve_env_vars("prefix_${TEST_MIDDLE}_suffix");
@@ -238,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_handles_empty_env_value() {
         temp_env::with_var("TEST_EMPTY_VAR", Some(""), || {
             let result = resolve_env_vars("before${TEST_EMPTY_VAR}after");
@@ -246,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_env_vars_supports_lowercase_variables() {
         temp_env::with_var("test_lowercase_var", Some("lowercase_value"), || {
             let result = resolve_env_vars("${test_lowercase_var}");

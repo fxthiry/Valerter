@@ -1,6 +1,8 @@
 //! Integration tests for Config loading, validation, and compilation.
 
+use super::types::ENV_MATTERMOST_WEBHOOK;
 use super::*;
+use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -96,9 +98,10 @@ fn load_webhook_from_explicit_value() {
 }
 
 #[test]
+#[serial]
 fn load_webhook_from_environment_variable() {
     temp_env::with_var(
-        "MATTERMOST_WEBHOOK",
+        ENV_MATTERMOST_WEBHOOK,
         Some("https://test.webhook.url/hook"),
         || {
             let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();

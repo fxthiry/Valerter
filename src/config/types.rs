@@ -13,6 +13,9 @@ use std::time::Duration;
 /// Default configuration file path.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/valerter/config.yaml";
 
+/// Environment variable name for Mattermost webhook URL.
+pub const ENV_MATTERMOST_WEBHOOK: &str = "MATTERMOST_WEBHOOK";
+
 /// Main configuration structure for valerter.
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -199,6 +202,10 @@ pub struct NotifyConfig {
 
 impl Config {
     /// Load configuration from a file path.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::LoadError`] if the file cannot be read.
+    /// Returns [`ConfigError::ValidationError`] if the YAML is invalid.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::LoadError(format!("{}: {}", path.display(), e)))?;
@@ -206,7 +213,7 @@ impl Config {
         let mut config: Config = serde_yaml::from_str(&content)
             .map_err(|e| ConfigError::ValidationError(e.to_string()))?;
 
-        config.mattermost_webhook = std::env::var("MATTERMOST_WEBHOOK")
+        config.mattermost_webhook = std::env::var(ENV_MATTERMOST_WEBHOOK)
             .ok()
             .map(SecretString::new);
 
@@ -214,6 +221,10 @@ impl Config {
     }
 
     /// Load configuration with an explicit webhook (for testing).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::LoadError`] if the file cannot be read.
+    /// Returns [`ConfigError::ValidationError`] if the YAML is invalid.
     #[cfg(test)]
     pub fn load_with_webhook(path: &Path, webhook: Option<String>) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)
@@ -228,6 +239,10 @@ impl Config {
     }
 
     /// Validate all rules (even disabled ones) - AD-11.
+    ///
+    /// # Errors
+    /// Returns a `Vec<ConfigError>` containing all validation errors found.
+    /// Possible errors: `InvalidRegex`, `InvalidTemplate`, `ValidationError` (for invalid colors).
     pub fn validate(&self) -> Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
 

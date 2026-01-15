@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub type NotifiersConfig = HashMap<String, NotifierConfig>;
 
 /// Notifier configuration with type tag for deserialization.
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum NotifierConfig {
@@ -73,6 +74,7 @@ pub struct SmtpConfig {
 }
 
 /// TLS mode for SMTP connections.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {

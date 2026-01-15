@@ -21,9 +21,9 @@ pub use runtime::{
 };
 pub use secret::SecretString;
 pub use types::{
-    BasicAuthConfig, Config, DEFAULT_CONFIG_PATH, DefaultsConfig, JsonParserConfig, MetricsConfig,
-    NotifyConfig, NotifyDefaults, ParserConfig, RuleConfig, TemplateConfig, ThrottleConfig,
-    TlsConfig, VictoriaLogsConfig,
+    BasicAuthConfig, Config, DEFAULT_CONFIG_PATH, DefaultsConfig, ENV_MATTERMOST_WEBHOOK,
+    JsonParserConfig, MetricsConfig, NotifyConfig, NotifyDefaults, ParserConfig, RuleConfig,
+    TemplateConfig, ThrottleConfig, TlsConfig, VictoriaLogsConfig,
 };
 pub use validation::validate_template_render;
 

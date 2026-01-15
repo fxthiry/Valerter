@@ -14,6 +14,9 @@ pub(crate) fn validate_jinja_template(source: &str) -> Result<(), String> {
 
 /// Validates a Jinja template by performing a test render with empty data.
 /// Detects runtime errors like unknown filters.
+///
+/// # Errors
+/// Returns an error string if the template syntax is invalid or uses unknown filters.
 pub fn validate_template_render(source: &str) -> Result<(), String> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
