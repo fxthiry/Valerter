@@ -39,9 +39,6 @@ jobs:
         run: |
           mkdir -p release/valerter-linux-${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/valerter release/valerter-linux-${{ matrix.arch }}/
-          cp systemd/valerter.service release/valerter-linux-${{ matrix.arch }}/
-          cp scripts/install.sh release/valerter-linux-${{ matrix.arch }}/
-          cp scripts/uninstall.sh release/valerter-linux-${{ matrix.arch }}/
           cp config/config.example.yaml release/valerter-linux-${{ matrix.arch }}/
           cd release
           tar -czvf valerter-linux-${{ matrix.arch }}.tar.gz valerter-linux-${{ matrix.arch }}
