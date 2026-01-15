@@ -34,7 +34,7 @@ metrics:
 |--------|--------|-------------|
 | `valerter_queue_size` | - | Current notification queue size |
 | `valerter_last_query_timestamp` | `rule_name` | Unix timestamp of last successful query |
-| `valerter_victorialogs_up` | `rule_name` | VictoriaLogs connection status (1=up, 0=down) |
+| `valerter_victorialogs_up` | `rule_name` | VictoriaLogs data received (1=logs received, 0=waiting or error) |
 | `valerter_uptime_seconds` | - | Time since valerter started |
 | `valerter_build_info` | `version` | Build information (always 1) |
 
@@ -71,15 +71,15 @@ groups:
           summary: "Valerter rule {{ $labels.rule_name }} not querying"
           description: "No queries received from rule {{ $labels.rule_name }} for over 5 minutes"
 
-      # VictoriaLogs connection down
-      - alert: ValerterVictoriaLogsDown
+      # VictoriaLogs not receiving logs
+      - alert: ValerterVictoriaLogsNoData
         expr: valerter_victorialogs_up == 0
-        for: 2m
+        for: 5m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "Valerter lost connection to VictoriaLogs"
-          description: "Rule {{ $labels.rule_name }} cannot connect to VictoriaLogs"
+          summary: "Valerter not receiving logs from VictoriaLogs"
+          description: "Rule {{ $labels.rule_name }} has not received any matching logs (may be normal if no logs match the query)"
 
       # Alerts failing to send
       - alert: ValerterAlertsFailing
@@ -125,7 +125,7 @@ groups:
 
 ### Health
 
-- `valerter_victorialogs_up` - Connection to VictoriaLogs
+- `valerter_victorialogs_up` - Data received from VictoriaLogs (becomes 1 only after receiving first log)
 - `valerter_uptime_seconds` - Process uptime (detect restarts)
 
 ### Performance
