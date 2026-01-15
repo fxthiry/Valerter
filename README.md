@@ -47,7 +47,7 @@ Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which e
 
 ## Quick Start
 
-### Debian/Ubuntu (.deb) - Recommended
+### Debian/Ubuntu (.deb)
 
 ```bash
 # Install

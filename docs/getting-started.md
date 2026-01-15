@@ -9,7 +9,7 @@ This guide covers installing and running Valerter for the first time.
 
 ## Installation
 
-### Debian/Ubuntu (.deb) - Recommended
+### Debian/Ubuntu (.deb)
 
 ```bash
 # Download and install the latest release
