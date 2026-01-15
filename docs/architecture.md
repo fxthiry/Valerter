@@ -150,4 +150,3 @@ tokio::spawn(async { process().unwrap(); }); // Silent crash
 
 - [Configuration](configuration.md) - Configure the pipeline
 - [Metrics](metrics.md) - Monitor the pipeline
-- [project-context.md](../_bmad-output/project-context.md) - Implementation rules for developers
