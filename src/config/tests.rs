@@ -358,6 +358,7 @@ fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> R
             notify: NotifyDefaults {
                 template: "default".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -470,6 +471,7 @@ fn validate_collects_all_errors() {
             notify: NotifyDefaults {
                 template: "default".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -537,6 +539,7 @@ fn validate_throttle_key_template() {
             notify: NotifyDefaults {
                 template: "default".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: std::collections::HashMap::new(),
         rules: vec![RuleConfig {
@@ -587,6 +590,7 @@ fn validate_nonexistent_notify_template_fails() {
             notify: NotifyDefaults {
                 template: "existing_template".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -650,6 +654,7 @@ fn validate_nonexistent_default_template_fails() {
             notify: NotifyDefaults {
                 template: "missing_default".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: std::collections::HashMap::new(),
         rules: vec![],
@@ -986,6 +991,7 @@ fn validate_rule_destinations_collects_all_errors() {
             notify: NotifyDefaults {
                 template: "default".to_string(),
             },
+            timestamp_timezone: "UTC".to_string(),
         },
         templates: {
             let mut t = std::collections::HashMap::new();

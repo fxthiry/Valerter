@@ -28,6 +28,8 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         },
         rule_name: rule_name.to_string(),
         destinations: vec![], // Uses default notifier
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
 }
 
@@ -41,6 +43,8 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         },
         rule_name: rule_name.to_string(),
         destinations,
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
 }
 
@@ -637,12 +641,19 @@ fn alert_payload_clone_works() {
         },
         rule_name: "my_rule".to_string(),
         destinations: vec!["mattermost-infra".to_string()],
+        log_timestamp: "2026-01-15T10:00:00Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
     };
 
     let cloned = payload.clone();
     assert_eq!(cloned.rule_name, payload.rule_name);
     assert_eq!(cloned.message.title, payload.message.title);
     assert_eq!(cloned.destinations, payload.destinations);
+    assert_eq!(cloned.log_timestamp, payload.log_timestamp);
+    assert_eq!(
+        cloned.log_timestamp_formatted,
+        payload.log_timestamp_formatted
+    );
 }
 
 #[test]

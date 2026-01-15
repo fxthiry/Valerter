@@ -60,9 +60,29 @@ If `body_template` is omitted, sends:
   "rule_name": "...",
   "title": "...",
   "body": "...",
-  "timestamp": "<ISO8601>"
+  "timestamp": "<ISO8601>",
+  "log_timestamp": "<ISO8601>",
+  "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | When the alert was sent |
+| `log_timestamp` | Original log timestamp (ISO 8601, for VictoriaLogs search) |
+| `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
+
+### Template Variables
+
+When using `body_template`, these variables are available:
+
+| Variable | Description |
+|----------|-------------|
+| `title` | Alert title |
+| `body` | Alert body |
+| `rule_name` | Name of the rule |
+| `log_timestamp` | Original log timestamp (ISO 8601) |
+| `log_timestamp_formatted` | Human-readable timestamp |
 
 ### Examples
 
@@ -229,6 +249,16 @@ templates:
     body: "{{ body }}"
     accent_color: "#ff0000"    # Red sidebar in Mattermost
 ```
+
+### Timestamp in Footer
+
+Mattermost notifications automatically include the original log timestamp in the footer, formatted according to the `timestamp_timezone` setting:
+
+```
+Log time: 15/01/2026 11:00:00 CET
+```
+
+This helps operators quickly locate the original log entry in VictoriaLogs.
 
 ## Multi-Destination Routing
 

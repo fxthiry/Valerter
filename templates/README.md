@@ -25,6 +25,8 @@ You can provide your own template via:
 | `body` | string | Alert body (from message template) |
 | `rule_name` | string | Name of the rule that triggered |
 | `accent_color` | string \| null | Accent color from template (e.g., `#ff0000`) |
+| `log_timestamp` | string | Original log timestamp in ISO 8601 format (for VictoriaLogs search) |
+| `log_timestamp_formatted` | string | Human-readable timestamp (respects `timestamp_timezone` setting) |
 
 ## Jinja2 Syntax
 
@@ -120,7 +122,10 @@ notifiers:
     <div style="padding: 20px; border-left: 4px solid {{ accent_color | default('#ff0000') }};">
         <h1>{{ title }}</h1>
         <p>{{ body }}</p>
-        <small>Rule: <code>{{ rule_name }}</code></small>
+        <small>
+            Rule: <code>{{ rule_name }}</code><br>
+            Log time: {{ log_timestamp_formatted }}
+        </small>
     </div>
 </body>
 </html>

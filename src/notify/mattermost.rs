@@ -46,6 +46,7 @@ struct MattermostPayload {
 fn build_mattermost_payload(
     message: &crate::template::RenderedMessage,
     rule_name: &str,
+    log_timestamp_formatted: &str,
     channel: Option<&str>,
     username: Option<&str>,
     icon_url: Option<&str>,
@@ -59,7 +60,7 @@ fn build_mattermost_payload(
             color: message.accent_color.clone(),
             title: message.title.clone(),
             text: message.body.clone(),
-            footer: format!("valerter | {}", rule_name),
+            footer: format!("valerter | {} | {}", rule_name, log_timestamp_formatted),
         }],
     }
 }
@@ -168,6 +169,7 @@ impl Notifier for MattermostNotifier {
         let mattermost_payload = build_mattermost_payload(
             &alert.message,
             &alert.rule_name,
+            &alert.log_timestamp_formatted,
             self.channel.as_deref(),
             self.username.as_deref(),
             self.icon_url.as_deref(),
@@ -291,7 +293,14 @@ mod tests {
             accent_color: Some("#ff0000".to_string()),
         };
 
-        let payload = build_mattermost_payload(&message, "test_rule", None, None, None);
+        let payload = build_mattermost_payload(
+            &message,
+            "test_rule",
+            "15/01/2026 10:49:35 UTC",
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(payload.attachments.len(), 1);
         let attachment = &payload.attachments[0];
@@ -299,7 +308,10 @@ mod tests {
         assert_eq!(attachment.title, "Test Alert");
         assert_eq!(attachment.text, "Something happened");
         assert_eq!(attachment.color, Some("#ff0000".to_string()));
-        assert_eq!(attachment.footer, "valerter | test_rule");
+        assert_eq!(
+            attachment.footer,
+            "valerter | test_rule | 15/01/2026 10:49:35 UTC"
+        );
         // Optional fields should be None
         assert!(payload.channel.is_none());
         assert!(payload.username.is_none());
@@ -315,7 +327,14 @@ mod tests {
             accent_color: None,
         };
 
-        let payload = build_mattermost_payload(&message, "simple_rule", None, None, None);
+        let payload = build_mattermost_payload(
+            &message,
+            "simple_rule",
+            "09/01/2026 10:00:00 UTC",
+            None,
+            None,
+            None,
+        );
 
         let attachment = &payload.attachments[0];
         assert_eq!(attachment.color, None);
@@ -333,6 +352,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "rule",
+            "09/01/2026 10:00:00 UTC",
             Some("infra-alerts"),
             Some("valerter-bot"),
             Some("https://example.com/icon.png"),
@@ -355,7 +375,14 @@ mod tests {
             accent_color: Some("#00ff00".to_string()),
         };
 
-        let payload = build_mattermost_payload(&message, "rule", None, None, None);
+        let payload = build_mattermost_payload(
+            &message,
+            "rule",
+            "09/01/2026 10:00:00 UTC",
+            None,
+            None,
+            None,
+        );
         let json = serde_json::to_string(&payload).unwrap();
 
         assert!(json.contains("\"attachments\""));
@@ -363,7 +390,7 @@ mod tests {
         assert!(json.contains("\"title\":\"Test\""));
         assert!(json.contains("\"text\":\"Body\""));
         assert!(json.contains("\"color\":\"#00ff00\""));
-        assert!(json.contains("\"footer\":\"valerter | rule\""));
+        assert!(json.contains("\"footer\":\"valerter | rule | 09/01/2026 10:00:00 UTC\""));
         // Optional fields should be omitted when None
         assert!(!json.contains("channel"));
         assert!(!json.contains("username"));
@@ -379,7 +406,14 @@ mod tests {
             accent_color: None,
         };
 
-        let payload = build_mattermost_payload(&message, "rule", Some("alerts"), Some("bot"), None);
+        let payload = build_mattermost_payload(
+            &message,
+            "rule",
+            "09/01/2026 10:00:00 UTC",
+            Some("alerts"),
+            Some("bot"),
+            None,
+        );
         let json = serde_json::to_string(&payload).unwrap();
 
         assert!(json.contains("\"channel\":\"alerts\""));

@@ -55,7 +55,20 @@ defaults:
     window: 60s      # Time window (e.g., 60s, 5m, 1h)
   notify:
     template: "default_alert"    # Template name
+  # timestamp_timezone: "Europe/Paris"  # Optional: timezone for formatted timestamps (default: UTC)
 ```
+
+### Timestamp Timezone
+
+The `timestamp_timezone` setting controls the timezone used for `{{ log_timestamp_formatted }}` in templates and Mattermost footers.
+
+| Value | Example Output |
+|-------|----------------|
+| `UTC` (default) | `15/01/2026 10:00:00 UTC` |
+| `Europe/Paris` | `15/01/2026 11:00:00 CET` (winter) / `CEST` (summer) |
+| `America/New_York` | `15/01/2026 05:00:00 EST` |
+
+Uses [IANA timezone names](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). Invalid timezone will fail at startup.
 
 ## Templates
 
@@ -78,9 +91,16 @@ Variables come from the parser output plus built-in fields:
 |----------|-------------|
 | `rule_name` | Name of the rule that triggered |
 | `_msg` | Original log message (from VictoriaLogs) |
-| `_time` | Log timestamp |
+| `_time` | Log timestamp (raw from VictoriaLogs) |
 | `_stream` | Stream labels |
+| `log_timestamp` | Original log timestamp in ISO 8601 format (for VictoriaLogs search) |
+| `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
 | Custom fields | Extracted by regex/JSON parser |
+
+**Note:** `log_timestamp` and `log_timestamp_formatted` are available in:
+- Email subject and body templates
+- Webhook `body_template`
+- Mattermost footer (automatically includes `log_timestamp_formatted`)
 
 ### body_html Requirement
 

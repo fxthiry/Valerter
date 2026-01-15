@@ -107,7 +107,9 @@ metrics:
 #   #   "rule_name": "...",
 #   #   "title": "...",
 #   #   "body": "...",
-#   #   "timestamp": "<ISO8601>"
+#   #   "timestamp": "<ISO8601>",
+#   #   "log_timestamp": "<ISO8601>",              # Original log timestamp (for VictoriaLogs search)
+#   #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"  # Human-readable timestamp
 #   # }
 #   # Note: Webhook is generic - accent_color is not included in the payload.
 #
@@ -148,7 +150,7 @@ metrics:
 #       Authorization: "Bearer ${API_TOKEN}"
 #       X-Custom-Header: "valerter"
 #     body_template: |
-#       {"alert": "{{ title }}", "details": "{{ body }}"}
+#       {"alert": "{{ title }}", "details": "{{ body }}", "log_time": "{{ log_timestamp_formatted }}"}
 #
 #   # --------------------------------------------------------------------------
 #   # Email Notifier (SMTP)
@@ -166,7 +168,8 @@ metrics:
 #   #   - body_template: inline Jinja template string
 #   #   - body_template_file: path to template file (relative to config or absolute)
 #   #   - If neither is specified, a default HTML template is used
-#   #   - Available variables: title, body, rule_name, accent_color
+#   #   - Available variables: title, body, rule_name, accent_color,
+#   #                          log_timestamp, log_timestamp_formatted
 #
 #   # Example: Full email config with authentication
 #   email-ops:
@@ -221,6 +224,11 @@ defaults:
   # REQUIRED: Default notification settings
   notify:
     template: "default_alert"      # REQUIRED: Template name from templates section
+
+  # OPTIONAL: Timezone for formatted log timestamps (IANA timezone name)
+  # Default: UTC. Used in {{ log_timestamp_formatted }} and Mattermost footers.
+  # Examples: "UTC", "Europe/Paris", "America/New_York", "Asia/Tokyo"
+  timestamp_timezone: "UTC"
 
 # ==============================================================================
 # SECTION 5: Templates (REQUIRED)

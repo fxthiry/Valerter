@@ -131,6 +131,13 @@ impl Default for MetricsConfig {
 pub struct DefaultsConfig {
     pub throttle: ThrottleConfig,
     pub notify: NotifyDefaults,
+    /// Timezone for formatted timestamps (e.g., "UTC", "Europe/Paris").
+    #[serde(default = "default_timestamp_timezone")]
+    pub timestamp_timezone: String,
+}
+
+fn default_timestamp_timezone() -> String {
+    "UTC".to_string()
 }
 
 /// Throttle configuration for rate limiting.
@@ -347,6 +354,19 @@ impl Config {
                     name, e
                 )));
             }
+        }
+
+        // Validate timestamp_timezone
+        if self
+            .defaults
+            .timestamp_timezone
+            .parse::<chrono_tz::Tz>()
+            .is_err()
+        {
+            errors.push(ConfigError::ValidationError(format!(
+                "defaults.timestamp_timezone '{}' is not a valid timezone",
+                self.defaults.timestamp_timezone
+            )));
         }
 
         if errors.is_empty() {

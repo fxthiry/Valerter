@@ -24,6 +24,8 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         },
         rule_name: rule_name.to_string(),
         destinations: vec![], // Empty = use default notifier (Story 6.3)
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
 }
 
@@ -201,7 +203,7 @@ async fn test_mattermost_payload_format() {
                 "fallback": "Alert from format_rule",
                 "title": "Alert from format_rule",
                 "text": "Test body content",
-                "footer": "valerter | format_rule"
+                "footer": "valerter | format_rule | 15/01/2026 10:49:35 UTC"
             }]
         })))
         .respond_with(ResponseTemplate::new(200))
@@ -330,6 +332,8 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         },
         rule_name: rule_name.to_string(),
         destinations,
+        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
 }
 

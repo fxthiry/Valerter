@@ -69,6 +69,8 @@ struct RuleSpawnContext {
     /// Notification destinations for this rule (Story 6.3).
     /// Empty vec means use the default notifier.
     destinations: Vec<String>,
+    /// Timezone for formatting log timestamps.
+    timestamp_timezone: String,
 }
 
 /// Rule engine that orchestrates all alert rules.
@@ -193,6 +195,7 @@ impl RuleEngine {
                 default_template: default_template.clone(),
                 default_throttle: default_throttle.clone(),
                 destinations,
+                timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
             };
 
             let rule_name = rule.name.clone();
@@ -424,6 +427,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
     let destinations = Arc::new(destinations);
     let template_engine = ctx.template_engine;
     let queue = ctx.queue;
+    let timestamp_timezone = Arc::new(ctx.timestamp_timezone.clone());
 
     let stream_result = tail_client
         .stream_with_reconnect(&rule_name, Some(&reconnect_callback), |line| {
@@ -436,6 +440,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
             let template_name = Arc::clone(&template_name);
             let rule_name = rule_name.clone();
             let destinations = Arc::clone(&destinations);
+            let timestamp_timezone = Arc::clone(&timestamp_timezone);
 
             async move {
                 // Pattern Log+Continue: never propagate errors, just log and continue
@@ -448,6 +453,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
                     &rule_name,
                     &destinations,
                     &queue,
+                    &timestamp_timezone,
                 )
                 .await
                 {
@@ -489,6 +495,7 @@ async fn process_log_line(
     rule_name: &str,
     destinations: &[String],
     queue: &NotificationQueue,
+    timestamp_timezone: &str,
 ) -> Result<(), ProcessError> {
     // Step 1: Parse the log line
     let fields = match parser.parse(line) {
@@ -514,11 +521,26 @@ async fn process_log_line(
     // Step 3: Render template
     let rendered = template_engine.render_with_fallback(template_name, &fields, rule_name);
 
-    // Step 4: Send to queue with destinations (Story 6.3)
+    // Step 4: Extract _time from parsed fields for log timestamp
+    let log_timestamp = fields
+        .get("_time")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            warn!(rule_name = %rule_name, "Missing _time field in log, using current time");
+            chrono::Utc::now().to_rfc3339()
+        });
+
+    let log_timestamp_formatted =
+        crate::notify::format_log_timestamp(&log_timestamp, timestamp_timezone);
+
+    // Step 5: Send to queue with destinations (Story 6.3)
     let payload = AlertPayload {
         message: rendered,
         rule_name: rule_name.to_string(),
         destinations: destinations.to_vec(),
+        log_timestamp,
+        log_timestamp_formatted,
     };
 
     if let Err(e) = queue.send(payload) {
@@ -602,6 +624,7 @@ mod tests {
                 notify: NotifyDefaults {
                     template: "default".to_string(),
                 },
+                timestamp_timezone: "UTC".to_string(),
             },
             templates: {
                 let mut t = HashMap::new();
@@ -843,6 +866,7 @@ mod tests {
             "test_rule",
             &destinations,
             &queue,
+            "UTC",
         )
         .await;
 
@@ -875,6 +899,7 @@ mod tests {
             "test_rule",
             &[], // Empty destinations = use default
             &queue,
+            "UTC",
         )
         .await;
 
@@ -909,6 +934,7 @@ mod tests {
             "test_rule",
             &[], // Empty destinations = use default
             &queue,
+            "UTC",
         )
         .await;
         assert!(result1.is_ok());
@@ -924,6 +950,7 @@ mod tests {
             "test_rule",
             &[],
             &queue,
+            "UTC",
         )
         .await;
         assert!(result2.is_ok());
@@ -957,17 +984,20 @@ mod tests {
             "test_rule",
             &destinations,
             &queue,
+            "UTC",
         )
         .await;
 
         assert!(result.is_ok());
         assert_eq!(queue.len(), 1);
 
-        // Verify the payload has the destinations
+        // Verify the payload has the destinations and timestamps
         let payload = rx.recv().await.unwrap();
         assert_eq!(payload.destinations.len(), 2);
         assert_eq!(payload.destinations[0], "mattermost-infra");
         assert_eq!(payload.destinations[1], "mattermost-ops");
+        assert_eq!(payload.log_timestamp, "2026-01-09T10:00:00Z");
+        assert_eq!(payload.log_timestamp_formatted, "09/01/2026 10:00:00 UTC");
     }
 
     // ===================================================================
