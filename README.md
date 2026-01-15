@@ -25,12 +25,12 @@ Valerter streams logs from VictoriaLogs in real-time and sends alerts with the *
 
 Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which evaluates queries periodically and returns aggregated statistics, Valerter provides **real-time, per-event alerting**:
 
-| | vmalert | Valerter |
-|---|---------|----------|
-| **Mode** | Periodic queries | Real-time streaming |
-| **API** | `/stats_query` | `/tail` |
+|                   | vmalert                                 | Valerter                       |
+| ----------------- | --------------------------------------- | ------------------------------ |
+| **Mode**          | Periodic queries                        | Real-time streaming            |
+| **API**           | `/stats_query`                          | `/tail`                        |
 | **Alert content** | Aggregated stats ("500 errors in 5min") | **Full log line with context** |
-| **Latency** | Evaluation interval (e.g., 1min) | < 5 seconds |
+| **Latency**       | Evaluation interval (e.g., 1min)        | < 5 seconds                    |
 
 **Use vmalert**: "More than 100 errors in the last 5 minutes"
 
@@ -62,7 +62,7 @@ sudo systemctl start valerter
 sudo systemctl enable valerter
 ```
 
-### Static Binary (any Linux)
+### Static Binary
 
 ```bash
 # Download (x86_64, or aarch64 for ARM)
@@ -104,7 +104,7 @@ rules:
   - name: "error_alert"
     query: '_stream:{app="myapp"} level:error'
     parser:
-      regex: '(?P<message>.*)'
+      regex: "(?P<message>.*)"
 ```
 
 ## Documentation
@@ -114,7 +114,7 @@ rules:
 - **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost setup
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
 - **[Architecture](docs/architecture.md)** — How Valerter works
-- **[Examples](examples/)** — Real-world configurations with screenshots
+- **[Examples](examples/)** — Real-world configurations
 
 ## Contributing
 
