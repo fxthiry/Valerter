@@ -1,6 +1,6 @@
 # Cisco Switches Alerting
 
-Real-time alerts for Cisco IOS/IOS-XE switches: STP errors, hardware warnings, stack changes, and restarts.
+Real-time alerts for Cisco IOS/IOS-XE switches. This example focuses on **STP BPDU Guard violations** — a common and critical alert.
 
 ## Log Flow
 
@@ -16,12 +16,12 @@ Mattermost / Email
 
 ## Sample Log
 
-A typical log entry in VictoriaLogs:
+A BPDU Guard violation in VictoriaLogs:
 
 ```json
 {
   "_time": "2026-01-15T10:52:01.935Z",
-  "_msg": "1046: Jan 15 10:52:01.935: %SPANTREE-2-BLOCK_BPDUGUARD: Received BPDU on port Gi1/0/8 with BPDU Guard enabled. Disabling port.",
+  "_msg": "1046: DC1-SW-ACCESS-01: Jan 15 10:52:01.935: %SPANTREE-2-BLOCK_BPDUGUARD: Received BPDU on port Gi1/0/8 with BPDU Guard enabled. Disabling port.",
   "hostname": "10.255.40.25",
   "site": "DC1",
   "severity": "2",
@@ -35,11 +35,11 @@ A typical log entry in VictoriaLogs:
 ### 1. Query Matches the Log
 
 ```yaml
-query: 'group:"SW" severity:~"[0-2]"'
+query: 'group:"SW" "SPANTREE-2-BLOCK_BPDUGUARD"'
 ```
 
 - `group:"SW"` — filters only switch logs
-- `severity:~"[0-2]"` — matches critical severities (0, 1, 2)
+- `"SPANTREE-2-BLOCK_BPDUGUARD"` — matches this specific alert
 
 ### 2. Parser Extracts Fields
 
@@ -47,54 +47,55 @@ query: 'group:"SW" severity:~"[0-2]"'
 parser:
   json:
     fields: ["hostname", "site", "severity", "_msg", "level"]
-  regex: '%(?P<alert_type>[A-Z0-9_-]+):'
+  regex: '^\d+: (?P<switch_name>[A-Z0-9-]+):'
 ```
 
 - JSON fields become template variables
-- Regex extracts `alert_type` = `SPANTREE-2-BLOCK_BPDUGUARD`
+- Regex extracts `switch_name` = `DC1-SW-ACCESS-01` from the message
 
 ### 3. Throttle Prevents Spam
 
 ```yaml
 throttle:
-  key: "{{ hostname }}-{{ alert_type }}"
+  key: "{{ switch_name }}"
   count: 3
   window: 5m
 ```
 
-- Groups alerts by switch + alert type
-- Max 3 notifications per 5 minutes per key
-- Different alert types on same switch → separate throttles
+- Groups alerts by switch name
+- Max 3 notifications per 5 minutes per switch
 
 ### 4. Template Formats the Notification
 
 ```yaml
-template: "cisco_critical"
+template: "bpdu_guard"
 ```
 
 **Mattermost output:**
 
 ```markdown
-🚨 CRITICAL | 10.255.40.25
+🚨 BPDU Guard | DC1-SW-ACCESS-01 (10.255.40.25)
 
-**Site:** `DC1` | **Switch:** `10.255.40.25` | **Severity:** `CRITICAL`
+**Switch:** `DC1-SW-ACCESS-01` | **IP:** `10.255.40.25` | **Site:** `DC1`
 
 ​```
-1046: Jan 15 10:52:01.935: %SPANTREE-2-BLOCK_BPDUGUARD:
+1046: DC1-SW-ACCESS-01: Jan 15 10:52:01.935: %SPANTREE-2-BLOCK_BPDUGUARD:
 Received BPDU on port Gi1/0/8 with BPDU Guard enabled. Disabling port.
 ​```
 ```
 
-## Alert Types
+## Other Cisco Alerts
 
-| Rule | Query | What it catches |
-|------|-------|-----------------|
-| `cisco_sw_critical` | `severity:~"[0-2]"` | STP errors, security violations |
-| `cisco_platform_warning` | `"PLATFORM-4-ELEMENT_WARNING"` | Fan, PSU, temperature |
-| `cisco_sfp_threshold` | `"SFF8472-3-THRESHOLD_VIOLATION"` | Optical transceiver issues |
-| `cisco_vlan_mismatch` | `"CDP-4-NATIVE_VLAN_MISMATCH"` | VLAN configuration issues |
-| `cisco_stack_change` | `"STACKMGR-4-STACK_LINK_CHANGE"` | Stack topology changes |
-| `cisco_restart` | `"SYS-5-RESTART"` | Switch reboots |
+The same logic applies to other Cisco syslog messages. Just change the query:
+
+| Alert Type | Query |
+|------------|-------|
+| Hardware warnings | `group:"SW" "PLATFORM-4-ELEMENT_WARNING"` |
+| SFP threshold | `group:"SW" "SFF8472-3-THRESHOLD_VIOLATION"` |
+| VLAN mismatch | `group:"SW" "CDP-4-NATIVE_VLAN_MISMATCH"` |
+| Stack link change | `group:"SW" "STACKMGR-4-STACK_LINK_CHANGE"` |
+| Switch restart | `group:"SW" "SYS-5-RESTART"` |
+| All critical (0-2) | `group:"SW" severity:~"[0-2]"` |
 
 ## Full Configuration
 
