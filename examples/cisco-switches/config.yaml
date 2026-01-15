@@ -33,7 +33,7 @@ defaults:
     window: 5m
 
 templates:
-  bpdu_guard:
+  SPANTREE-2-BLOCK_BPDUGUARD:
     title: "🚨 BPDU Guard | {{ switch_name }} ({{ hostname }})"
     body: |
       **Switch:** `{{ switch_name }}` | **IP:** `{{ hostname }}` | **Site:** `{{ site }}`
@@ -67,7 +67,7 @@ templates:
     accent_color: "#dc3545"
 
 rules:
-  - name: "cisco_bpdu_guard"
+  - name: "SPANTREE-2-BLOCK_BPDUGUARD"
     enabled: true
     query: 'group:"SW" "SPANTREE-2-BLOCK_BPDUGUARD"'
     parser:
@@ -79,7 +79,7 @@ rules:
       count: 3
       window: 5m
     notify:
-      template: "bpdu_guard"
+      template: "SPANTREE-2-BLOCK_BPDUGUARD"
       destinations:
         - mattermost-infra
         - email-infra
