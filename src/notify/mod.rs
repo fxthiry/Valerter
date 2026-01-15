@@ -606,6 +606,7 @@ pub fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn test_config_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -822,6 +823,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn registry_from_config_creates_mattermost_notifiers() {
         use crate::config::{MattermostNotifierConfig, NotifierConfig};
 
@@ -874,6 +876,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_fails_on_undefined_env_var() {
         use crate::config::{MattermostNotifierConfig, NotifierConfig};
 
@@ -913,6 +916,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_collects_all_errors() {
         use crate::config::{MattermostNotifierConfig, NotifierConfig};
 
@@ -974,6 +978,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn registry_from_config_creates_webhook_notifiers() {
         use crate::config::{NotifierConfig, WebhookNotifierConfig};
 
@@ -1045,6 +1050,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_webhook_fails_on_undefined_env_var() {
         use crate::config::{NotifierConfig, WebhookNotifierConfig};
 
@@ -1087,6 +1093,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_mixed_notifiers() {
         use crate::config::{MattermostNotifierConfig, NotifierConfig, WebhookNotifierConfig};
 
@@ -1374,6 +1381,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_email_with_auth() {
         use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
@@ -1419,6 +1427,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_email_fails_on_undefined_env_var() {
         use crate::config::{EmailNotifierConfig, NotifierConfig, SmtpConfig, TlsMode};
 
@@ -1502,6 +1511,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registry_from_config_all_three_notifier_types() {
         use crate::config::{
             EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig, TlsMode,

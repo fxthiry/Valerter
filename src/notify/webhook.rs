@@ -362,6 +362,7 @@ impl std::fmt::Debug for WebhookNotifier {
 mod tests {
     use super::*;
     use crate::template::RenderedMessage;
+    use serial_test::serial;
     use std::collections::HashMap;
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
@@ -382,6 +383,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn from_config_with_all_fields() {
         temp_env::with_var("TEST_WEBHOOK_TOKEN", Some("secret-token-123"), || {
             let config = WebhookNotifierConfig {
@@ -428,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_config_resolves_url_env_var() {
         temp_env::with_var(
             "TEST_WEBHOOK_URL",
@@ -450,6 +453,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_config_fails_on_undefined_url_env_var() {
         temp_env::with_var("UNDEFINED_WEBHOOK_URL", None::<&str>, || {
             let config = WebhookNotifierConfig {
@@ -476,6 +480,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_config_fails_on_undefined_header_env_var() {
         temp_env::with_var("UNDEFINED_TOKEN", None::<&str>, || {
             let config = WebhookNotifierConfig {
@@ -685,6 +690,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn debug_output_does_not_expose_url() {
         temp_env::with_var(
             "TEST_SECRET_URL",
@@ -713,6 +719,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn debug_output_does_not_expose_headers() {
         temp_env::with_var("TEST_AUTH_TOKEN", Some("Bearer super-secret-token"), || {
             let config = WebhookNotifierConfig {
