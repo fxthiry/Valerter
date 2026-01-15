@@ -1,0 +1,198 @@
+# Valerter Configuration - Cisco Switches
+# =========================================
+
+victorialogs:
+  url: "http://victorialogs:9428"
+
+metrics:
+  enabled: true
+  port: 9090
+
+notifiers:
+  mattermost-infra:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/xxx"
+    username: "Valerter"
+
+  email-infra:
+    type: email
+    smtp:
+      host: smtp.example.com
+      port: 587
+      tls: starttls
+      username: "user"
+      password: "password"
+    from: "valerter@example.com"
+    to:
+      - "team@example.com"
+    subject_template: "[Valerter] {{ title }}"
+
+defaults:
+  throttle:
+    count: 10
+    window: 5m
+  notify:
+    template: "cisco_critical"
+
+templates:
+  cisco_critical:
+    title: "🚨 CRITICAL | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}` | **Severity:** `{{ level | upper }}`
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#dc3545"
+
+  cisco_sfp:
+    title: "🔌 SFP Threshold | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}`
+
+      > ⚠️ Optical transceiver alert (temperature/power)
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#fd7e14"
+
+  cisco_vlan:
+    title: "🔀 VLAN Mismatch | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}`
+
+      > ⚠️ Inconsistent native VLAN configuration
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#ffc107"
+
+  cisco_platform:
+    title: "⚙️ Platform Warning | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}`
+
+      > ⚠️ Hardware alert (fan, PSU, temperature)
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#fd7e14"
+
+  cisco_stack:
+    title: "📚 Stack Change | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}`
+
+      > ⚠️ Stack link modification detected
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#6f42c1"
+
+  cisco_restart:
+    title: "🔄 Switch Restart | {{ hostname }}"
+    body: |
+      **Site:** `{{ site }}` | **Switch:** `{{ hostname }}`
+
+      > ℹ️ The switch has been restarted
+
+      ```
+      {{ _msg }}
+      ```
+    accent_color: "#0dcaf0"
+
+rules:
+  - name: "cisco_sw_critical"
+    enabled: true
+    query: 'group:"SW" severity:~"[0-2]"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+      regex: '%(?P<alert_type>[A-Z0-9_-]+):'
+    throttle:
+      key: "{{ hostname }}-{{ alert_type }}"
+      count: 3
+      window: 5m
+    notify:
+      template: "cisco_critical"
+      destinations:
+        - mattermost-infra
+
+  - name: "cisco_platform_warning"
+    enabled: true
+    query: 'group:"SW" "PLATFORM-4-ELEMENT_WARNING"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+    throttle:
+      key: "{{ hostname }}"
+      count: 1
+      window: 48h
+    notify:
+      template: "cisco_platform"
+      destinations:
+        - mattermost-infra
+
+  - name: "cisco_sfp_threshold"
+    enabled: true
+    query: 'group:"SW" "SFF8472-3-THRESHOLD_VIOLATION"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+    throttle:
+      key: "{{ hostname }}"
+      count: 1
+      window: 48h
+    notify:
+      template: "cisco_sfp"
+      destinations:
+        - mattermost-infra
+
+  - name: "cisco_vlan_mismatch"
+    enabled: true
+    query: 'group:"SW" "CDP-4-NATIVE_VLAN_MISMATCH"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+    throttle:
+      key: "{{ hostname }}"
+      count: 3
+      window: 5m
+    notify:
+      template: "cisco_vlan"
+      destinations:
+        - mattermost-infra
+
+  - name: "cisco_stack_change"
+    enabled: true
+    query: 'group:"SW" "STACKMGR-4-STACK_LINK_CHANGE"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+    throttle:
+      key: "{{ hostname }}"
+      count: 5
+      window: 5m
+    notify:
+      template: "cisco_stack"
+      destinations:
+        - mattermost-infra
+
+  - name: "cisco_restart"
+    enabled: true
+    query: 'group:"SW" "SYS-5-RESTART"'
+    parser:
+      json:
+        fields: ["hostname", "site", "severity", "_msg", "level"]
+    throttle:
+      key: "{{ hostname }}"
+      count: 1
+      window: 1m
+    notify:
+      template: "cisco_restart"
+      destinations:
+        - mattermost-infra
