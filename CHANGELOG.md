@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] - 2026-01-15
+
+### Changed
+- **Simplified tarball** - Contains only binary + config.example.yaml (removed install.sh, uninstall.sh, valerter.service)
+- **Updated Quick Start** - Clear separation between .deb and static binary installation paths
+
 ## [1.0.0-rc.2] - 2026-01-15
 
 ### Added
@@ -83,7 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...HEAD
+[1.0.0-rc.3]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.2...v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.1...v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-beta.1...v1.0.0-rc.1
 [1.0.0-beta.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-alpha.2...v1.0.0-beta.1
