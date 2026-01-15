@@ -44,6 +44,39 @@ victorialogs:
     verify: true    # Set to false for self-signed certs
 ```
 
+### Reverse Proxy Configuration
+
+If VictoriaLogs is behind a reverse proxy (nginx, Traefik, etc.), you **must** disable buffering and caching for the `/select/logsql/tail` endpoint. Valerter uses HTTP streaming to receive logs in real-time, and proxy buffering will cause delays or connection issues.
+
+**Nginx example:**
+
+```nginx
+# Add this BEFORE your general /select location block
+location = /select/logsql/tail {
+    proxy_pass http://victorialogs_backend;
+
+    # CRITICAL: Disable buffering and caching for streaming
+    proxy_buffering off;
+    proxy_cache off;
+
+    # Long timeouts for persistent connections
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+**Key settings:**
+- `proxy_buffering off` — Send data immediately to client
+- `proxy_cache off` — Don't cache streaming responses
+- `proxy_read_timeout 3600s` — Keep connection alive for 1 hour
+
 ## Defaults
 
 Default values applied to all rules unless overridden.

@@ -35,7 +35,7 @@ async fn test_streaming_basic_single_line() {
     let mock_server = MockServer::start().await;
 
     // Configure streaming response with a single JSON line
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(query_param("query", "_stream:test"))
         .and(header("Accept", "application/x-ndjson"))
@@ -69,7 +69,7 @@ async fn test_streaming_multiple_lines() {
 {"_time":"2026-01-09T10:00:02Z","_msg":"log 3"}
 "#;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(body.as_slice(), "application/x-ndjson"),
@@ -92,7 +92,7 @@ async fn test_streaming_multiple_lines() {
 async fn test_streaming_empty_response() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(b"", "application/x-ndjson"))
         .mount(&mock_server)
@@ -114,7 +114,7 @@ async fn test_streaming_empty_response() {
 async fn test_connection_error_http_500() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)
@@ -138,7 +138,7 @@ async fn test_connection_error_http_500() {
 async fn test_connection_error_http_404() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock_server)
@@ -162,7 +162,7 @@ async fn test_connection_error_http_404() {
 async fn test_connection_error_http_503() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(503))
         .mount(&mock_server)
@@ -217,7 +217,7 @@ async fn test_timeout_detection() {
     // Note: In real tests, we'd want to test actual timeout behavior,
     // but wiremock doesn't easily support streaming delays.
     // Instead, we test the timeout mapping in error handling.
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -269,7 +269,7 @@ async fn test_url_construction_is_correct() {
     let mock_server = MockServer::start().await;
 
     // Verify the exact URL format expected by VictoriaLogs
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(query_param("query", "_stream:{app=\"myapp\"}"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(b"\n", "application/x-ndjson"))
@@ -296,7 +296,7 @@ async fn test_url_construction_is_correct() {
 async fn test_url_with_start_param() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(query_param("query", "_stream:test"))
         .and(query_param("start", "now-1h"))
@@ -326,7 +326,7 @@ async fn test_url_with_start_param() {
 async fn test_headers_are_set_correctly() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header("Accept", "application/x-ndjson"))
         .and(header("Connection", "keep-alive"))
@@ -354,7 +354,7 @@ async fn test_streaming_with_utf8_content() {
 {"_msg":"Alert 🚨 triggered"}
 "#;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(body.as_bytes(), "application/x-ndjson"),
@@ -405,7 +405,7 @@ async fn test_stream_with_reconnect_receives_lines() {
     let mock_server = MockServer::start().await;
 
     // Configure streaming response
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             b"{\"_msg\":\"line1\"}\n{\"_msg\":\"line2\"}\n",
@@ -448,14 +448,14 @@ async fn test_stream_with_reconnect_retries_on_error() {
     let mock_server = MockServer::start().await;
 
     // First request fails, second succeeds
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(ResponseTemplate::new(503))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -584,7 +584,7 @@ async fn test_basic_auth_header_is_sent() {
     let mock_server = MockServer::start().await;
 
     // Expected Basic Auth header for "testuser:testpass" is "dGVzdHVzZXI6dGVzdHBhc3M="
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
         .respond_with(
@@ -608,7 +608,7 @@ async fn test_basic_auth_header_is_sent() {
 async fn test_custom_headers_are_sent() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header("X-API-Key", "secret-key-123"))
         .and(header("X-Custom", "custom-value"))
@@ -643,7 +643,7 @@ async fn test_custom_headers_are_sent() {
 async fn test_bearer_token_in_header() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header("Authorization", "Bearer my-jwt-token-here"))
         .respond_with(
@@ -674,7 +674,7 @@ async fn test_basic_auth_with_custom_headers_combined() {
     let mock_server = MockServer::start().await;
 
     // Both Basic Auth and custom headers should be sent
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header_exists("Authorization")) // Basic auth header
         .and(header("X-Tenant-ID", "tenant-abc"))
@@ -721,7 +721,7 @@ async fn test_basic_auth_401_on_wrong_credentials() {
     let mock_server = MockServer::start().await;
 
     // Server expects correct credentials, returns 401 for wrong ones
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .and(header(
             "Authorization",
@@ -750,7 +750,7 @@ async fn test_without_auth_no_authorization_header() {
     let mock_server = MockServer::start().await;
 
     // This mock will FAIL if Authorization header is present
-    Mock::given(method("POST"))
+    Mock::given(method("GET"))
         .and(path("/select/logsql/tail"))
         .respond_with(
             ResponseTemplate::new(200)
