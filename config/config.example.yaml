@@ -1,377 +1,319 @@
-# ==============================================================================
-# Valerter Configuration Example
-# ==============================================================================
-# Copy to /etc/valerter/config.yaml and customize
+# ══════════════════════════════════════════════════════════════════════════════
+#                         VALERTER CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# Quick Start: Uncomment and configure sections as needed.
-# Minimal config requires: victorialogs.url, defaults, templates, rules
-# ==============================================================================
+# Copy this file to /etc/valerter/config.yaml and customize.
 #
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │ MULTI-FILE CONFIGURATION (rules.d/, templates.d/, notifiers.d/)            │
-# ├─────────────────────────────────────────────────────────────────────────────┤
-# │                                                                             │
-# │ For large deployments, you can split rules/templates/notifiers into        │
-# │ separate files in .d/ directories alongside config.yaml:                   │
-# │                                                                             │
-# │   /etc/valerter/                                                            │
-# │   ├── config.yaml         # Main config (this file)                        │
-# │   ├── rules.d/                                                              │
-# │   │   ├── security.yaml   # Security team rules                            │
-# │   │   └── infra.yaml      # Infrastructure rules                           │
-# │   ├── templates.d/                                                          │
-# │   │   └── custom.yaml     # Custom templates                               │
-# │   └── notifiers.d/                                                          │
-# │       └── team-channels.yaml                                                │
-# │                                                                             │
-# │ Format in .d/ files uses HashMap (name = YAML key):                        │
-# │                                                                             │
-# │   # rules.d/security.yaml                                                   │
-# │   auth_failure:                                                             │
-# │     query: "_msg:authentication AND status:failed"                         │
-# │     parser:                                                                 │
-# │       json:                                                                 │
-# │         fields: [user, ip]                                                  │
-# │                                                                             │
-# │ Names must be unique across config.yaml and all .d/ files.                 │
-# │ Collisions produce explicit errors indicating both source files.           │
-# └─────────────────────────────────────────────────────────────────────────────┘
+# Required sections: victorialogs, defaults, templates, notifiers, rules
+# Optional section:  metrics
 #
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │ CONFIGURATION APPROACHES                                                    │
-# ├─────────────────────────────────────────────────────────────────────────────┤
-# │                                                                             │
-# │ ► RECOMMENDED (Simple deployments):                                         │
-# │   Put all values directly in this file, including secrets.                  │
-# │   Secure with: chmod 600 /etc/valerter/config.yaml                          │
-# │                                                                             │
-# │   webhook_url: "https://mattermost.example.com/hooks/abc123"                │
-# │                                                                             │
-# │ ► ALTERNATIVE (Kubernetes / Orchestrators):                                 │
-# │   Use ${VAR_NAME} syntax for secrets. Variables are resolved at startup     │
-# │   from the process environment (env vars, ConfigMaps, Secrets).             │
-# │                                                                             │
-# │   webhook_url: "${MM_WEBHOOK}"                                              │
-# │                                                                             │
-# │ Both approaches can be mixed in the same config file.                       │
-# └─────────────────────────────────────────────────────────────────────────────┘
-# ==============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# SECRETS MANAGEMENT
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Option 1 - Direct values (simple deployments):
+#   Secure with: chmod 600 /etc/valerter/config.yaml
+#   webhook_url: "https://mattermost.example.com/hooks/abc123"
+#
+# Option 2 - Environment variables (Kubernetes, orchestrators):
+#   Variables resolved at startup from process environment.
+#   webhook_url: "${MM_WEBHOOK}"
+#
+# Both approaches can be mixed in the same file.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# MULTI-FILE CONFIGURATION
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Split configuration into .d/ directories for large deployments:
+#
+#   /etc/valerter/
+#   ├── config.yaml
+#   ├── rules.d/
+#   │   ├── security.yaml
+#   │   └── infra.yaml
+#   ├── templates.d/
+#   │   └── custom.yaml
+#   └── notifiers.d/
+#       └── team-channels.yaml
+#
+# In .d/ files, the resource name is the YAML key (not a field):
+#
+#   # rules.d/security.yaml
+#   auth_failure:                          # ← Rule name
+#     query: "_msg:authentication failed"
+#     parser:
+#       json:
+#         fields:
+#           - user
+#           - ip
+#     notify:
+#       template: default_alert
+#       destinations:
+#         - slack-security
+#
+# Names must be unique across all files. Collisions produce explicit errors.
+#
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ==============================================================================
-# SECTION 1: VictoriaLogs Connection (REQUIRED)
-# ==============================================================================
-# Configure the connection to your VictoriaLogs instance.
-# The URL is required; authentication and TLS are optional.
+
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ VICTORIALOGS CONNECTION                                          [REQUIRED]│
+# └────────────────────────────────────────────────────────────────────────────┘
 
 victorialogs:
-  # REQUIRED: VictoriaLogs base URL (typically port 9428)
-  url: "http://victorialogs:9428"
+  url: "http://127.0.0.1:9428"
 
-  # OPTIONAL: Basic Authentication
-  # Generates 'Authorization: Basic ...' header automatically.
-  # Recommended: use environment variables for credentials.
+  # ── Authentication (optional) ──────────────────────────────────────────────
+  #
   # basic_auth:
-  #   username: "${VL_USER}"       # REQUIRED if basic_auth is set
-  #   password: "${VL_PASS}"       # REQUIRED if basic_auth is set
-
-  # OPTIONAL: Custom HTTP headers
-  # Use for Bearer tokens, API keys, or custom auth schemes.
-  # headers:
+  #   username: "${VL_USER}"
+  #   password: "${VL_PASS}"
+  #
+  # headers:                               # For Bearer tokens or API keys
   #   Authorization: "Bearer ${VL_TOKEN}"
-  #   X-API-Key: "${VL_API_KEY}"
 
-  # OPTIONAL: TLS configuration
+  # ── TLS (optional) ─────────────────────────────────────────────────────────
+  #
   # tls:
-  #   verify: true                 # Default: true. Set to false for self-signed certs (like curl -k)
+  #   verify: true                         # Set false for self-signed certs
 
-# ==============================================================================
-# SECTION 2: Metrics (OPTIONAL)
-# ==============================================================================
-# Prometheus metrics exposition. Exposes /metrics endpoint.
-# Default: enabled=true, port=9090
 
-metrics:
-  enabled: true                    # Default: true
-  port: 9090                       # Default: 9090
-
-# ==============================================================================
-# SECTION 3: Notifiers (REQUIRED)
-# ==============================================================================
-# Named notification channels. Rules can target one or more notifiers.
-# At least one notifier must be configured.
-#
-# Supported types:
-#   - mattermost: Mattermost incoming webhook
-#   - webhook: Generic HTTP endpoint (PagerDuty, Slack, custom APIs)
-#   - email: SMTP email notifications
-
-notifiers:
-  # Minimal mattermost config (required for example to work)
-  mattermost-ops:
-    type: mattermost
-    webhook_url: "https://mattermost.example.com/hooks/example"
-
-# Additional notifier examples (uncomment as needed):
-# notifiers:
-#   # --------------------------------------------------------------------------
-#   # Mattermost Notifier
-#   # --------------------------------------------------------------------------
-#   # Required: webhook_url
-#   # Optional: channel, username, icon_url
-#
-#   mattermost-ops:
-#     type: mattermost
-#     webhook_url: "https://mattermost.example.com/hooks/abc123"  # REQUIRED - direct value
-#     # OR: webhook_url: "${MM_WEBHOOK}"                          # Alternative: env var for secrets
-#     channel: ops-alerts                     # Optional: override default channel
-#     username: valerter                      # Optional: webhook username
-#     icon_url: "https://example.com/icon.png"  # Optional: webhook icon
-#
-#   # Minimal mattermost config (only webhook_url is required)
-#   mattermost-minimal:
-#     type: mattermost
-#     webhook_url: "https://mattermost.example.com/hooks/xyz789"
-#
-#   # --------------------------------------------------------------------------
-#   # Webhook Notifier (Generic HTTP)
-#   # --------------------------------------------------------------------------
-#   # Required: url
-#   # Optional: method (default: POST), headers, body_template
-#   #
-#   # If body_template is omitted, sends default JSON payload:
-#   # {
-#   #   "alert_name": "<notifier_name>",
-#   #   "rule_name": "...",
-#   #   "title": "...",
-#   #   "body": "...",
-#   #   "timestamp": "<ISO8601>",
-#   #   "log_timestamp": "<ISO8601>",              # Original log timestamp (for VictoriaLogs search)
-#   #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"  # Human-readable timestamp
-#   # }
-#   # Note: Webhook is generic - accent_color is not included in the payload.
-#
-#   # Example: PagerDuty integration
-#   pagerduty:
-#     type: webhook
-#     url: "https://events.pagerduty.com/v2/enqueue"
-#     method: POST                            # Optional, default: POST
-#     headers:
-#       Authorization: "Token token=${PAGERDUTY_TOKEN}"
-#       Content-Type: "application/json"
-#     body_template: |
-#       {
-#         "routing_key": "${PAGERDUTY_ROUTING_KEY}",
-#         "event_action": "trigger",
-#         "payload": {
-#           "summary": "{{ title }}",
-#           "source": "valerter",
-#           "severity": "error",
-#           "custom_details": {
-#             "body": "{{ body }}",
-#             "rule": "{{ rule_name }}"
-#           }
-#         }
-#       }
-#
-#   # Example: Slack webhook (minimal config)
-#   slack-alerts:
-#     type: webhook
-#     url: "${SLACK_WEBHOOK_URL}"
-#
-#   # Example: Custom API with PUT method and auth header
-#   custom-api:
-#     type: webhook
-#     url: "https://api.example.com/alerts"
-#     method: PUT
-#     headers:
-#       Authorization: "Bearer ${API_TOKEN}"
-#       X-Custom-Header: "valerter"
-#     body_template: |
-#       {"alert": "{{ title }}", "details": "{{ body }}", "log_time": "{{ log_timestamp_formatted }}"}
-#
-#   # --------------------------------------------------------------------------
-#   # Email Notifier (SMTP)
-#   # --------------------------------------------------------------------------
-#   # Required: smtp (host, port), from, to, subject_template
-#   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify,
-#   #           body_template, body_template_file
-#   #
-#   # TLS modes:
-#   #   - none: No encryption (port 25, internal networks only)
-#   #   - starttls: STARTTLS upgrade (port 587, recommended)
-#   #   - tls: Direct TLS connection (port 465)
-#   #
-#   # Body templates:
-#   #   - body_template: inline Jinja template string
-#   #   - body_template_file: path to template file (relative to config or absolute)
-#   #   - If neither is specified, a default HTML template is used
-#   #   - Available variables: title, body, rule_name, accent_color,
-#   #                          log_timestamp, log_timestamp_formatted
-#
-#   # Example: Full email config with authentication
-#   email-ops:
-#     type: email
-#     smtp:
-#       host: smtp.example.com               # REQUIRED
-#       port: 587                            # REQUIRED (587=STARTTLS, 465=TLS, 25=none)
-#       username: "${SMTP_USER}"             # Optional: SMTP auth username
-#       password: "${SMTP_PASSWORD}"         # Optional: SMTP auth password
-#       tls: starttls                        # Default: starttls. Options: none, starttls, tls
-#       tls_verify: true                     # Default: true. Set false for self-signed certs
-#     from: "valerter@example.com"           # REQUIRED
-#     to:                                    # REQUIRED (at least one recipient)
-#       - "ops@example.com"
-#       - "admin@example.com"
-#     subject_template: "[{{ rule_name | upper }}] {{ title }}"  # REQUIRED
-#     # body_template_file: "templates/custom-email.html.j2"  # Optional: custom template
-#     # Or inline:
-#     # body_template: |
-#     #   <html>
-#     #     <body>
-#     #       <h1>{{ title }}</h1>
-#     #       <p>{{ body }}</p>
-#     #       <small>Rule: {{ rule_name }}</small>
-#     #     </body>
-#     #   </html>
-#
-#   # Example: Minimal email config (internal network, no auth)
-#   email-internal:
-#     type: email
-#     smtp:
-#       host: internal-smtp.local
-#       port: 25
-#       tls: none
-#       tls_verify: false
-#     from: "alerts@internal.local"
-#     to:
-#       - "team@internal.local"
-#     subject_template: "Alert: {{ title }}"
-
-# ==============================================================================
-# SECTION 4: Defaults (REQUIRED)
-# ==============================================================================
-# Default values applied to rules when not explicitly specified.
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ DEFAULTS                                                         [REQUIRED]│
+# └────────────────────────────────────────────────────────────────────────────┘
 
 defaults:
-  # REQUIRED: Default throttle settings
   throttle:
-    count: 5                       # REQUIRED: Max alerts per window
-    window: 60s                    # REQUIRED: Time window (e.g., 60s, 5m, 1h)
+    count: 5                               # Max alerts per window
+    window: 60s                            # Duration: 30s, 5m, 1h, etc.
 
-  # OPTIONAL: Timezone for formatted log timestamps (IANA timezone name)
-  # Default: UTC. Used in {{ log_timestamp_formatted }} and Mattermost footers.
-  # Examples: "UTC", "Europe/Paris", "America/New_York", "Asia/Tokyo"
-  timestamp_timezone: "UTC"
+  timestamp_timezone: "UTC"       # IANA timezone for log_timestamp_formatted
+                                           # Examples: UTC, America/New_York, Asia/Tokyo
 
-# ==============================================================================
-# SECTION 5: Templates (REQUIRED)
-# ==============================================================================
-# Reusable message templates for alert formatting.
-# Uses Jinja2-like syntax (minijinja). Available variables depend on parser output.
-# Built-in variables: title, body, rule_name, accent_color
+
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ TEMPLATES                                                        [REQUIRED]│
+# └────────────────────────────────────────────────────────────────────────────┘
+# Message templates using Jinja2 syntax (minijinja).
+#
+# Built-in variables:
+#   rule_name                - Name of the triggered rule
+#   log_timestamp            - Original log timestamp (ISO8601)
+#   log_timestamp_formatted  - Human-readable timestamp (uses defaults.timestamp_timezone)
+#
+# Parser variables:
+#   Any field extracted by the rule's parser (JSON fields or regex named groups)
+#
+# Fields:
+#   title        - Alert title (required)
+#   body         - Alert body, plain text or Markdown (required)
+#   body_html    - HTML version for email (optional, falls back to body)
+#   accent_color - Hex color for visual indicators (optional, e.g., "#ff0000")
 
 templates:
-  # Simple default template
   default_alert:
-    title: "{{ title | default('Alert') }}"  # REQUIRED
-    body: "{{ body }}"                        # REQUIRED
-    accent_color: "#ff0000"                   # Optional - hex color (#rrggbb) for visual indicators
-    # Note: accent_color requires quotes in YAML since # is a comment character
+    title: "{{ title | default('Alert') }}"
+    body: "{{ body }}"
+    accent_color: "#3498db"
 
-  # Example: Template with accent_color
-  custom_template:
-    title: "{{ severity }}: {{ title }}"
-    body: |
-      **Host:** {{ host }}
-      **Message:** {{ message }}
-      **Time:** {{ timestamp }}
-    accent_color: "#ff0000"                   # Used for email colored dot and Mattermost sidebar
+  # ── Example: Severity-based template ───────────────────────────────────────
+  #
+  # critical_alert:
+  #   title: "🔴 CRITICAL: {{ title }}"
+  #   body: |
+  #     **Host:** {{ host }}
+  #     **Message:** {{ message }}
+  #   body_html: |
+  #     <h2 style="color: red;">{{ title }}</h2>
+  #     <p><strong>Host:</strong> {{ host }}</p>
+  #     <p>{{ message }}</p>
+  #   accent_color: "#e74c3c"
 
-# ==============================================================================
-# SECTION 6: Rules (REQUIRED)
-# ==============================================================================
-# Alert rules define what logs to monitor and how to process them.
-# At least one rule is required.
+
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ NOTIFIERS                                                        [REQUIRED]│
+# └────────────────────────────────────────────────────────────────────────────┘
+# At least one notifier must be configured.
+# Rules reference notifiers by name in their destinations list.
+
+notifiers:
+
+  # ── Mattermost ─────────────────────────────────────────────────────────────
+  # Incoming webhook integration.
+  #
+  # Required: webhook_url
+  # Optional: channel (override default), username, icon_url
+
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/xxx"
+    # channel: alerts
+    # username: valerter
+    # icon_url: "https://example.com/icon.png"
+
+  # ── Webhook (Generic HTTP) ─────────────────────────────────────────────────
+  # Send alerts to any HTTP endpoint (Slack, PagerDuty, custom APIs).
+  #
+  # Required: url
+  # Optional: method (default: POST), headers, body_template
+  #
+  # Default payload when body_template is omitted:
+  # {
+  #   "alert_name": "<notifier_name>",
+  #   "rule_name": "...",
+  #   "title": "...",
+  #   "body": "...",
+  #   "timestamp": "<ISO8601>",
+  #   "log_timestamp": "<ISO8601>",
+  #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"
+  # }
+
+  # slack-alerts:
+  #   type: webhook
+  #   url: "${SLACK_WEBHOOK_URL}"
+
+  # pagerduty:
+  #   type: webhook
+  #   url: "https://events.pagerduty.com/v2/enqueue"
+  #   headers:
+  #     Authorization: "Token token=${PAGERDUTY_TOKEN}"
+  #     Content-Type: "application/json"
+  #   body_template: |
+  #     {
+  #       "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+  #       "event_action": "trigger",
+  #       "payload": {
+  #         "summary": "{{ title }}",
+  #         "source": "valerter",
+  #         "severity": "error",
+  #         "custom_details": {
+  #           "body": "{{ body }}",
+  #           "rule": "{{ rule_name }}"
+  #         }
+  #       }
+  #     }
+
+  # ── Email (SMTP) ───────────────────────────────────────────────────────────
+  # Required: smtp.host, smtp.port, from, to, subject_template
+  # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify,
+  #           body_template (inline), body_template_file (path)
+  #
+  # TLS modes:
+  #   none     - No encryption (port 25, internal networks only)
+  #   starttls - STARTTLS upgrade (port 587, recommended)
+  #   tls      - Direct TLS (port 465)
+  #
+  # If no body template is specified, a default HTML template is used.
+
+  # email-ops:
+  #   type: email
+  #   smtp:
+  #     host: smtp.example.com
+  #     port: 587
+  #     username: "${SMTP_USER}"
+  #     password: "${SMTP_PASSWORD}"
+  #     tls: starttls                      # Default: starttls
+  #     tls_verify: true                   # Default: true
+  #   from: "valerter@example.com"
+  #   to:
+  #     - "ops@example.com"
+  #     - "admin@example.com"
+  #   subject_template: "[{{ rule_name | upper }}] {{ title }}"
+
+
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ RULES                                                            [REQUIRED]│
+# └────────────────────────────────────────────────────────────────────────────┘
+# At least one rule must be configured.
+#
+# Fields:
+#   name         - Unique identifier (required)
+#   query        - LogsQL query (required)
+#   parser       - Data extraction config (required, see below)
+#   notify       - Notification settings (required)
+#   enabled      - Enable/disable rule (optional, default: true)
+#   throttle     - Override default throttle (optional)
+#
+# Parser (at least one of regex or json should be configured):
+#   json.fields  - List of JSON fields to extract
+#   regex        - Pattern with named capture groups: (?P<name>pattern)
 
 rules:
-  # --------------------------------------------------------------------------
-  # Example 1: JSON parser with per-host throttling
-  # --------------------------------------------------------------------------
-  - name: "high_cpu_alert"                   # REQUIRED: Unique rule name
-    enabled: true                            # Default: true
-    query: '_stream:{host="server1"} | json | cpu > 90'  # REQUIRED: LogsQL query
-    parser:                                  # At least one of regex or json recommended
-      json:
-        fields: ["host", "cpu", "timestamp"]  # REQUIRED: Fields to extract from JSON
-    throttle:                                # Optional: Overrides defaults.throttle
-      key: "{{ host }}"                      # Optional: Group throttling by field value
-      count: 3                               # REQUIRED if throttle is set
-      window: 5m                             # REQUIRED if throttle is set
-    notify:                                  # REQUIRED: Notification settings
-      template: "default_alert"              # REQUIRED: Template name from templates section
-      mattermost_channel: "custom-channel"   # Optional: Override Mattermost channel
-      destinations:                          # REQUIRED: Send to specific notifiers
-        - mattermost-ops                     # Must match names in notifiers section
+  # ── Example 1: JSON logs with per-host throttling ──────────────────────────
 
-  # --------------------------------------------------------------------------
-  # Example 2: Regex parser with minimal config
-  # --------------------------------------------------------------------------
-  - name: "error_log_alert"
-    enabled: true
-    query: '_stream:{app="myapp"} level:error'
+  - name: high_cpu_alert
+    query: '_stream:{host="server1"} AND _msg:"cpu" | json | cpu:>90'
     parser:
-      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'  # Named capture groups
+      json:
+        fields:
+          - host
+          - cpu
+          - timestamp
+    throttle:
+      key: "{{ host }}"                    # Throttle independently per host
+      count: 3
+      window: 5m
     notify:
-      template: "default_alert"
+      template: default_alert
       destinations:
         - mattermost-ops
 
-  # --------------------------------------------------------------------------
-  # Example 3: Multi-destination routing
-  # --------------------------------------------------------------------------
-  # - name: "critical_error_alert"
-  #   enabled: true
-  #   query: '_stream:{app="myapp"} level:critical'
+  # ── Example 2: Regex parser ────────────────────────────────────────────────
+
+  - name: error_log_alert
+    query: '_stream:{app="myapp"} AND level:error'
+    parser:
+      regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
+    notify:
+      template: default_alert
+      # mattermost_channel: custom-channel # Override notifier's default channel
+      destinations:
+        - mattermost-ops
+
+  # ── Example 3: Multi-destination routing ───────────────────────────────────
+  #
+  # - name: critical_alert
+  #   query: '_stream:{app="myapp"} AND level:critical'
   #   parser:
   #     json:
-  #       fields: ["message", "error", "stack_trace"]
+  #       fields:
+  #         - message
+  #         - stack_trace
   #   notify:
-  #     template: "default_alert"
-  #     destinations:                        # Send to multiple channels
+  #     template: critical_alert
+  #     destinations:
   #       - mattermost-ops
   #       - email-ops
   #       - pagerduty
 
-  # --------------------------------------------------------------------------
-  # Example 4: Disabled rule (for reference or testing)
-  # --------------------------------------------------------------------------
-  - name: "disabled_example"
-    enabled: false                           # Rule is ignored
-    query: '_stream:{app="test"}'
-    parser:
-      json:
-        fields: ["message"]
-    notify:
-      template: "default_alert"
-      destinations:
-        - mattermost-ops
 
-# ==============================================================================
-# ENVIRONMENT VARIABLES REFERENCE
-# ==============================================================================
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ METRICS                                                          [OPTIONAL]│
+# └────────────────────────────────────────────────────────────────────────────┘
+# Prometheus metrics exposition at /metrics endpoint.
+
+metrics:
+  enabled: true                            # Default: true
+  port: 9090                               # Default: 9090
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENVIRONMENT VARIABLES
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# VictoriaLogs Authentication:
-#   VL_USER         - Basic Auth username
-#   VL_PASS         - Basic Auth password
-#   VL_TOKEN        - Bearer token (for headers section)
-#   VL_API_KEY      - API key (for headers section)
+# Use ${VAR_NAME} syntax anywhere in this file to reference environment variables.
+# Any variable from the process environment can be used (no predefined list).
 #
-# SMTP/Email:
-#   SMTP_USER       - SMTP authentication username
-#   SMTP_PASSWORD   - SMTP authentication password
+# Examples used in this file:
+#   ${VL_USER}, ${VL_PASS}     - VictoriaLogs credentials
+#   ${VL_TOKEN}                - Bearer token for VictoriaLogs
+#   ${SMTP_USER}, ${SMTP_PASSWORD} - Email credentials
+#   ${SLACK_WEBHOOK_URL}       - Slack webhook
+#   ${PAGERDUTY_TOKEN}         - PagerDuty API token
 #
-# Logging:
-#   RUST_LOG        - Log level: error, warn, info (default), debug, trace
-#   LOG_FORMAT      - Output format: text (default), json
+# Runtime variables (not substituted in config, read directly by the process):
+#   RUST_LOG   - Log level: error, warn, info (default), debug, trace
+#   LOG_FORMAT - Output format: text (default), json
 #
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
