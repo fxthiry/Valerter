@@ -23,8 +23,8 @@ use valerter::{
 /// - `LogFormat::Text`: Human-readable format for journalctl (AD-10)
 /// - `LogFormat::Json`: Structured JSON format for log aggregation (FR42)
 fn init_logging(format: LogFormat) {
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(tracing::Level::INFO.into());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     match format {
         LogFormat::Text => {
