@@ -1,7 +1,6 @@
 //! Runtime configuration with pre-compiled regex and templates.
 
 use super::notifiers::NotifiersConfig;
-use super::secret::SecretString;
 use super::types::{
     Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig, VictoriaLogsConfig,
 };
@@ -20,7 +19,6 @@ pub struct RuntimeConfig {
     pub rules: Vec<CompiledRule>,
     pub metrics: MetricsConfig,
     pub notifiers: Option<NotifiersConfig>,
-    pub mattermost_webhook: Option<SecretString>,
     pub config_dir: std::path::PathBuf,
 }
 
@@ -181,7 +179,6 @@ impl Config {
             rules,
             metrics: self.metrics,
             notifiers: self.notifiers,
-            mattermost_webhook: self.mattermost_webhook,
             config_dir,
         })
     }

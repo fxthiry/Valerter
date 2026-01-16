@@ -12,6 +12,11 @@ victorialogs:
   tls:
     verify: false
 
+notifiers:
+  test-notifier:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5

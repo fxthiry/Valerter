@@ -642,7 +642,6 @@ mod tests {
             rules,
             metrics: MetricsConfig::default(),
             notifiers: None,
-            mattermost_webhook: None,
             config_dir: std::path::PathBuf::from("."),
         }
     }

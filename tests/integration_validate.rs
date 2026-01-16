@@ -187,3 +187,117 @@ fn validate_email_missing_body_html_exits_failure() {
         stderr
     );
 }
+
+// Test: --validate with config missing notifiers exits with code 1
+#[test]
+fn validate_no_notifiers_exits_failure() {
+    ensure_binary_built();
+
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(fixture_path("config_no_notifier.yaml"))
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        !output.status.success(),
+        "valerter --validate should exit with non-zero code for config without notifiers"
+    );
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 1,
+        "Exit code should be 1 for missing notifiers validation failure"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no notifiers configured"),
+        "Error message should mention no notifiers configured: {}",
+        stderr
+    );
+}
+
+// Test: --validate with config missing templates exits with code 1
+#[test]
+fn validate_no_templates_exits_failure() {
+    ensure_binary_built();
+
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(fixture_path("config_no_template.yaml"))
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        !output.status.success(),
+        "valerter --validate should exit with non-zero code for config without templates"
+    );
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 1,
+        "Exit code should be 1 for missing templates validation failure"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no templates defined"),
+        "Error message should mention no templates defined: {}",
+        stderr
+    );
+}
+
+// Test: MATTERMOST_WEBHOOK env var is no longer used (breaking change)
+// Config without notifiers should fail even if MATTERMOST_WEBHOOK is set
+#[test]
+fn validate_mattermost_env_var_ignored() {
+    ensure_binary_built();
+
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(fixture_path("config_no_notifier.yaml"))
+        .env(
+            "MATTERMOST_WEBHOOK",
+            "https://mattermost.example.com/hooks/test",
+        )
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        !output.status.success(),
+        "Config without notifiers should fail even with MATTERMOST_WEBHOOK env var set"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no notifiers configured"),
+        "Error should mention 'no notifiers configured', got: {}",
+        stderr
+    );
+}
+
+// Test: --validate with minimal config (README example) passes
+#[test]
+fn validate_minimal_config_exits_success() {
+    ensure_binary_built();
+
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(fixture_path("config_minimal.yaml"))
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        output.status.success(),
+        "valerter --validate should exit with code 0 for minimal config (README example)\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Configuration is valid"),
+        "Output should indicate valid config: {}",
+        stdout
+    );
+}

@@ -3,6 +3,11 @@
 victorialogs:
   url: http://victorialogs:9428
 
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5

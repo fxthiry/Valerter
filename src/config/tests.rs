@@ -1,8 +1,6 @@
 //! Integration tests for Config loading, validation, and compilation.
 
-use super::types::ENV_MATTERMOST_WEBHOOK;
 use super::*;
-use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -80,72 +78,6 @@ fn load_invalid_yaml_returns_validation_error() {
         crate::error::ConfigError::ValidationError(_) => {}
         e => panic!("Expected ValidationError, got {:?}", e),
     }
-}
-
-#[test]
-fn load_webhook_from_explicit_value() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("https://mattermost.example.com/hooks/xxx".to_string()),
-    )
-    .unwrap();
-
-    assert!(config.mattermost_webhook.is_some());
-    assert_eq!(
-        config.mattermost_webhook.as_ref().unwrap().expose(),
-        "https://mattermost.example.com/hooks/xxx"
-    );
-}
-
-#[test]
-#[serial]
-fn load_webhook_from_environment_variable() {
-    temp_env::with_var(
-        ENV_MATTERMOST_WEBHOOK,
-        Some("https://test.webhook.url/hook"),
-        || {
-            let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
-            assert!(config.mattermost_webhook.is_some());
-            assert_eq!(
-                config.mattermost_webhook.as_ref().unwrap().expose(),
-                "https://test.webhook.url/hook"
-            );
-        },
-    );
-}
-
-#[test]
-fn mattermost_webhook_in_yaml_is_ignored_due_to_serde_skip() {
-    // This test verifies that #[serde(skip)] on mattermost_webhook works:
-    // even if mattermost_webhook appears in YAML, it should be None after deserialization
-    // (it can only be set via load_with_webhook or MATTERMOST_WEBHOOK env var)
-    let yaml = r#"
-        victorialogs:
-          url: http://localhost:9428
-        defaults:
-          throttle:
-            count: 5
-            window: 1m
-          notify:
-            template: default_alert
-        templates:
-          default_alert:
-            title: "Alert"
-            body: "{{ body }}"
-        rules:
-          - name: test_rule
-            query: "*"
-            parser:
-              regex: ".*"
-        mattermost_webhook: "https://should-be-ignored.com/hooks/secret"
-    "#;
-
-    let config: Config = serde_yaml::from_str(yaml).unwrap();
-    // The mattermost_webhook field should be None because #[serde(skip)] ignores it
-    assert!(
-        config.mattermost_webhook.is_none(),
-        "mattermost_webhook should be None due to #[serde(skip)], but it was set from YAML"
-    );
 }
 
 #[test]
@@ -242,6 +174,40 @@ rules: []
     assert!(has_no_rules_error);
 }
 
+#[test]
+fn validate_no_notifiers_fails() {
+    let config = Config::load(&fixture_path("config_no_notifier.yaml")).unwrap();
+    let result = config.validate();
+    assert!(result.is_err());
+
+    let errors = result.unwrap_err();
+    let has_no_notifiers_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no notifiers configured"))
+    });
+    assert!(
+        has_no_notifiers_error,
+        "Expected 'no notifiers configured' error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_no_templates_fails() {
+    let config = Config::load(&fixture_path("config_no_template.yaml")).unwrap();
+    let result = config.validate();
+    assert!(result.is_err());
+
+    let errors = result.unwrap_err();
+    let has_no_templates_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no templates defined"))
+    });
+    assert!(
+        has_no_templates_error,
+        "Expected 'no templates defined' error, got: {:?}",
+        errors
+    );
+}
+
 // ============================================================
 // Compilation Tests
 // ============================================================
@@ -332,20 +298,6 @@ fn basic_auth_debug_redacts_password() {
     assert!(debug_output.contains("[REDACTED]"));
 }
 
-#[test]
-fn config_debug_does_not_leak_webhook() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("secret-webhook-url".to_string()),
-    )
-    .unwrap();
-
-    let debug_output = format!("{:?}", config);
-
-    assert!(!debug_output.contains("secret-webhook-url"));
-    assert!(debug_output.contains("[REDACTED]"));
-}
-
 // ============================================================
 // Notifiers Tests
 // ============================================================
@@ -360,8 +312,9 @@ fn load_config_with_notifiers_section() {
 }
 
 #[test]
-fn load_config_without_notifiers_section_is_valid() {
-    let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+fn load_config_without_notifiers_section_loads_none() {
+    // config_no_notifier.yaml has no notifiers section
+    let config = Config::load(&fixture_path("config_no_notifier.yaml")).unwrap();
     assert!(config.notifiers.is_none());
 }
 
@@ -418,7 +371,6 @@ fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> R
         }],
         metrics: MetricsConfig::default(),
         notifiers: Some(std::collections::HashMap::new()),
-        mattermost_webhook: None,
         config_dir: std::path::PathBuf::from("."),
     }
 }
@@ -465,20 +417,16 @@ fn validate_rule_destinations_fails_for_unknown_destination() {
 }
 
 #[test]
-fn load_without_webhook() {
-    let config = Config::load_with_webhook(&fixture_path("config_valid.yaml"), None).unwrap();
-    assert!(config.mattermost_webhook.is_none());
-}
-
-#[test]
 fn rules_use_defaults_when_not_specified() {
     let config = Config::load(&fixture_path("config_minimal.yaml")).unwrap();
     assert_eq!(config.rules.len(), 1);
     let rule = &config.rules[0];
+    // Rule doesn't override throttle or notify, so it uses defaults
     assert!(rule.throttle.is_none());
     assert!(rule.notify.is_none());
-    assert_eq!(config.defaults.throttle.count, 10);
-    assert_eq!(config.defaults.notify.template, "simple");
+    // config_minimal.yaml matches README example values
+    assert_eq!(config.defaults.throttle.count, 5);
+    assert_eq!(config.defaults.notify.template, "default_alert");
 }
 
 #[test]
@@ -540,13 +488,17 @@ fn validate_collects_all_errors() {
         ],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
     assert!(result.is_err());
     let errors = result.unwrap_err();
-    assert_eq!(errors.len(), 2, "Should collect all regex errors");
+    // 2 regex errors + 1 no notifiers error = 3 errors
+    assert_eq!(
+        errors.len(),
+        3,
+        "Should collect all errors (2 regex + 1 no notifiers)"
+    );
 }
 
 #[test]
@@ -587,7 +539,6 @@ fn validate_throttle_key_template() {
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
@@ -650,7 +601,6 @@ fn validate_nonexistent_notify_template_fails() {
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
@@ -688,7 +638,6 @@ fn validate_nonexistent_default_template_fails() {
         rules: vec![],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
@@ -699,27 +648,6 @@ fn validate_nonexistent_default_template_fails() {
             if rule == "defaults.notify" && message.contains("missing_default"))
     });
     assert!(has_default_error);
-}
-
-#[test]
-fn security_audit_full_config_debug_safe() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("https://secret.webhook.url/hooks/supersecret123".to_string()),
-    )
-    .unwrap();
-
-    let debug_output = format!("{:?}", config);
-    let forbidden = ["secret.webhook.url", "supersecret123", "hooks/"];
-
-    for pattern in &forbidden {
-        assert!(
-            !debug_output.contains(pattern),
-            "SECURITY VIOLATION: Config debug leaked '{}'",
-            pattern
-        );
-    }
-    assert!(debug_output.contains("[REDACTED]"));
 }
 
 #[test]
@@ -930,6 +858,10 @@ fn validate_config_with_valid_accent_color_passes() {
     let yaml = r##"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
@@ -988,6 +920,10 @@ fn validate_valid_templates_pass() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
@@ -1076,7 +1012,6 @@ fn validate_rule_destinations_collects_all_errors() {
         ],
         metrics: MetricsConfig::default(),
         notifiers: Some(std::collections::HashMap::new()),
-        mattermost_webhook: None,
         config_dir: std::path::PathBuf::from("."),
     };
 

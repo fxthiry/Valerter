@@ -1,0 +1,24 @@
+# Invalid config - no templates defined
+# This should fail validation with "no templates defined" error
+victorialogs:
+  url: "http://localhost:9428"
+
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+  notify:
+    template: "default"
+
+# templates: intentionally omitted to trigger "no templates defined" error
+
+rules:
+  - name: "test_rule"
+    query: '_stream:{app="test"}'
+    parser:
+      regex: '(?P<message>.*)'

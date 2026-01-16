@@ -51,7 +51,7 @@
 # │   Use ${VAR_NAME} syntax for secrets. Variables are resolved at startup     │
 # │   from the process environment (env vars, ConfigMaps, Secrets).             │
 # │                                                                             │
-# │   webhook_url: "${MATTERMOST_WEBHOOK}"                                      │
+# │   webhook_url: "${MM_WEBHOOK}"                                              │
 # │                                                                             │
 # │ Both approaches can be mixed in the same config file.                       │
 # └─────────────────────────────────────────────────────────────────────────────┘
@@ -95,10 +95,10 @@ metrics:
   port: 9090                       # Default: 9090
 
 # ==============================================================================
-# SECTION 3: Notifiers (OPTIONAL)
+# SECTION 3: Notifiers (REQUIRED)
 # ==============================================================================
 # Named notification channels. Rules can target one or more notifiers.
-# If omitted, falls back to MATTERMOST_WEBHOOK env var for backward compatibility.
+# At least one notifier must be configured.
 #
 # Supported types:
 #   - mattermost: Mattermost incoming webhook
@@ -114,8 +114,8 @@ metrics:
 #
 #   mattermost-ops:
 #     type: mattermost
-#     webhook_url: "https://mattermost.example.com/hooks/abc123"  # REQUIRED - direct value (recommended)
-#     # OR: webhook_url: "${MATTERMOST_WEBHOOK}"                  # Alternative: env var for orchestrators
+#     webhook_url: "https://mattermost.example.com/hooks/abc123"  # REQUIRED - direct value
+#     # OR: webhook_url: "${MM_WEBHOOK}"                          # Alternative: env var for secrets
 #     channel: ops-alerts                     # Optional: override default channel
 #     username: valerter                      # Optional: webhook username
 #     icon_url: "https://example.com/icon.png"  # Optional: webhook icon
@@ -356,9 +356,6 @@ rules:
 #   VL_PASS         - Basic Auth password
 #   VL_TOKEN        - Bearer token (for headers section)
 #   VL_API_KEY      - API key (for headers section)
-#
-# Mattermost:
-#   MATTERMOST_WEBHOOK - Legacy webhook URL (backward compatibility fallback)
 #
 # SMTP/Email:
 #   SMTP_USER       - SMTP authentication username
