@@ -40,11 +40,17 @@ auth_failure:
   parser:
     json:
       fields: [user, ip]
+  notify:
+    template: "security_alert"
+    destinations: ["security-team"]
 
 brute_force:
   query: "_msg:blocked"
   parser:
     regex: "IP (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+  notify:
+    template: "security_alert"
+    destinations: ["security-team"]
 ```
 
 ```yaml
@@ -156,8 +162,6 @@ defaults:
   throttle:
     count: 5         # Max alerts per window
     window: 60s      # Time window (e.g., 60s, 5m, 1h)
-  notify:
-    template: "default_alert"    # Template name
   # timestamp_timezone: "Europe/Paris"  # Optional: timezone for formatted timestamps (default: UTC)
 ```
 
@@ -230,11 +234,12 @@ rules:
       count: 3
       window: 5m
 
-    notify:                           # Optional: overrides defaults
-      template: "custom_template"
-      destinations:                   # Send to specific notifiers
+    notify:                           # REQUIRED
+      template: "custom_template"     # REQUIRED: template name
+      destinations:                   # REQUIRED: at least one notifier
         - mattermost-ops
         - email-ops
+      mattermost_channel: "alerts"    # Optional: override Mattermost channel
 ```
 
 ### Parser Types

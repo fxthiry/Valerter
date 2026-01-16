@@ -5,3 +5,5 @@ dir_rule_uses_inline_template:
     regex: ".*"
   notify:
     template: inline_template
+    destinations:
+      - "test"

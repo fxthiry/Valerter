@@ -5,8 +5,6 @@ defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: default_template
 
 templates:
   default_template:
@@ -24,5 +22,6 @@ rules:
     parser:
       regex: ".*"
     notify:
+      template: "default_template"
       destinations:
         - collision_notifier

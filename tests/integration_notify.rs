@@ -15,6 +15,10 @@ use wiremock::matchers::{body_partial_json, body_string_contains, header, method
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_payload(rule_name: &str) -> AlertPayload {
+    make_payload_with_destinations(rule_name, vec!["default".to_string()])
+}
+
+fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
     AlertPayload {
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
@@ -23,7 +27,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
-        destinations: vec![], // Empty = use default notifier (Story 6.3)
+        destinations,
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
     }
@@ -67,7 +71,7 @@ async fn test_send_success_first_attempt() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("test_rule");
     queue.send(payload).unwrap();
@@ -123,7 +127,7 @@ async fn test_retry_on_server_error_then_success() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("retry_rule");
     queue.send(payload).unwrap();
@@ -165,7 +169,7 @@ async fn test_failure_after_max_retries() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("fail_rule");
     queue.send(payload).unwrap();
@@ -215,7 +219,7 @@ async fn test_mattermost_payload_format() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("format_rule");
     queue.send(payload).unwrap();
@@ -256,7 +260,7 @@ async fn test_client_error_no_retry() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("bad_rule");
     queue.send(payload).unwrap();
@@ -296,7 +300,7 @@ async fn test_multiple_messages_in_sequence() {
     let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
-    let mut worker = NotificationWorker::new(&queue, registry, "default".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send 3 messages
     queue.send(make_payload("rule_1")).unwrap();
@@ -321,21 +325,6 @@ async fn test_multiple_messages_in_sequence() {
 // ============================================================================
 // Story 6.3: Test fan-out to multiple destinations in parallel
 // ============================================================================
-
-fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
-    AlertPayload {
-        message: RenderedMessage {
-            title: format!("Alert from {}", rule_name),
-            body: "Test body content".to_string(),
-            body_html: None,
-            accent_color: Some("#ff0000".to_string()),
-        },
-        rule_name: rule_name.to_string(),
-        destinations,
-        log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
-        log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
-    }
-}
 
 /// Create a test registry with multiple notifiers pointing to different mock servers.
 fn make_multi_notifier_registry(
@@ -388,7 +377,7 @@ async fn test_fanout_to_multiple_destinations() {
         ],
     );
 
-    let mut worker = NotificationWorker::new(&queue, registry, "mattermost-infra".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send one alert with two destinations
     let payload = make_payload_with_destinations(
@@ -449,7 +438,7 @@ async fn test_fanout_partial_failure_continues() {
         ],
     );
 
-    let mut worker = NotificationWorker::new(&queue, registry, "notifier-success".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send alert to both destinations
     let payload = make_payload_with_destinations(
@@ -544,9 +533,9 @@ async fn test_webhook_send_with_body_template() {
         HashMap::new(),
         body_template,
     );
-    let mut worker = NotificationWorker::new(&queue, registry, "test-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("template_rule");
+    let payload = make_payload_with_destinations("template_rule", vec!["test-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -592,9 +581,10 @@ async fn test_webhook_send_with_default_body() {
         HashMap::new(),
         None,
     );
-    let mut worker = NotificationWorker::new(&queue, registry, "default-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("default_rule");
+    let payload =
+        make_payload_with_destinations("default_rule", vec!["default-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -635,9 +625,9 @@ async fn test_webhook_with_custom_headers() {
 
     let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry("header-webhook", &webhook_url, "POST", headers, None);
-    let mut worker = NotificationWorker::new(&queue, registry, "header-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("header_rule");
+    let payload = make_payload_with_destinations("header_rule", vec!["header-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -681,9 +671,9 @@ async fn test_webhook_retry_on_500_then_success() {
     let queue = NotificationQueue::new(10);
     let registry =
         make_webhook_registry("retry-webhook", &webhook_url, "POST", HashMap::new(), None);
-    let mut worker = NotificationWorker::new(&queue, registry, "retry-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("retry_rule");
+    let payload = make_payload_with_destinations("retry_rule", vec!["retry-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -723,9 +713,10 @@ async fn test_webhook_no_retry_on_400() {
         HashMap::new(),
         None,
     );
-    let mut worker = NotificationWorker::new(&queue, registry, "no-retry-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("no_retry_rule");
+    let payload =
+        make_payload_with_destinations("no_retry_rule", vec!["no-retry-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -758,9 +749,9 @@ async fn test_webhook_put_method() {
 
     let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry("put-webhook", &webhook_url, "PUT", HashMap::new(), None);
-    let mut worker = NotificationWorker::new(&queue, registry, "put-webhook".to_string());
+    let mut worker = NotificationWorker::new(&queue, registry);
 
-    let payload = make_payload("put_rule");
+    let payload = make_payload_with_destinations("put_rule", vec!["put-webhook".to_string()]);
     queue.send(payload).unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();

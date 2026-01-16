@@ -78,7 +78,7 @@ cd valerter-linux-x86_64
 
 > For production installation with systemd, see [Getting Started](docs/getting-started.md).
 
-Minimal configuration:
+Example configuration:
 
 ```yaml
 victorialogs:
@@ -93,19 +93,22 @@ defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
+  timestamp_timezone: "UTC"
 
 templates:
-  default_alert:
-    title: "{{ title | default('Alert') }}"
-    body: "{{ body }}"
+  error_alert:
+    title: "Error detected"
+    body: "{{ _msg }}"
 
 rules:
-  - name: "error_alert"
-    query: '_stream:{app="myapp"} level:error'
+  - name: "error_logs"
+    query: '_msg:~"(error|failed|critical)"'
     parser:
-      regex: "(?P<message>.*)"
+      regex: '(?P<message>.*)'
+    notify:
+      template: "error_alert"
+      destinations:
+        - "mattermost-ops"
 ```
 
 ## Documentation

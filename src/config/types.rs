@@ -125,7 +125,6 @@ impl Default for MetricsConfig {
 #[derive(Debug, Deserialize)]
 pub struct DefaultsConfig {
     pub throttle: ThrottleConfig,
-    pub notify: NotifyDefaults,
     /// Timezone for formatted timestamps (e.g., "UTC", "Europe/Paris").
     #[serde(default = "default_timestamp_timezone")]
     pub timestamp_timezone: String,
@@ -143,12 +142,6 @@ pub struct ThrottleConfig {
     pub count: u32,
     #[serde(with = "humantime_serde")]
     pub window: Duration,
-}
-
-/// Default notification settings.
-#[derive(Debug, Deserialize)]
-pub struct NotifyDefaults {
-    pub template: String,
 }
 
 /// Template configuration for message formatting.
@@ -172,8 +165,7 @@ pub struct RuleConfig {
     pub parser: ParserConfig,
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
-    #[serde(default)]
-    pub notify: Option<NotifyConfig>,
+    pub notify: NotifyConfig,
 }
 
 /// Rule configuration without the `name` field, for deserializing `.d/` files.
@@ -186,8 +178,7 @@ struct RuleConfigWithoutName {
     pub parser: ParserConfig,
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
-    #[serde(default)]
-    pub notify: Option<NotifyConfig>,
+    pub notify: NotifyConfig,
 }
 
 impl RuleConfigWithoutName {
@@ -221,13 +212,12 @@ pub struct JsonParserConfig {
 
 /// Notification configuration for a rule.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotifyConfig {
+    pub template: String,
     #[serde(default)]
-    pub template: Option<String>,
-    #[serde(default)]
-    pub channel: Option<String>,
-    #[serde(default)]
-    pub destinations: Option<Vec<String>>,
+    pub mattermost_channel: Option<String>,
+    pub destinations: Vec<String>,
 }
 
 // ============================================================
@@ -516,26 +506,24 @@ impl Config {
                 });
             }
 
-            if let Some(ref notify) = rule.notify
-                && let Some(ref template_name) = notify.template
-                && !self.templates.contains_key(template_name)
-            {
+            // Validate template exists
+            if !self.templates.contains_key(&rule.notify.template) {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: rule.name.clone(),
-                    message: format!("notify.template '{}' not found in templates", template_name),
+                    message: format!(
+                        "notify.template '{}' not found in templates",
+                        rule.notify.template
+                    ),
                 });
             }
-        }
 
-        // Validate default template exists
-        if !self.templates.contains_key(&self.defaults.notify.template) {
-            errors.push(ConfigError::InvalidTemplate {
-                rule: "defaults.notify".to_string(),
-                message: format!(
-                    "default template '{}' not found in templates",
-                    self.defaults.notify.template
-                ),
-            });
+            // Validate destinations is not empty
+            if rule.notify.destinations.is_empty() {
+                errors.push(ConfigError::ValidationError(format!(
+                    "rule '{}': notify.destinations must contain at least one notifier",
+                    rule.name
+                )));
+            }
         }
 
         // Validate named templates (syntax)

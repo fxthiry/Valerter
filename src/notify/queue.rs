@@ -81,8 +81,6 @@ pub struct NotificationWorker {
     tx: broadcast::Sender<AlertPayload>,
     /// Registry of notifiers for sending.
     registry: Arc<NotifierRegistry>,
-    /// Default notifier name to use when no specific destination is specified.
-    default_notifier: String,
 }
 
 impl NotificationWorker {
@@ -92,17 +90,11 @@ impl NotificationWorker {
     ///
     /// * `queue` - Reference to the notification queue.
     /// * `registry` - Registry of available notifiers.
-    /// * `default_notifier` - Name of the default notifier to use.
-    pub fn new(
-        queue: &NotificationQueue,
-        registry: Arc<NotifierRegistry>,
-        default_notifier: String,
-    ) -> Self {
+    pub fn new(queue: &NotificationQueue, registry: Arc<NotifierRegistry>) -> Self {
         Self {
             rx: queue.subscribe(),
             tx: queue.tx.clone(),
             registry,
-            default_notifier,
         }
     }
 
@@ -159,8 +151,7 @@ impl NotificationWorker {
     /// Process a single alert payload.
     ///
     /// Implements fan-out routing (Story 6.3):
-    /// - If destinations is empty, sends to default notifier
-    /// - Otherwise, sends to ALL specified destinations in parallel (AC #2)
+    /// - Sends to ALL specified destinations in parallel (AC #2)
     async fn process_alert(&self, payload: AlertPayload) {
         let span = tracing::info_span!(
             "process_notification",
@@ -168,14 +159,8 @@ impl NotificationWorker {
         );
         let _guard = span.enter();
 
-        // Determine which destinations to use (Story 6.3)
-        let destinations: Vec<&str> = if payload.destinations.is_empty() {
-            // Backward compatibility: use default notifier
-            vec![&self.default_notifier]
-        } else {
-            // Use configured destinations
-            payload.destinations.iter().map(String::as_str).collect()
-        };
+        // Use configured destinations (validated at startup to be non-empty)
+        let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
 
         tracing::debug!(
             destination_count = destinations.len(),
@@ -244,9 +229,7 @@ impl NotificationWorker {
 
 impl std::fmt::Debug for NotificationWorker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotificationWorker")
-            .field("default_notifier", &self.default_notifier)
-            .finish()
+        f.debug_struct("NotificationWorker").finish()
     }
 }
 

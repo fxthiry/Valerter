@@ -105,6 +105,13 @@ metrics:
 #   - webhook: Generic HTTP endpoint (PagerDuty, Slack, custom APIs)
 #   - email: SMTP email notifications
 
+notifiers:
+  # Minimal mattermost config (required for example to work)
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/example"
+
+# Additional notifier examples (uncomment as needed):
 # notifiers:
 #   # --------------------------------------------------------------------------
 #   # Mattermost Notifier
@@ -251,10 +258,6 @@ defaults:
     count: 5                       # REQUIRED: Max alerts per window
     window: 60s                    # REQUIRED: Time window (e.g., 60s, 5m, 1h)
 
-  # REQUIRED: Default notification settings
-  notify:
-    template: "default_alert"      # REQUIRED: Template name from templates section
-
   # OPTIONAL: Timezone for formatted log timestamps (IANA timezone name)
   # Default: UTC. Used in {{ log_timestamp_formatted }} and Mattermost footers.
   # Examples: "UTC", "Europe/Paris", "America/New_York", "Asia/Tokyo"
@@ -304,22 +307,24 @@ rules:
       key: "{{ host }}"                      # Optional: Group throttling by field value
       count: 3                               # REQUIRED if throttle is set
       window: 5m                             # REQUIRED if throttle is set
-    notify:                                  # Optional: Overrides defaults.notify
-      template: "default_alert"              # Optional: Template name
-      # channel: "custom-channel"            # Optional: Override channel (legacy, prefer destinations)
-      # destinations:                        # Optional: Send to specific notifiers
-      #   - mattermost-ops                   # Must match names in notifiers section
-      #   - email-ops
+    notify:                                  # REQUIRED: Notification settings
+      template: "default_alert"              # REQUIRED: Template name from templates section
+      mattermost_channel: "custom-channel"   # Optional: Override Mattermost channel
+      destinations:                          # REQUIRED: Send to specific notifiers
+        - mattermost-ops                     # Must match names in notifiers section
 
   # --------------------------------------------------------------------------
-  # Example 2: Regex parser with default settings
+  # Example 2: Regex parser with minimal config
   # --------------------------------------------------------------------------
   - name: "error_log_alert"
     enabled: true
     query: '_stream:{app="myapp"} level:error'
     parser:
       regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'  # Named capture groups
-    # Uses defaults for throttle and notify
+    notify:
+      template: "default_alert"
+      destinations:
+        - mattermost-ops
 
   # --------------------------------------------------------------------------
   # Example 3: Multi-destination routing
@@ -346,6 +351,10 @@ rules:
     parser:
       json:
         fields: ["message"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - mattermost-ops
 
 # ==============================================================================
 # ENVIRONMENT VARIABLES REFERENCE

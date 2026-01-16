@@ -7,8 +7,6 @@ defaults:
   throttle:
     count: 10
     window: 30s
-  notify:
-    template: "simple"
 
 templates:
   simple:
@@ -21,3 +19,7 @@ rules:
     parser:
       json:
         fields: ["message"]
+    notify:
+      template: "simple"
+      destinations:
+        - "nonexistent"

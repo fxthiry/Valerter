@@ -2,12 +2,15 @@
 victorialogs:
   url: "http://victorialogs:9428"
 
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -19,9 +22,17 @@ rules:
     query: '_stream:{host="server1"}'
     parser:
       regex: '(?P<timestamp>\S+) (?P<level>\S+)'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"
 
   - name: "invalid_regex_rule"
     query: '_stream:{app="myapp"}'
     parser:
       # Invalid regex: unclosed group
       regex: '(?P<timestamp>\S+) (?P<level'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"

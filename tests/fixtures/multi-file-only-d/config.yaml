@@ -8,5 +8,3 @@ defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: dir_template

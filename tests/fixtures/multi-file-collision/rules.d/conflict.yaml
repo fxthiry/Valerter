@@ -3,3 +3,7 @@ collision_rule:
   query: "_msg:warning"
   parser:
     regex: ".*"
+  notify:
+    template: "default_alert"
+    destinations:
+      - "test"

@@ -434,60 +434,36 @@ mod tests {
               - mattermost-ops
         "#;
         let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.template, Some("custom_alert".to_string()));
-        assert!(config.destinations.is_some());
-        let destinations = config.destinations.unwrap();
-        assert_eq!(destinations.len(), 2);
+        assert_eq!(config.template, "custom_alert".to_string());
+        assert_eq!(config.destinations.len(), 2);
     }
 
     #[test]
-    fn notify_config_parses_without_destinations_for_backward_compat() {
+    fn notify_config_parses_with_mattermost_channel() {
         use crate::config::types::NotifyConfig;
         let yaml = r#"
             template: default_alert
-            channel: alerts
+            mattermost_channel: alerts
+            destinations:
+              - mattermost-infra
         "#;
         let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.template, Some("default_alert".to_string()));
-        assert_eq!(config.channel, Some("alerts".to_string()));
-        assert!(config.destinations.is_none());
-    }
-
-    #[test]
-    fn notify_config_default_is_all_none() {
-        use crate::config::types::NotifyConfig;
-        let yaml = "{}";
-        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.template.is_none());
-        assert!(config.channel.is_none());
-        assert!(config.destinations.is_none());
+        assert_eq!(config.template, "default_alert".to_string());
+        assert_eq!(config.mattermost_channel, Some("alerts".to_string()));
+        assert_eq!(config.destinations.len(), 1);
     }
 
     #[test]
     fn notify_config_parses_with_single_destination() {
         use crate::config::types::NotifyConfig;
         let yaml = r#"
+            template: test
             destinations:
               - mattermost-infra
         "#;
         let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
 
-        assert!(config.destinations.is_some());
-        let destinations = config.destinations.unwrap();
-        assert_eq!(destinations.len(), 1);
-        assert_eq!(destinations[0], "mattermost-infra");
-    }
-
-    #[test]
-    fn notify_config_parses_empty_destinations_as_empty_vec() {
-        use crate::config::types::NotifyConfig;
-        let yaml = r#"
-            destinations: []
-        "#;
-        let config: NotifyConfig = serde_yaml::from_str(yaml).unwrap();
-
-        assert!(config.destinations.is_some());
-        let destinations = config.destinations.unwrap();
-        assert!(destinations.is_empty());
+        assert_eq!(config.destinations.len(), 1);
+        assert_eq!(config.destinations[0], "mattermost-infra");
     }
 }

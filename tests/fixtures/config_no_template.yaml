@@ -12,8 +12,6 @@ defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default"
 
 # templates: intentionally omitted to trigger "no templates defined" error
 
@@ -22,3 +20,7 @@ rules:
     query: '_stream:{app="test"}'
     parser:
       regex: '(?P<message>.*)'
+    notify:
+      template: "default"
+      destinations:
+        - "test"

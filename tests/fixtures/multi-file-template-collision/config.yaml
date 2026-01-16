@@ -1,12 +1,15 @@
 victorialogs:
   url: http://victorialogs:9428
 
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: collision_template
 
 templates:
   collision_template:
@@ -18,3 +21,7 @@ rules:
     query: "_msg:test"
     parser:
       regex: ".*"
+    notify:
+      template: "collision_template"
+      destinations:
+        - "test"

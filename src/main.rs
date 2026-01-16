@@ -82,12 +82,12 @@ async fn shutdown_signal() {
 ///
 /// # Returns
 ///
-/// * `Ok((registry, default_notifier_name))` - Registry and the name of the first notifier (alphabetically)
+/// * `Ok(registry)` - Registry of all configured notifiers
 /// * `Err` - No notifiers configured or configuration error
 fn create_notifier_registry(
     config: &RuntimeConfig,
     http_client: reqwest::Client,
-) -> Result<(NotifierRegistry, String)> {
+) -> Result<NotifierRegistry> {
     let notifiers_config = config
         .notifiers
         .as_ref()
@@ -102,20 +102,12 @@ fn create_notifier_registry(
             anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
         })?;
 
-    // Use first notifier alphabetically as default for deterministic behavior
-    let default_name = registry
-        .names()
-        .min()
-        .expect("notifiers_config validated as non-empty")
-        .to_string();
-
     info!(
         notifier_count = registry.len(),
-        default_notifier = %default_name,
         "Created notifiers from config"
     );
 
-    Ok((registry, default_name))
+    Ok(registry)
 }
 
 /// Validate that templates used with email destinations have body_html.
@@ -126,7 +118,6 @@ fn create_notifier_registry(
 fn validate_email_templates(
     config: &valerter::config::RuntimeConfig,
     registry: &NotifierRegistry,
-    default_notifier: &str,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
@@ -138,10 +129,10 @@ fn validate_email_templates(
         // Determine which destinations this rule uses
         let destinations: Vec<&str> = rule
             .notify
-            .as_ref()
-            .and_then(|n| n.destinations.as_ref())
-            .map(|d| d.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_else(|| vec![default_notifier]);
+            .destinations
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         // Check if any destination is email
         let has_email_destination = destinations.iter().any(|dest| {
@@ -156,12 +147,7 @@ fn validate_email_templates(
         }
 
         // Get the template name for this rule
-        let template_name = rule
-            .notify
-            .as_ref()
-            .and_then(|n| n.template.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or(&config.defaults.notify.template);
+        let template_name = &rule.notify.template;
 
         // Check if template has body_html
         if let Some(template) = config.templates.get(template_name)
@@ -191,6 +177,38 @@ fn validate_email_templates(
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Warn if mattermost_channel is set but no Mattermost notifier is in destinations.
+fn warn_unused_mattermost_channels(
+    config: &valerter::config::RuntimeConfig,
+    registry: &NotifierRegistry,
+) {
+    for rule in &config.rules {
+        if !rule.enabled {
+            continue;
+        }
+
+        // Check if mattermost_channel is set
+        if rule.notify.mattermost_channel.is_none() {
+            continue;
+        }
+
+        // Check if any destination is a Mattermost notifier
+        let has_mattermost = rule.notify.destinations.iter().any(|dest| {
+            registry
+                .get(dest)
+                .map(|n| n.notifier_type() == "mattermost")
+                .unwrap_or(false)
+        });
+
+        if !has_mattermost {
+            tracing::warn!(
+                rule_name = %rule.name,
+                "mattermost_channel ignored - no mattermost notifier in destinations"
+            );
+        }
     }
 }
 
@@ -273,9 +291,8 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create notification queue (FR32: capacity 100)
     let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
 
-    // Create notifier registry (Story 6.2: named notifiers with backward compatibility)
-    let (registry, default_notifier) =
-        create_notifier_registry(&runtime_config, http_client.clone())?;
+    // Create notifier registry (Story 6.2: named notifiers)
+    let registry = create_notifier_registry(&runtime_config, http_client.clone())?;
 
     // Validate rule destinations against registry (Story 6.3: fail-fast at startup)
     let valid_notifiers: Vec<&str> = registry.names().collect();
@@ -291,7 +308,7 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     info!("All rule destinations validated successfully");
 
     // Validate that templates used with email destinations have body_html (fail-fast)
-    if let Err(errors) = validate_email_templates(&runtime_config, &registry, &default_notifier) {
+    if let Err(errors) = validate_email_templates(&runtime_config, &registry) {
         for e in &errors {
             error!(error = %e, "Email template validation error");
         }
@@ -302,10 +319,13 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     }
     info!("All email templates validated successfully");
 
+    // Warn if mattermost_channel is set but no Mattermost notifier in destinations
+    warn_unused_mattermost_channels(&runtime_config, &registry);
+
     let registry = Arc::new(registry);
 
     // Create notification worker with registry
-    let mut worker = NotificationWorker::new(&queue, registry.clone(), default_notifier);
+    let mut worker = NotificationWorker::new(&queue, registry.clone());
 
     // Create cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
