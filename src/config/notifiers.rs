@@ -21,6 +21,7 @@ pub enum NotifierConfig {
 
 /// Configuration for a Mattermost notifier instance.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MattermostNotifierConfig {
     /// Webhook URL (supports `${ENV_VAR}` substitution).
     pub webhook_url: String,
@@ -34,6 +35,7 @@ pub struct MattermostNotifierConfig {
 
 /// Configuration for a generic webhook notifier.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookNotifierConfig {
     /// Target URL (supports `${ENV_VAR}` substitution).
     pub url: String,
@@ -47,6 +49,7 @@ pub struct WebhookNotifierConfig {
 
 /// Configuration for an email notifier.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmailNotifierConfig {
     pub smtp: SmtpConfig,
     pub from: String,
@@ -60,6 +63,7 @@ pub struct EmailNotifierConfig {
 
 /// SMTP server configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: u16,

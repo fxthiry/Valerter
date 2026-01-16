@@ -1231,3 +1231,528 @@ fn load_with_notifier_collision_fails() {
         e => panic!("Expected DuplicateName error, got {:?}", e),
     }
 }
+
+#[test]
+fn defaults_notify_is_rejected() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: "default"
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("notify"), "Error should mention 'notify': {}", err);
+}
+
+// ============================================================
+// Strict Config Validation - Unknown Fields Rejected
+// ============================================================
+
+#[test]
+fn unknown_field_rejected_in_config_root() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+unknown_root_field: "should fail"
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field at root level should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_root_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_victorialogs_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+  unknown_vl_field: "should fail"
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in victorialogs should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_vl_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_metrics_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+metrics:
+  enabled: true
+  port: 9090
+  unknown_metrics_field: "should fail"
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in metrics should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_metrics_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_throttle_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+    unknown_throttle_field: "should fail"
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in throttle should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_throttle_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_template_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+    unknown_template_field: "should fail"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in template should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_template_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_rule_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    unknown_rule_field: "should fail"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in rule should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_rule_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_parser_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      unknown_parser_field: "should fail"
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in parser should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_parser_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_json_parser_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+        unknown_json_field: "should fail"
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in json parser should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_json_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_mattermost_notifier() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+    unknown_mm_field: "should fail"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in mattermost notifier should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_mm_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_webhook_notifier() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: webhook
+    url: "https://example.com/webhook"
+    method: "POST"
+    unknown_webhook_field: "should fail"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in webhook notifier should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_webhook_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_email_notifier() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: email
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+    from: "test@example.com"
+    to: ["recipient@example.com"]
+    subject_template: "Alert"
+    unknown_email_field: "should fail"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in email notifier should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_email_field"), "Error should mention the unknown field: {}", err);
+}
+
+#[test]
+fn unknown_field_rejected_in_smtp_config() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: email
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+      unknown_smtp_field: "should fail"
+    from: "test@example.com"
+    to: ["recipient@example.com"]
+    subject_template: "Alert"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(result.is_err(), "Unknown field in smtp config should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("unknown_smtp_field"), "Error should mention the unknown field: {}", err);
+}
+
+// ============================================================
+// Strict Config Validation - Invalid URLs Rejected
+// ============================================================
+
+#[test]
+fn invalid_url_rejected_in_victorialogs() {
+    let yaml = r#"
+victorialogs:
+  url: "not-a-valid-url"
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let result = config.validate();
+    assert!(result.is_err(), "Invalid URL in victorialogs should be rejected");
+}
+
+#[test]
+fn invalid_url_rejected_in_webhook_notifier() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: webhook
+    url: "not-a-valid-url"
+    method: "POST"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["test"]
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let result = config.validate();
+    assert!(result.is_err(), "Invalid URL in webhook notifier should be rejected");
+}
