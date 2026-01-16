@@ -313,4 +313,83 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
+
+    #[test]
+    fn resolve_body_template_file_exceeds_max_size_fails() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let large_file_path = temp_dir.path().join("large_template.html");
+
+        // Create a file > 1MB (1MB + 1 byte)
+        let mut file = std::fs::File::create(&large_file_path).unwrap();
+        let content = vec![b'x'; 1024 * 1024 + 1];
+        file.write_all(&content).unwrap();
+
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: None,
+            body_template_file: Some(large_file_path.to_string_lossy().to_string()),
+        };
+
+        let result = resolve_body_template(&config, temp_dir.path());
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "Expected 'exceeds maximum size' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_body_template_file_invalid_utf8_fails() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let invalid_utf8_path = temp_dir.path().join("invalid_utf8.html");
+
+        // Write invalid UTF-8 bytes (0x80-0xFF are invalid single-byte UTF-8)
+        let mut file = std::fs::File::create(&invalid_utf8_path).unwrap();
+        file.write_all(&[0x80, 0x81, 0x82, 0xFF]).unwrap();
+
+        let config = EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: None,
+            body_template_file: Some(invalid_utf8_path.to_string_lossy().to_string()),
+        };
+
+        let result = resolve_body_template(&config, temp_dir.path());
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("must be valid UTF-8"),
+            "Expected 'must be valid UTF-8' error, got: {}",
+            err
+        );
+    }
 }
