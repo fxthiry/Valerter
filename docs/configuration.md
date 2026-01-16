@@ -42,7 +42,8 @@ auth_failure:
       fields: [user, ip]
   notify:
     template: "security_alert"
-    destinations: ["security-team"]
+    destinations:
+      - security-team
 
 brute_force:
   query: "_msg:blocked"
@@ -50,7 +51,8 @@ brute_force:
     regex: "IP (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
   notify:
     template: "security_alert"
-    destinations: ["security-team"]
+    destinations:
+      - security-team
 ```
 
 ```yaml
