@@ -24,8 +24,10 @@ pub struct Config {
     /// Default values for throttle and notify.
     pub defaults: DefaultsConfig,
     /// Reusable message templates.
+    #[serde(default)]
     pub templates: HashMap<String, TemplateConfig>,
     /// Alert rules definitions.
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
     /// Metrics exposition configuration.
     #[serde(default)]
@@ -244,11 +246,9 @@ use super::notifiers::NotifierConfig;
 /// Load rules from a `.d/` directory.
 /// Returns a HashMap of rule name → (RuleConfig, source path) for collision detection.
 fn load_rules_directory(dir: &Path) -> Result<HashMap<String, (RuleConfig, PathBuf)>, ConfigError> {
-    load_directory_generic::<RuleConfigWithoutName, RuleConfig>(
-        dir,
-        "rules.d",
-        |name, config| config.into_rule_config(name),
-    )
+    load_directory_generic::<RuleConfigWithoutName, RuleConfig>(dir, "rules.d", |name, config| {
+        config.into_rule_config(name)
+    })
 }
 
 /// Load templates from a `.d/` directory.
@@ -288,14 +288,10 @@ where
     })?;
 
     // Collect and sort entries for deterministic processing order
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     paths.sort();
 
     for path in paths {
-
         // Skip non-files
         if !path.is_file() {
             continue;
@@ -517,6 +513,13 @@ impl Config {
     /// Possible errors: `InvalidRegex`, `InvalidTemplate`, `ValidationError` (for invalid colors).
     pub fn validate(&self) -> Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
+
+        // Validate that at least one rule is defined (after .d/ merge)
+        if self.rules.is_empty() {
+            errors.push(ConfigError::ValidationError(
+                "no rules defined: add rules in config.yaml or rules.d/".to_string(),
+            ));
+        }
 
         // Validate all rules
         for rule in &self.rules {

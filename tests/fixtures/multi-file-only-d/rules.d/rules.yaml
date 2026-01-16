@@ -1,0 +1,7 @@
+only_dir_rule:
+  query: "_msg:test"
+  parser:
+    regex: ".*"
+  notify:
+    destinations:
+      - dir-notifier

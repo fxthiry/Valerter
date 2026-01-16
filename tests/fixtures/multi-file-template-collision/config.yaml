@@ -1,0 +1,20 @@
+victorialogs:
+  url: http://victorialogs:9428
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: collision_template
+
+templates:
+  collision_template:
+    title: "From config.yaml"
+    body: "{{ _msg }}"
+
+rules:
+  - name: test_rule
+    query: "_msg:test"
+    parser:
+      regex: ".*"

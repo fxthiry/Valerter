@@ -1,0 +1,12 @@
+# Config without templates, rules, or notifiers keys
+# Everything loaded from .d/ directories
+
+victorialogs:
+  url: http://victorialogs:9428
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: dir_template

@@ -1,0 +1,3 @@
+dir_template:
+  title: "Template from dir"
+  body: "{{ _msg }}"

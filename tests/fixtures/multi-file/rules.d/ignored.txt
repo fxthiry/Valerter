@@ -1,0 +1,3 @@
+This is not a YAML file and should be ignored.
+rule_from_txt:
+  query: "_msg:should_not_load"

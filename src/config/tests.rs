@@ -214,6 +214,34 @@ fn validate_invalid_template_returns_error() {
     assert!(has_template_error);
 }
 
+#[test]
+fn validate_no_rules_fails() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: test
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+rules: []
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let result = config.validate();
+    assert!(result.is_err());
+
+    let errors = result.unwrap_err();
+    let has_no_rules_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no rules defined"))
+    });
+    assert!(has_no_rules_error);
+}
+
 // ============================================================
 // Compilation Tests
 // ============================================================
@@ -913,7 +941,11 @@ templates:
     title: "Test"
     body: "Body"
     accent_color: "#ff5500"
-rules: []
+rules:
+  - name: test_rule
+    query: "_msg:test"
+    parser:
+      regex: ".*"
 "##;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
@@ -966,7 +998,11 @@ templates:
   test:
     title: "{{ title | upper }}"
     body: "{{ body | default('N/A') }}"
-rules: []
+rules:
+  - name: test_rule
+    query: "_msg:test"
+    parser:
+      regex: ".*"
 "#;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
@@ -1234,6 +1270,81 @@ fn load_with_intra_directory_collision_fails() {
             // Due to sorting, a.yaml comes before b.yaml
             assert!(source1.contains("a.yaml"));
             assert!(source2.contains("b.yaml"));
+        }
+        e => panic!("Expected DuplicateName error, got {:?}", e),
+    }
+}
+
+#[test]
+fn load_with_only_d_directories_no_inline_keys() {
+    // Config without templates, rules, notifiers keys - all loaded from .d/
+    let config = Config::load(&fixture_path("multi-file-only-d/config.yaml")).unwrap();
+
+    assert_eq!(config.rules.len(), 1);
+    assert_eq!(config.rules[0].name, "only_dir_rule");
+
+    assert_eq!(config.templates.len(), 1);
+    assert!(config.templates.contains_key("dir_template"));
+
+    let notifiers = config.notifiers.as_ref().expect("notifiers should be Some");
+    assert_eq!(notifiers.len(), 1);
+    assert!(notifiers.contains_key("dir-notifier"));
+
+    // Validation should pass
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn load_ignores_non_yaml_files_in_directory() {
+    // multi-file/rules.d/ has .txt and .json files that should be ignored
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Should still have only 3 rules (1 inline + 2 from extra.yaml)
+    // Files ignored.txt and ignored.json should not be processed
+    assert_eq!(config.rules.len(), 3);
+
+    let rule_names: Vec<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
+    assert!(!rule_names.contains(&"rule_from_txt"));
+    assert!(!rule_names.contains(&"rule_from_json"));
+}
+
+#[test]
+fn load_with_template_collision_fails() {
+    let result = Config::load(&fixture_path("multi-file-template-collision/config.yaml"));
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::ConfigError::DuplicateName {
+            resource_type,
+            name,
+            source1,
+            source2,
+        } => {
+            assert_eq!(resource_type, "template");
+            assert_eq!(name, "collision_template");
+            assert!(source1.contains("config.yaml"));
+            assert!(source2.contains("conflict.yaml"));
+        }
+        e => panic!("Expected DuplicateName error, got {:?}", e),
+    }
+}
+
+#[test]
+fn load_with_notifier_collision_fails() {
+    let result = Config::load(&fixture_path("multi-file-notifier-collision/config.yaml"));
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::ConfigError::DuplicateName {
+            resource_type,
+            name,
+            source1,
+            source2,
+        } => {
+            assert_eq!(resource_type, "notifier");
+            assert_eq!(name, "collision_notifier");
+            assert!(source1.contains("config.yaml"));
+            assert!(source2.contains("conflict.yaml"));
         }
         e => panic!("Expected DuplicateName error, got {:?}", e),
     }

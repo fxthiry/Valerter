@@ -1,0 +1,4 @@
+# Collision: same template name as in config.yaml
+collision_template:
+  title: "From templates.d"
+  body: "{{ _msg }}"
