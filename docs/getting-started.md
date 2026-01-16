@@ -89,8 +89,6 @@ defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -103,6 +101,10 @@ rules:
     query: '_stream:{app="myapp"} level:error'
     parser:
       regex: '(?P<message>.*)'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "mattermost-ops"
 ```
 
 ### 2. Validate Configuration

@@ -1,22 +1,28 @@
-# Minimal valid config - tests defaults
+# Minimal valid config - matches README example
 victorialogs:
   url: "http://localhost:9428"
 
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
+
 defaults:
   throttle:
-    count: 10
-    window: 30s
-  notify:
-    template: "simple"
+    count: 5
+    window: 60s
 
 templates:
-  simple:
-    title: "Alert"
+  default_alert:
+    title: "{{ title | default('Alert') }}"
     body: "{{ body }}"
 
 rules:
-  - name: "simple_rule"
-    query: '_stream:{app="test"}'
+  - name: "error_alert"
+    query: '_stream:{app="myapp"} level:error'
     parser:
-      json:
-        fields: ["message"]
+      regex: '(?P<message>.*)'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "mattermost-ops"

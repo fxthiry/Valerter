@@ -1,8 +1,6 @@
 //! Integration tests for Config loading, validation, and compilation.
 
-use super::types::ENV_MATTERMOST_WEBHOOK;
 use super::*;
-use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,7 +25,6 @@ fn load_valid_config() {
     // Defaults
     assert_eq!(config.defaults.throttle.count, 5);
     assert_eq!(config.defaults.throttle.window, Duration::from_secs(60));
-    assert_eq!(config.defaults.notify.template, "default_alert");
 
     // Templates
     assert!(config.templates.contains_key("default_alert"));
@@ -46,8 +43,7 @@ fn load_valid_config() {
     let throttle = rule1.throttle.as_ref().unwrap();
     assert_eq!(throttle.count, 3);
     assert_eq!(throttle.window, Duration::from_secs(300)); // 5m = 300s
-    let notify = rule1.notify.as_ref().unwrap();
-    assert_eq!(notify.channel, Some("alerts".to_string()));
+    assert_eq!(rule1.notify.mattermost_channel, Some("alerts".to_string()));
 
     // Second rule: error_log_alert (uses regex parser)
     let rule2 = &config.rules[1];
@@ -80,72 +76,6 @@ fn load_invalid_yaml_returns_validation_error() {
         crate::error::ConfigError::ValidationError(_) => {}
         e => panic!("Expected ValidationError, got {:?}", e),
     }
-}
-
-#[test]
-fn load_webhook_from_explicit_value() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("https://mattermost.example.com/hooks/xxx".to_string()),
-    )
-    .unwrap();
-
-    assert!(config.mattermost_webhook.is_some());
-    assert_eq!(
-        config.mattermost_webhook.as_ref().unwrap().expose(),
-        "https://mattermost.example.com/hooks/xxx"
-    );
-}
-
-#[test]
-#[serial]
-fn load_webhook_from_environment_variable() {
-    temp_env::with_var(
-        ENV_MATTERMOST_WEBHOOK,
-        Some("https://test.webhook.url/hook"),
-        || {
-            let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
-            assert!(config.mattermost_webhook.is_some());
-            assert_eq!(
-                config.mattermost_webhook.as_ref().unwrap().expose(),
-                "https://test.webhook.url/hook"
-            );
-        },
-    );
-}
-
-#[test]
-fn mattermost_webhook_in_yaml_is_ignored_due_to_serde_skip() {
-    // This test verifies that #[serde(skip)] on mattermost_webhook works:
-    // even if mattermost_webhook appears in YAML, it should be None after deserialization
-    // (it can only be set via load_with_webhook or MATTERMOST_WEBHOOK env var)
-    let yaml = r#"
-        victorialogs:
-          url: http://localhost:9428
-        defaults:
-          throttle:
-            count: 5
-            window: 1m
-          notify:
-            template: default_alert
-        templates:
-          default_alert:
-            title: "Alert"
-            body: "{{ body }}"
-        rules:
-          - name: test_rule
-            query: "*"
-            parser:
-              regex: ".*"
-        mattermost_webhook: "https://should-be-ignored.com/hooks/secret"
-    "#;
-
-    let config: Config = serde_yaml::from_str(yaml).unwrap();
-    // The mattermost_webhook field should be None because #[serde(skip)] ignores it
-    assert!(
-        config.mattermost_webhook.is_none(),
-        "mattermost_webhook should be None due to #[serde(skip)], but it was set from YAML"
-    );
 }
 
 #[test]
@@ -219,12 +149,14 @@ fn validate_no_rules_fails() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -240,6 +172,40 @@ rules: []
         matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no rules defined"))
     });
     assert!(has_no_rules_error);
+}
+
+#[test]
+fn validate_no_notifiers_fails() {
+    let config = Config::load(&fixture_path("config_no_notifier.yaml")).unwrap();
+    let result = config.validate();
+    assert!(result.is_err());
+
+    let errors = result.unwrap_err();
+    let has_no_notifiers_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no notifiers configured"))
+    });
+    assert!(
+        has_no_notifiers_error,
+        "Expected 'no notifiers configured' error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_no_templates_fails() {
+    let config = Config::load(&fixture_path("config_no_template.yaml")).unwrap();
+    let result = config.validate();
+    assert!(result.is_err());
+
+    let errors = result.unwrap_err();
+    let has_no_templates_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no templates defined"))
+    });
+    assert!(
+        has_no_templates_error,
+        "Expected 'no templates defined' error, got: {:?}",
+        errors
+    );
 }
 
 // ============================================================
@@ -332,20 +298,6 @@ fn basic_auth_debug_redacts_password() {
     assert!(debug_output.contains("[REDACTED]"));
 }
 
-#[test]
-fn config_debug_does_not_leak_webhook() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("secret-webhook-url".to_string()),
-    )
-    .unwrap();
-
-    let debug_output = format!("{:?}", config);
-
-    assert!(!debug_output.contains("secret-webhook-url"));
-    assert!(debug_output.contains("[REDACTED]"));
-}
-
 // ============================================================
 // Notifiers Tests
 // ============================================================
@@ -360,8 +312,9 @@ fn load_config_with_notifiers_section() {
 }
 
 #[test]
-fn load_config_without_notifiers_section_is_valid() {
-    let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+fn load_config_without_notifiers_section_loads_none() {
+    // config_no_notifier.yaml has no notifiers section
+    let config = Config::load(&fixture_path("config_no_notifier.yaml")).unwrap();
     assert!(config.notifiers.is_none());
 }
 
@@ -369,7 +322,7 @@ fn load_config_without_notifiers_section_is_valid() {
 // RuntimeConfig Destination Validation Tests
 // ============================================================
 
-fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> RuntimeConfig {
+fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeConfig {
     RuntimeConfig {
         victorialogs: VictoriaLogsConfig {
             url: "http://localhost:9428".to_string(),
@@ -382,9 +335,6 @@ fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> R
                 key: None,
                 count: 5,
                 window: Duration::from_secs(60),
-            },
-            notify: NotifyDefaults {
-                template: "default".to_string(),
             },
             timestamp_timezone: "UTC".to_string(),
         },
@@ -410,25 +360,24 @@ fn make_runtime_config_with_destinations(destinations: Option<Vec<String>>) -> R
                 json: None,
             },
             throttle: None,
-            notify: Some(NotifyConfig {
-                template: None,
-                channel: None,
+            notify: NotifyConfig {
+                template: "default".to_string(),
+                mattermost_channel: None,
                 destinations,
-            }),
+            },
         }],
         metrics: MetricsConfig::default(),
         notifiers: Some(std::collections::HashMap::new()),
-        mattermost_webhook: None,
         config_dir: std::path::PathBuf::from("."),
     }
 }
 
 #[test]
 fn collect_rule_destinations_returns_configured_destinations() {
-    let config = make_runtime_config_with_destinations(Some(vec![
+    let config = make_runtime_config_with_destinations(vec![
         "mattermost-infra".to_string(),
         "mattermost-ops".to_string(),
-    ]));
+    ]);
 
     let destinations = config.collect_rule_destinations();
     assert_eq!(destinations.len(), 1);
@@ -438,10 +387,10 @@ fn collect_rule_destinations_returns_configured_destinations() {
 
 #[test]
 fn validate_rule_destinations_passes_for_valid_destinations() {
-    let config = make_runtime_config_with_destinations(Some(vec![
+    let config = make_runtime_config_with_destinations(vec![
         "notifier-a".to_string(),
         "notifier-b".to_string(),
-    ]));
+    ]);
 
     let valid_notifiers = vec!["notifier-a", "notifier-b", "notifier-c"];
     let result = config.validate_rule_destinations(&valid_notifiers);
@@ -450,10 +399,10 @@ fn validate_rule_destinations_passes_for_valid_destinations() {
 
 #[test]
 fn validate_rule_destinations_fails_for_unknown_destination() {
-    let config = make_runtime_config_with_destinations(Some(vec![
+    let config = make_runtime_config_with_destinations(vec![
         "notifier-a".to_string(),
         "unknown-notifier".to_string(),
-    ]));
+    ]);
 
     let valid_notifiers = vec!["notifier-a", "notifier-b"];
     let result = config.validate_rule_destinations(&valid_notifiers);
@@ -465,20 +414,17 @@ fn validate_rule_destinations_fails_for_unknown_destination() {
 }
 
 #[test]
-fn load_without_webhook() {
-    let config = Config::load_with_webhook(&fixture_path("config_valid.yaml"), None).unwrap();
-    assert!(config.mattermost_webhook.is_none());
-}
-
-#[test]
 fn rules_use_defaults_when_not_specified() {
     let config = Config::load(&fixture_path("config_minimal.yaml")).unwrap();
     assert_eq!(config.rules.len(), 1);
     let rule = &config.rules[0];
+    // Rule doesn't override throttle, so it uses defaults
     assert!(rule.throttle.is_none());
-    assert!(rule.notify.is_none());
-    assert_eq!(config.defaults.throttle.count, 10);
-    assert_eq!(config.defaults.notify.template, "simple");
+    // config_minimal.yaml matches README example values
+    assert_eq!(config.defaults.throttle.count, 5);
+    // notify is now mandatory, so check rule has it
+    assert_eq!(rule.notify.template, "default_alert");
+    assert!(!rule.notify.destinations.is_empty());
 }
 
 #[test]
@@ -495,9 +441,6 @@ fn validate_collects_all_errors() {
                 key: None,
                 count: 5,
                 window: Duration::from_secs(60),
-            },
-            notify: NotifyDefaults {
-                template: "default".to_string(),
             },
             timestamp_timezone: "UTC".to_string(),
         },
@@ -524,7 +467,11 @@ fn validate_collects_all_errors() {
                     json: None,
                 },
                 throttle: None,
-                notify: None,
+                notify: NotifyConfig {
+                    template: "default".to_string(),
+                    mattermost_channel: None,
+                    destinations: vec!["test".to_string()],
+                },
             },
             RuleConfig {
                 name: "rule2_invalid".to_string(),
@@ -535,18 +482,26 @@ fn validate_collects_all_errors() {
                     json: None,
                 },
                 throttle: None,
-                notify: None,
+                notify: NotifyConfig {
+                    template: "default".to_string(),
+                    mattermost_channel: None,
+                    destinations: vec!["test".to_string()],
+                },
             },
         ],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
     assert!(result.is_err());
     let errors = result.unwrap_err();
-    assert_eq!(errors.len(), 2, "Should collect all regex errors");
+    // 2 regex errors + 1 no notifiers error = 3 errors
+    assert_eq!(
+        errors.len(),
+        3,
+        "Should collect all errors (2 regex + 1 no notifiers)"
+    );
 }
 
 #[test]
@@ -564,12 +519,21 @@ fn validate_throttle_key_template() {
                 count: 5,
                 window: Duration::from_secs(60),
             },
-            notify: NotifyDefaults {
-                template: "default".to_string(),
-            },
             timestamp_timezone: "UTC".to_string(),
         },
-        templates: std::collections::HashMap::new(),
+        templates: {
+            let mut t = std::collections::HashMap::new();
+            t.insert(
+                "default".to_string(),
+                TemplateConfig {
+                    title: "{{ title }}".to_string(),
+                    body: "{{ body }}".to_string(),
+                    body_html: None,
+                    accent_color: None,
+                },
+            );
+            t
+        },
         rules: vec![RuleConfig {
             name: "rule_with_invalid_throttle_key".to_string(),
             enabled: true,
@@ -583,11 +547,14 @@ fn validate_throttle_key_template() {
                 count: 5,
                 window: Duration::from_secs(60),
             }),
-            notify: None,
+            notify: NotifyConfig {
+                template: "default".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["test".to_string()],
+            },
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
@@ -615,9 +582,6 @@ fn validate_nonexistent_notify_template_fails() {
                 count: 5,
                 window: Duration::from_secs(60),
             },
-            notify: NotifyDefaults {
-                template: "existing_template".to_string(),
-            },
             timestamp_timezone: "UTC".to_string(),
         },
         templates: {
@@ -642,15 +606,14 @@ fn validate_nonexistent_notify_template_fails() {
                 json: None,
             },
             throttle: None,
-            notify: Some(NotifyConfig {
-                template: Some("nonexistent_template".to_string()),
-                channel: None,
-                destinations: None,
-            }),
+            notify: NotifyConfig {
+                template: "nonexistent_template".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["test".to_string()],
+            },
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
-        mattermost_webhook: None,
     };
 
     let result = config.validate();
@@ -662,64 +625,6 @@ fn validate_nonexistent_notify_template_fails() {
             && message.contains("nonexistent_template"))
     });
     assert!(has_missing_template_error);
-}
-
-#[test]
-fn validate_nonexistent_default_template_fails() {
-    let config = Config {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
-        },
-        defaults: DefaultsConfig {
-            throttle: ThrottleConfig {
-                key: None,
-                count: 5,
-                window: Duration::from_secs(60),
-            },
-            notify: NotifyDefaults {
-                template: "missing_default".to_string(),
-            },
-            timestamp_timezone: "UTC".to_string(),
-        },
-        templates: std::collections::HashMap::new(),
-        rules: vec![],
-        metrics: MetricsConfig::default(),
-        notifiers: None,
-        mattermost_webhook: None,
-    };
-
-    let result = config.validate();
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
-    let has_default_error = errors.iter().any(|e| {
-        matches!(e, crate::error::ConfigError::InvalidTemplate { rule, message }
-            if rule == "defaults.notify" && message.contains("missing_default"))
-    });
-    assert!(has_default_error);
-}
-
-#[test]
-fn security_audit_full_config_debug_safe() {
-    let config = Config::load_with_webhook(
-        &fixture_path("config_valid.yaml"),
-        Some("https://secret.webhook.url/hooks/supersecret123".to_string()),
-    )
-    .unwrap();
-
-    let debug_output = format!("{:?}", config);
-    let forbidden = ["secret.webhook.url", "supersecret123", "hooks/"];
-
-    for pattern in &forbidden {
-        assert!(
-            !debug_output.contains(pattern),
-            "SECURITY VIOLATION: Config debug leaked '{}'",
-            pattern
-        );
-    }
-    assert!(debug_output.contains("[REDACTED]"));
 }
 
 #[test]
@@ -805,49 +710,18 @@ fn load_config_with_unknown_notifier_type_fails() {
 }
 
 #[test]
-fn collect_rule_destinations_skips_rules_without_destinations() {
-    let config = make_runtime_config_with_destinations(None);
-    let destinations = config.collect_rule_destinations();
-    assert!(destinations.is_empty());
-}
-
-#[test]
-fn collect_rule_destinations_skips_empty_destinations() {
-    let config = make_runtime_config_with_destinations(Some(vec![]));
-    let destinations = config.collect_rule_destinations();
-    assert!(destinations.is_empty());
-}
-
-#[test]
-fn validate_rule_destinations_fails_for_empty_destinations_when_notifiers_configured() {
-    let config = make_runtime_config_with_destinations(Some(vec![]));
-    let valid_notifiers = vec!["notifier-a"];
-    let result = config.validate_rule_destinations(&valid_notifiers);
-
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
-    assert!(errors[0].to_string().contains("cannot be empty"));
-}
-
-#[test]
-fn validate_rule_destinations_passes_for_none_destinations_backward_compat() {
-    let config = make_runtime_config_with_destinations(None);
-    let valid_notifiers = vec!["notifier-a"];
-    let result = config.validate_rule_destinations(&valid_notifiers);
-    assert!(result.is_ok());
-}
-
-#[test]
 fn validate_body_html_syntax_error_detected() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -874,12 +748,14 @@ fn validate_config_with_invalid_accent_color_fails() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -902,12 +778,14 @@ fn validate_config_with_short_hex_fails() {
     let yaml = r##"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -930,12 +808,14 @@ fn validate_config_with_valid_accent_color_passes() {
     let yaml = r##"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -946,6 +826,10 @@ rules:
     query: "_msg:test"
     parser:
       regex: ".*"
+    notify:
+      template: "test"
+      destinations:
+        - "test"
 "##;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
@@ -957,12 +841,14 @@ fn validate_template_render_in_body_detects_unknown_filter() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "Test"
@@ -988,12 +874,14 @@ fn validate_valid_templates_pass() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
 defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: test
 templates:
   test:
     title: "{{ title | upper }}"
@@ -1003,6 +891,10 @@ rules:
     query: "_msg:test"
     parser:
       regex: ".*"
+    notify:
+      template: "test"
+      destinations:
+        - "test"
 "#;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
@@ -1023,9 +915,6 @@ fn validate_rule_destinations_collects_all_errors() {
                 key: None,
                 count: 5,
                 window: Duration::from_secs(60),
-            },
-            notify: NotifyDefaults {
-                template: "default".to_string(),
             },
             timestamp_timezone: "UTC".to_string(),
         },
@@ -1052,11 +941,11 @@ fn validate_rule_destinations_collects_all_errors() {
                     json: None,
                 },
                 throttle: None,
-                notify: Some(NotifyConfig {
-                    template: None,
-                    channel: None,
-                    destinations: Some(vec!["unknown-1".to_string()]),
-                }),
+                notify: NotifyConfig {
+                    template: "default".to_string(),
+                    mattermost_channel: None,
+                    destinations: vec!["unknown-1".to_string()],
+                },
             },
             CompiledRule {
                 name: "rule_2".to_string(),
@@ -1067,16 +956,15 @@ fn validate_rule_destinations_collects_all_errors() {
                     json: None,
                 },
                 throttle: None,
-                notify: Some(NotifyConfig {
-                    template: None,
-                    channel: None,
-                    destinations: Some(vec!["unknown-2".to_string()]),
-                }),
+                notify: NotifyConfig {
+                    template: "default".to_string(),
+                    mattermost_channel: None,
+                    destinations: vec!["unknown-2".to_string()],
+                },
             },
         ],
         metrics: MetricsConfig::default(),
         notifiers: Some(std::collections::HashMap::new()),
-        mattermost_webhook: None,
         config_dir: std::path::PathBuf::from("."),
     };
 
@@ -1205,10 +1093,7 @@ fn load_with_cross_file_reference_validates() {
         .iter()
         .find(|r| r.name == "dir_rule_uses_inline_template")
         .unwrap();
-    assert_eq!(
-        dir_rule.notify.as_ref().unwrap().template,
-        Some("inline_template".to_string())
-    );
+    assert_eq!(dir_rule.notify.template, "inline_template".to_string());
 
     // Rule from config.yaml references template from .d/
     let inline_rule = config
@@ -1216,10 +1101,7 @@ fn load_with_cross_file_reference_validates() {
         .iter()
         .find(|r| r.name == "inline_rule_uses_dir_template")
         .unwrap();
-    assert_eq!(
-        inline_rule.notify.as_ref().unwrap().template,
-        Some("template_from_dir".to_string())
-    );
+    assert_eq!(inline_rule.notify.template, "template_from_dir".to_string());
 
     // Validation should pass (cross-file references are valid)
     assert!(config.validate().is_ok());

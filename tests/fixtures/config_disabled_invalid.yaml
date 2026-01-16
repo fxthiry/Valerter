@@ -3,12 +3,15 @@
 victorialogs:
   url: "http://victorialogs:9428"
 
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -21,6 +24,10 @@ rules:
     query: '_stream:{host="server1"}'
     parser:
       regex: '(?P<host>\S+)'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"
 
   - name: "disabled_invalid_rule"
     enabled: false
@@ -28,3 +35,7 @@ rules:
     parser:
       # Invalid regex even though rule is disabled - should still fail
       regex: '[invalid(regex'
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"

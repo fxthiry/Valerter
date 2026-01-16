@@ -2,12 +2,15 @@
 victorialogs:
   url: "http://victorialogs:9428"
 
+notifiers:
+  default-mattermost:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test-webhook"
+
 defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -31,14 +34,19 @@ rules:
       window: 5m
     notify:
       template: "default_alert"
-      channel: "alerts"
+      mattermost_channel: "alerts"
+      destinations:
+        - "default-mattermost"
 
   - name: "error_log_alert"
     enabled: true
     query: '_stream:{app="myapp"} level:error'
     parser:
       regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
-    # Uses defaults for throttle and notify
+    notify:
+      template: "default_alert"
+      destinations:
+        - "default-mattermost"
 
   - name: "disabled_rule"
     enabled: false
@@ -46,3 +54,7 @@ rules:
     parser:
       json:
         fields: ["message"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - "default-mattermost"

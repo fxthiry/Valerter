@@ -1,7 +1,6 @@
 //! Runtime configuration with pre-compiled regex and templates.
 
 use super::notifiers::NotifiersConfig;
-use super::secret::SecretString;
 use super::types::{
     Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig, VictoriaLogsConfig,
 };
@@ -20,7 +19,6 @@ pub struct RuntimeConfig {
     pub rules: Vec<CompiledRule>,
     pub metrics: MetricsConfig,
     pub notifiers: Option<NotifiersConfig>,
-    pub mattermost_webhook: Option<SecretString>,
     pub config_dir: std::path::PathBuf,
 }
 
@@ -32,7 +30,7 @@ pub struct CompiledRule {
     pub query: String,
     pub parser: CompiledParser,
     pub throttle: Option<CompiledThrottle>,
-    pub notify: Option<NotifyConfig>,
+    pub notify: NotifyConfig,
 }
 
 /// Parser with pre-compiled regex pattern.
@@ -64,13 +62,7 @@ impl RuntimeConfig {
     pub fn collect_rule_destinations(&self) -> Vec<(&str, &[String])> {
         self.rules
             .iter()
-            .filter_map(|rule| {
-                rule.notify
-                    .as_ref()
-                    .and_then(|n| n.destinations.as_ref())
-                    .filter(|d| !d.is_empty())
-                    .map(|d| (rule.name.as_str(), d.as_slice()))
-            })
+            .map(|rule| (rule.name.as_str(), rule.notify.destinations.as_slice()))
             .collect()
     }
 
@@ -101,20 +93,7 @@ impl RuntimeConfig {
             }
         }
 
-        // Validate empty destinations when notifiers section exists
-        if self.notifiers.is_some() {
-            for rule in &self.rules {
-                if let Some(ref notify) = rule.notify
-                    && let Some(ref destinations) = notify.destinations
-                    && destinations.is_empty()
-                {
-                    errors.push(ConfigError::ValidationError(format!(
-                        "rule '{}': notify.destinations cannot be empty",
-                        rule.name
-                    )));
-                }
-            }
-        }
+        // Note: empty destinations validation is now done in Config::validate()
 
         if errors.is_empty() {
             Ok(())
@@ -181,7 +160,6 @@ impl Config {
             rules,
             metrics: self.metrics,
             notifiers: self.notifiers,
-            mattermost_webhook: self.mattermost_webhook,
             config_dir,
         })
     }

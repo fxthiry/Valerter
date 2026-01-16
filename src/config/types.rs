@@ -13,9 +13,6 @@ use std::time::Duration;
 /// Default configuration file path.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/valerter/config.yaml";
 
-/// Environment variable name for Mattermost webhook URL.
-pub const ENV_MATTERMOST_WEBHOOK: &str = "MATTERMOST_WEBHOOK";
-
 /// Main configuration structure for valerter.
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -32,13 +29,9 @@ pub struct Config {
     /// Metrics exposition configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
-    /// Named notifier configurations (Story 6.2).
-    /// If None, falls back to MATTERMOST_WEBHOOK env var for backward compatibility.
+    /// Named notifier configurations.
     #[serde(default)]
     pub notifiers: Option<NotifiersConfig>,
-    /// Mattermost webhook URL (loaded from environment, not from YAML).
-    #[serde(skip)]
-    pub mattermost_webhook: Option<SecretString>,
 }
 
 /// VictoriaLogs connection configuration.
@@ -132,7 +125,6 @@ impl Default for MetricsConfig {
 #[derive(Debug, Deserialize)]
 pub struct DefaultsConfig {
     pub throttle: ThrottleConfig,
-    pub notify: NotifyDefaults,
     /// Timezone for formatted timestamps (e.g., "UTC", "Europe/Paris").
     #[serde(default = "default_timestamp_timezone")]
     pub timestamp_timezone: String,
@@ -150,12 +142,6 @@ pub struct ThrottleConfig {
     pub count: u32,
     #[serde(with = "humantime_serde")]
     pub window: Duration,
-}
-
-/// Default notification settings.
-#[derive(Debug, Deserialize)]
-pub struct NotifyDefaults {
-    pub template: String,
 }
 
 /// Template configuration for message formatting.
@@ -179,8 +165,7 @@ pub struct RuleConfig {
     pub parser: ParserConfig,
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
-    #[serde(default)]
-    pub notify: Option<NotifyConfig>,
+    pub notify: NotifyConfig,
 }
 
 /// Rule configuration without the `name` field, for deserializing `.d/` files.
@@ -193,8 +178,7 @@ struct RuleConfigWithoutName {
     pub parser: ParserConfig,
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
-    #[serde(default)]
-    pub notify: Option<NotifyConfig>,
+    pub notify: NotifyConfig,
 }
 
 impl RuleConfigWithoutName {
@@ -228,13 +212,12 @@ pub struct JsonParserConfig {
 
 /// Notification configuration for a rule.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotifyConfig {
+    pub template: String,
     #[serde(default)]
-    pub template: Option<String>,
-    #[serde(default)]
-    pub channel: Option<String>,
-    #[serde(default)]
-    pub destinations: Option<Vec<String>>,
+    pub mattermost_channel: Option<String>,
+    pub destinations: Vec<String>,
 }
 
 // ============================================================
@@ -463,46 +446,6 @@ impl Config {
             config.notifiers = merge_notifiers(config.notifiers, notifiers_from_dir, path)?;
         }
 
-        config.mattermost_webhook = std::env::var(ENV_MATTERMOST_WEBHOOK)
-            .ok()
-            .map(SecretString::new);
-
-        Ok(config)
-    }
-
-    /// Load configuration with an explicit webhook (for testing).
-    ///
-    /// Also loads and merges configs from `.d/` directories like `load()`.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::LoadError`] if the file cannot be read.
-    /// Returns [`ConfigError::ValidationError`] if the YAML is invalid.
-    /// Returns [`ConfigError::DuplicateName`] if a name collision is detected.
-    #[cfg(test)]
-    pub fn load_with_webhook(path: &Path, webhook: Option<String>) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::LoadError(format!("{}: {}", path.display(), e)))?;
-
-        let mut config: Config = serde_yaml::from_str(&content)
-            .map_err(|e| ConfigError::ValidationError(e.to_string()))?;
-
-        // Load and merge from .d/ directories
-        if let Some(config_dir) = path.parent() {
-            let rules_dir = config_dir.join("rules.d");
-            let templates_dir = config_dir.join("templates.d");
-            let notifiers_dir = config_dir.join("notifiers.d");
-
-            let rules_from_dir = load_rules_directory(&rules_dir)?;
-            let templates_from_dir = load_templates_directory(&templates_dir)?;
-            let notifiers_from_dir = load_notifiers_directory(&notifiers_dir)?;
-
-            config.rules = merge_rules(config.rules, rules_from_dir, path)?;
-            config.templates = merge_templates(config.templates, templates_from_dir, path)?;
-            config.notifiers = merge_notifiers(config.notifiers, notifiers_from_dir, path)?;
-        }
-
-        config.mattermost_webhook = webhook.map(SecretString::new);
-
         Ok(config)
     }
 
@@ -514,14 +457,35 @@ impl Config {
     pub fn validate(&self) -> Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
 
-        // Validate that at least one rule is defined (after .d/ merge)
+        // ===== Mandatory config sections (after .d/ merge) =====
+
+        // Validate that at least one notifier is configured
+        let has_notifiers = self
+            .notifiers
+            .as_ref()
+            .map(|n| !n.is_empty())
+            .unwrap_or(false);
+        if !has_notifiers {
+            errors.push(ConfigError::ValidationError(
+                "no notifiers configured: add notifiers in config.yaml or notifiers.d/".to_string(),
+            ));
+        }
+
+        // Validate that at least one template is defined
+        if self.templates.is_empty() {
+            errors.push(ConfigError::ValidationError(
+                "no templates defined: add templates in config.yaml or templates.d/".to_string(),
+            ));
+        }
+
+        // Validate that at least one rule is defined
         if self.rules.is_empty() {
             errors.push(ConfigError::ValidationError(
                 "no rules defined: add rules in config.yaml or rules.d/".to_string(),
             ));
         }
 
-        // Validate all rules
+        // ===== Rule validations =====
         for rule in &self.rules {
             if let Some(ref pattern) = rule.parser.regex
                 && let Err(e) = Regex::new(pattern)
@@ -542,26 +506,24 @@ impl Config {
                 });
             }
 
-            if let Some(ref notify) = rule.notify
-                && let Some(ref template_name) = notify.template
-                && !self.templates.contains_key(template_name)
-            {
+            // Validate template exists
+            if !self.templates.contains_key(&rule.notify.template) {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: rule.name.clone(),
-                    message: format!("notify.template '{}' not found in templates", template_name),
+                    message: format!(
+                        "notify.template '{}' not found in templates",
+                        rule.notify.template
+                    ),
                 });
             }
-        }
 
-        // Validate default template exists
-        if !self.templates.contains_key(&self.defaults.notify.template) {
-            errors.push(ConfigError::InvalidTemplate {
-                rule: "defaults.notify".to_string(),
-                message: format!(
-                    "default template '{}' not found in templates",
-                    self.defaults.notify.template
-                ),
-            });
+            // Validate destinations is not empty
+            if rule.notify.destinations.is_empty() {
+                errors.push(ConfigError::ValidationError(format!(
+                    "rule '{}': notify.destinations must contain at least one notifier",
+                    rule.name
+                )));
+            }
         }
 
         // Validate named templates (syntax)

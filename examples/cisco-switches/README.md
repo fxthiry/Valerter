@@ -98,11 +98,21 @@ With the config above: **max 3 alerts per switch per 5 minutes**.
 - `key: "{{ hostname }}-{{ service }}"` — throttle per host+service combo
 - Remove `key` entirely — global throttle across all matching logs
 
-### 4. Template — Format the Notification
+### 4. Notify — Route to Destinations
 
 ```yaml
-template: "SPANTREE-2-BLOCK_BPDUGUARD"
+notify:
+  template: "SPANTREE-2-BLOCK_BPDUGUARD"
+  destinations:
+    - mattermost-infra
+    - email-infra
 ```
+
+Each rule must specify:
+- `template` — which template to use for formatting
+- `destinations` — list of notifiers to send to (defined in `notifiers` section)
+
+### 5. Template — Format the Notification
 
 Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) with all extracted variables:
 

@@ -6,8 +6,6 @@ defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -56,6 +54,10 @@ rules:
     parser:
       json:
         fields: ["message"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - "mattermost-infra"
 
   # Story 6.3: Rule with multi-destination routing
   - name: "test_multi_destination"

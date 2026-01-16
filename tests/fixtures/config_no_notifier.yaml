@@ -1,0 +1,25 @@
+# Invalid config - no notifiers configured
+# This should fail validation with "no notifiers configured" error
+victorialogs:
+  url: "http://localhost:9428"
+
+defaults:
+  throttle:
+    count: 10
+    window: 30s
+
+templates:
+  simple:
+    title: "Alert"
+    body: "{{ body }}"
+
+rules:
+  - name: "simple_rule"
+    query: '_stream:{app="test"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "simple"
+      destinations:
+        - "nonexistent"

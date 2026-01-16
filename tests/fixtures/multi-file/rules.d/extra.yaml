@@ -4,6 +4,10 @@ extra_rule_from_dir:
   parser:
     json:
       fields: [level, message]
+  notify:
+    template: "default_alert"
+    destinations:
+      - "inline-mattermost"
 
 another_dir_rule:
   query: "_msg:critical"
@@ -12,3 +16,7 @@ another_dir_rule:
   throttle:
     count: 1
     window: 5m
+  notify:
+    template: "default_alert"
+    destinations:
+      - "inline-mattermost"

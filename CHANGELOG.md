@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] - 2026-01-16
+
+**Feature freeze** - From this release, only bug fixes until 1.0.0 stable. No new features or refactoring.
+
+### Added
+- **Multi-file configuration** - Split rules, templates, and notifiers into separate files in `.d/` directories (`rules.d/`, `templates.d/`, `notifiers.d/`)
+- **Collision detection** - Explicit errors when duplicate names are found across config files
+- **Warning for unused mattermost_channel** - Warns when `mattermost_channel` is set but no Mattermost notifier in destinations
+
+### Changed
+- **BREAKING: `notify.template` required** - Each rule must now specify its template explicitly (no more `defaults.notify.template` fallback)
+- **BREAKING: `notify.destinations` required** - Each rule must specify at least one destination
+- **BREAKING: `defaults.notify` removed** - The entire `defaults.notify` section has been removed
+- **BREAKING: `notifiers` section required** - At least one notifier must be configured
+- **BREAKING: `templates` section required** - At least one template must be defined
+- **BREAKING: `MATTERMOST_WEBHOOK` env var removed** - Use `notifiers` section instead
+- **BREAKING: `notify.channel` renamed** - Now `notify.mattermost_channel` for clarity
+- **Strict field validation** - Unknown fields in `notify` section now cause parsing errors
+
+### Fixed
+- **Debian package** - Creates `.d/` directories on install
+
 ## [1.0.0-rc.3] - 2026-01-15
 
 ### Changed
@@ -89,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.4...HEAD
+[1.0.0-rc.4]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.2...v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.1...v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/fxthiry/valerter/compare/v1.0.0-beta.1...v1.0.0-rc.1

@@ -2,12 +2,15 @@
 victorialogs:
   url: "http://victorialogs:9428"
 
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "broken_template"
 
 templates:
   broken_template:
@@ -24,3 +27,7 @@ rules:
     query: '_stream:{host="server1"}'
     parser:
       regex: '(?P<host>\S+)'
+    notify:
+      template: "broken_template"
+      destinations:
+        - "test"

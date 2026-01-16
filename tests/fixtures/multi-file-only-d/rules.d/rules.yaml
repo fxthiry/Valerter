@@ -3,5 +3,6 @@ only_dir_rule:
   parser:
     regex: ".*"
   notify:
+    template: "dir_template"
     destinations:
       - dir-notifier

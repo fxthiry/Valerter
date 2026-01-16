@@ -7,8 +7,6 @@ defaults:
   throttle:
     count: 5
     window: 1m
-  notify:
-    template: default_alert
 
 templates:
   default_alert:
@@ -23,6 +21,10 @@ rules:
     query: "_msg:error"
     parser:
       regex: ".*"
+    notify:
+      template: "default_alert"
+      destinations:
+        - "inline-mattermost"
 
 notifiers:
   inline-mattermost:

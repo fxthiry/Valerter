@@ -64,11 +64,7 @@ struct RuleSpawnContext {
     vl_tls: Option<TlsConfig>,
     queue: NotificationQueue,
     template_engine: Arc<TemplateEngine>,
-    default_template: String,
     default_throttle: CompiledThrottle,
-    /// Notification destinations for this rule (Story 6.3).
-    /// Empty vec means use the default notifier.
-    destinations: Vec<String>,
     /// Timezone for formatting log timestamps.
     timestamp_timezone: String,
 }
@@ -162,8 +158,7 @@ impl RuleEngine {
         // Create shared template engine for all rules
         let template_engine = Arc::new(TemplateEngine::new(self.runtime_config.templates.clone()));
 
-        // Get default template name and throttle config
-        let default_template = self.runtime_config.defaults.notify.template.clone();
+        // Get default throttle config
         let default_throttle = CompiledThrottle {
             key_template: self.runtime_config.defaults.throttle.key.clone(),
             count: self.runtime_config.defaults.throttle.count,
@@ -176,14 +171,6 @@ impl RuleEngine {
                 continue;
             }
 
-            // Extract destinations from rule's notify config (Story 6.3).
-            // Empty vec means use the default notifier.
-            let destinations = rule
-                .notify
-                .as_ref()
-                .and_then(|n| n.destinations.clone())
-                .unwrap_or_default();
-
             let ctx = RuleSpawnContext {
                 rule: rule.clone(),
                 vl_url: self.runtime_config.victorialogs.url.clone(),
@@ -192,9 +179,7 @@ impl RuleEngine {
                 vl_tls: self.runtime_config.victorialogs.tls.clone(),
                 queue: self.queue.clone(),
                 template_engine: Arc::clone(&template_engine),
-                default_template: default_template.clone(),
                 default_throttle: default_throttle.clone(),
-                destinations,
                 timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
             };
 
@@ -391,17 +376,9 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
     let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
     let throttler = Arc::new(Throttler::new(Some(throttle_config), &ctx.rule.name));
 
-    // Get template name for this rule
-    let template_name = ctx
-        .rule
-        .notify
-        .as_ref()
-        .and_then(|n| n.template.clone())
-        .unwrap_or(ctx.default_template.clone());
-
-    // Get destinations for this rule (Story 6.3).
-    // Empty vec means use the default notifier.
-    let destinations = ctx.destinations.clone();
+    // Get template name and destinations for this rule (both are now required)
+    let template_name = ctx.rule.notify.template.clone();
+    let destinations = ctx.rule.notify.destinations.clone();
 
     // Wrap parser in Arc for sharing across closure invocations
     let parser = Arc::new(parser);
@@ -578,7 +555,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, MetricsConfig,
-        NotifyDefaults, ThrottleConfig, VictoriaLogsConfig,
+        NotifyConfig, ThrottleConfig, VictoriaLogsConfig,
     };
     use std::collections::HashMap;
 
@@ -603,7 +580,11 @@ mod tests {
                 json: None,
             },
             throttle: None,
-            notify: None,
+            notify: NotifyConfig {
+                template: "default".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["mattermost-test".to_string()],
+            },
         }
     }
 
@@ -620,9 +601,6 @@ mod tests {
                     key: None,
                     count: 5,
                     window: Duration::from_secs(60),
-                },
-                notify: NotifyDefaults {
-                    template: "default".to_string(),
                 },
                 timestamp_timezone: "UTC".to_string(),
             },
@@ -642,7 +620,6 @@ mod tests {
             rules,
             metrics: MetricsConfig::default(),
             notifiers: None,
-            mattermost_webhook: None,
             config_dir: std::path::PathBuf::from("."),
         }
     }

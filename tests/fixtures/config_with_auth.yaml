@@ -12,12 +12,15 @@ victorialogs:
   tls:
     verify: false
 
+notifiers:
+  test-notifier:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+
 defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "default_alert"
 
 templates:
   default_alert:
@@ -30,3 +33,7 @@ rules:
     parser:
       json:
         fields: ["message"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test-notifier"

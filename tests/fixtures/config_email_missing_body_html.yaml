@@ -8,8 +8,6 @@ defaults:
   throttle:
     count: 5
     window: 60s
-  notify:
-    template: "alert"
 
 templates:
   alert:
