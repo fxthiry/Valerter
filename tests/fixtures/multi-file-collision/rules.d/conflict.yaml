@@ -1,0 +1,5 @@
+# This rule has the same name as one in config.yaml -> collision!
+collision_rule:
+  query: "_msg:warning"
+  parser:
+    regex: ".*"

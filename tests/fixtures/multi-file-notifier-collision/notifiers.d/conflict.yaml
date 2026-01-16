@@ -1,0 +1,4 @@
+# Collision: same notifier name as in config.yaml
+collision_notifier:
+  type: mattermost
+  webhook_url: "https://example.com/hooks/from-dir"

@@ -19,6 +19,17 @@ pub enum ConfigError {
     /// Story 6.2: Error for invalid notifier configuration.
     #[error("invalid notifier '{name}': {message}")]
     InvalidNotifier { name: String, message: String },
+    /// Duplicate name detected during multi-file config merge.
+    #[error("duplicate {resource_type} name '{name}': defined in '{source1}' and '{source2}'")]
+    DuplicateName {
+        resource_type: String,
+        name: String,
+        source1: String,
+        source2: String,
+    },
+    /// Error reading configuration directory.
+    #[error("failed to read directory '{path}': {message}")]
+    DirectoryError { path: String, message: String },
 }
 
 /// Errors related to VictoriaLogs streaming connection.
@@ -122,6 +133,32 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid notifier 'mattermost-infra': missing webhook_url"
+        );
+    }
+
+    #[test]
+    fn config_error_duplicate_name_display() {
+        let err = ConfigError::DuplicateName {
+            resource_type: "rule".to_string(),
+            name: "my_rule".to_string(),
+            source1: "config.yaml".to_string(),
+            source2: "rules.d/extra.yaml".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "duplicate rule name 'my_rule': defined in 'config.yaml' and 'rules.d/extra.yaml'"
+        );
+    }
+
+    #[test]
+    fn config_error_directory_error_display() {
+        let err = ConfigError::DirectoryError {
+            path: "rules.d".to_string(),
+            message: "permission denied".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to read directory 'rules.d': permission denied"
         );
     }
 

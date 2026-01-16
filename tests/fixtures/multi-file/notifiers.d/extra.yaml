@@ -1,0 +1,8 @@
+# Extra notifiers in HashMap format
+dir-mattermost:
+  type: mattermost
+  webhook_url: "https://dir.example.com/hooks/yyy"
+
+dir-webhook:
+  type: webhook
+  url: "https://api.example.com/alerts"

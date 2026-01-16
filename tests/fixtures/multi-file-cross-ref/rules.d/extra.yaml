@@ -1,0 +1,7 @@
+# Rule from .d/ that references template from config.yaml
+dir_rule_uses_inline_template:
+  query: "_msg:warning"
+  parser:
+    regex: ".*"
+  notify:
+    template: inline_template

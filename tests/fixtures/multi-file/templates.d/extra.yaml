@@ -1,0 +1,5 @@
+# Extra templates in HashMap format
+template_from_dir:
+  title: "Dir Template: {{ rule_name }}"
+  body: "From directory: {{ _msg }}"
+  accent_color: "#00ff00"

@@ -21,6 +21,14 @@ case "$1" in
             chown root:valerter /etc/valerter/config.yaml
             chmod 640 /etc/valerter/config.yaml
         fi
+        # Create .d/ directories for multi-file config
+        for dir in rules.d templates.d notifiers.d; do
+            if [ ! -d /etc/valerter/$dir ]; then
+                mkdir -p /etc/valerter/$dir
+                chown root:valerter /etc/valerter/$dir
+                chmod 750 /etc/valerter/$dir
+            fi
+        done
         # Set permissions on templates directory
         if [ -d /etc/valerter/templates ]; then
             chown -R valerter:valerter /etc/valerter/templates

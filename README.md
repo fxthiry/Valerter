@@ -43,6 +43,7 @@ Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which e
 - **Intelligent throttling** — Avoid alert spam with per-key rate limiting
 - **Real-time alerting** — Less than 5 seconds from log event to notification
 - **Declarative rules** — YAML configuration with regex/JSON parsing
+- **Multi-file config** — Split rules/templates/notifiers across `rules.d/`, `templates.d/`, `notifiers.d/`
 - **Prometheus metrics** — Built-in `/metrics` endpoint for monitoring
 
 ## Quick Start

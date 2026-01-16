@@ -1,0 +1,28 @@
+victorialogs:
+  url: http://victorialogs:9428
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: default_template
+
+templates:
+  default_template:
+    title: "Test"
+    body: "{{ _msg }}"
+
+notifiers:
+  collision_notifier:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/from-config"
+
+rules:
+  - name: test_rule
+    query: "_msg:test"
+    parser:
+      regex: ".*"
+    notify:
+      destinations:
+        - collision_notifier

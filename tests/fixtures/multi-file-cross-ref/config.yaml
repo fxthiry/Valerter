@@ -1,0 +1,27 @@
+# Config for testing cross-file references
+
+victorialogs:
+  url: http://victorialogs:9428
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: default_alert
+
+templates:
+  default_alert:
+    title: "Default Alert"
+    body: "{{ _msg }}"
+  inline_template:
+    title: "Inline Template"
+    body: "From inline: {{ _msg }}"
+
+rules:
+  - name: inline_rule_uses_dir_template
+    query: "_msg:error"
+    parser:
+      regex: ".*"
+    notify:
+      template: template_from_dir

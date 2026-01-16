@@ -13,6 +13,76 @@ See [config/config.example.yaml](../config/config.example.yaml) for a complete a
 
 **Security:** The file should be owned by `valerter:valerter` with mode `600` (owner read/write only).
 
+## Multi-File Configuration
+
+For large deployments, you can split rules, templates, and notifiers into separate files in `.d/` directories alongside `config.yaml`:
+
+```
+/etc/valerter/
+├── config.yaml         # Main config
+├── rules.d/
+│   ├── security.yaml   # Security team rules
+│   └── infra.yaml      # Infrastructure rules
+├── templates.d/
+│   └── custom.yaml     # Custom templates
+└── notifiers.d/
+    └── team-channels.yaml
+```
+
+### Format in `.d/` Files
+
+Files in `.d/` directories use a **HashMap format** where the name is the YAML key:
+
+```yaml
+# rules.d/security.yaml
+auth_failure:
+  query: "_msg:authentication AND status:failed"
+  parser:
+    json:
+      fields: [user, ip]
+
+brute_force:
+  query: "_msg:blocked"
+  parser:
+    regex: "IP (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+```
+
+```yaml
+# templates.d/custom.yaml
+security_alert:
+  title: "Security: {{ title }}"
+  body: "{{ body }}"
+  accent_color: "#ff0000"
+```
+
+```yaml
+# notifiers.d/team-channels.yaml
+security-team:
+  type: mattermost
+  webhook_url: "https://mattermost.example.com/hooks/security"
+
+infra-team:
+  type: mattermost
+  webhook_url: "https://mattermost.example.com/hooks/infra"
+```
+
+### Rules
+
+- **Files processed:** `*.yaml` and `*.yml` only
+- **Order:** Alphabetical (deterministic)
+- **Hidden files:** Files starting with `.` are ignored
+- **Empty files:** Silently skipped
+- **Name uniqueness:** Names must be unique across `config.yaml` and all `.d/` files
+- **Cross-references:** Rules in `.d/` can reference templates in `config.yaml` and vice versa
+
+### Collision Detection
+
+If the same name is defined in multiple files, Valerter fails at startup with an explicit error:
+
+```
+Error: duplicate rule name 'my_rule': defined in 'config.yaml' and 'rules.d/extra.yaml'
+```
+
 ## Structure Overview
 
 ```yaml

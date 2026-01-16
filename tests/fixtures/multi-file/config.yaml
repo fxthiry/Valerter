@@ -1,0 +1,30 @@
+# Base config with inline rules/templates/notifiers for multi-file merge testing
+
+victorialogs:
+  url: http://victorialogs:9428
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+  notify:
+    template: default_alert
+
+templates:
+  default_alert:
+    title: "Alert: {{ rule_name }}"
+    body: "{{ _msg }}"
+  inline_template:
+    title: "Inline: {{ title }}"
+    body: "{{ body }}"
+
+rules:
+  - name: inline_rule
+    query: "_msg:error"
+    parser:
+      regex: ".*"
+
+notifiers:
+  inline-mattermost:
+    type: mattermost
+    webhook_url: "https://inline.example.com/hooks/xxx"

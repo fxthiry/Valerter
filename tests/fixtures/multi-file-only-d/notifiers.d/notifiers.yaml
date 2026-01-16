@@ -1,0 +1,3 @@
+dir-notifier:
+  type: mattermost
+  webhook_url: "https://example.com/hooks/test"
