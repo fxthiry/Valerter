@@ -1,8 +1,8 @@
 [package]
 name = "valerter"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2024"
-description = "Real-time alerting from VictoriaLogs to Mattermost"
+description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"
 
 [dependencies]
