@@ -2,12 +2,9 @@
 /target
 
 # Local config (secrets)
-config/config.yaml
-config/config.test.yaml
-config/config.prod.yaml
-config/rules.d/
-config/templates.d/
-config/notifiers.d/
+config/prod/
+config/test/
+config/minimal/
 
 # IDE
 .idea/
