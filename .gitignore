@@ -5,6 +5,9 @@
 config/config.yaml
 config/config.test.yaml
 config/config.prod.yaml
+config/rules.d/
+config/templates.d/
+config/notifiers.d/
 
 # IDE
 .idea/
