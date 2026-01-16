@@ -1,0 +1,4 @@
+# Invalid YAML - missing required fields
+broken_rule:
+  query: "_msg:error"
+  # Missing parser field!

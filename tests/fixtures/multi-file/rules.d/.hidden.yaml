@@ -1,0 +1,5 @@
+# This hidden file should be ignored
+hidden_rule_should_not_load:
+  query: "_msg:hidden"
+  parser:
+    regex: ".*"

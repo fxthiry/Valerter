@@ -1,0 +1,4 @@
+# Template from .d/ that can be referenced by inline rule
+template_from_dir:
+  title: "Dir Template"
+  body: "From dir: {{ _msg }}"

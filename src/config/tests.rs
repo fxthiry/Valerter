@@ -1051,3 +1051,190 @@ fn validate_rule_destinations_collects_all_errors() {
     let errors = result.unwrap_err();
     assert_eq!(errors.len(), 2, "Should collect all destination errors");
 }
+
+// ============================================================
+// Multi-file Config Tests (rules.d/, templates.d/, notifiers.d/)
+// ============================================================
+
+#[test]
+fn load_with_rules_d_merges_rules() {
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Should have 1 inline + 2 from rules.d/ = 3 rules
+    assert_eq!(config.rules.len(), 3);
+
+    let rule_names: Vec<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
+    assert!(rule_names.contains(&"inline_rule"));
+    assert!(rule_names.contains(&"extra_rule_from_dir"));
+    assert!(rule_names.contains(&"another_dir_rule"));
+}
+
+#[test]
+fn load_with_templates_d_merges_templates() {
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Should have 2 inline + 1 from templates.d/ = 3 templates
+    assert_eq!(config.templates.len(), 3);
+
+    assert!(config.templates.contains_key("default_alert"));
+    assert!(config.templates.contains_key("inline_template"));
+    assert!(config.templates.contains_key("template_from_dir"));
+
+    // Verify the dir template content
+    let dir_template = config.templates.get("template_from_dir").unwrap();
+    assert_eq!(dir_template.accent_color, Some("#00ff00".to_string()));
+}
+
+#[test]
+fn load_with_notifiers_d_merges_notifiers() {
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Should have 1 inline + 2 from notifiers.d/ = 3 notifiers
+    let notifiers = config.notifiers.expect("notifiers should be Some");
+    assert_eq!(notifiers.len(), 3);
+
+    assert!(notifiers.contains_key("inline-mattermost"));
+    assert!(notifiers.contains_key("dir-mattermost"));
+    assert!(notifiers.contains_key("dir-webhook"));
+}
+
+#[test]
+fn load_with_all_directories_merges_all() {
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Verify all merges happened
+    assert_eq!(config.rules.len(), 3);
+    assert_eq!(config.templates.len(), 3);
+    assert_eq!(config.notifiers.as_ref().unwrap().len(), 3);
+
+    // Verify validation still passes
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn load_without_directories_works() {
+    // config_valid.yaml has no .d/ directories - should work as before
+    let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn load_with_empty_directories_works() {
+    let config = Config::load(&fixture_path("multi-file-empty/config.yaml")).unwrap();
+
+    // Only the inline rule should exist
+    assert_eq!(config.rules.len(), 1);
+    assert_eq!(config.rules[0].name, "only_inline_rule");
+}
+
+#[test]
+fn load_with_empty_file_in_directory_works() {
+    // multi-file-empty has an empty.yaml file in rules.d/ - should be skipped
+    let config = Config::load(&fixture_path("multi-file-empty/config.yaml")).unwrap();
+    assert_eq!(config.rules.len(), 1);
+}
+
+#[test]
+fn load_with_collision_fails_with_sources() {
+    let result = Config::load(&fixture_path("multi-file-collision/config.yaml"));
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::ConfigError::DuplicateName {
+            resource_type,
+            name,
+            source1,
+            source2,
+        } => {
+            assert_eq!(resource_type, "rule");
+            assert_eq!(name, "collision_rule");
+            assert!(source1.contains("config.yaml"));
+            assert!(source2.contains("conflict.yaml"));
+        }
+        e => panic!("Expected DuplicateName error, got {:?}", e),
+    }
+}
+
+#[test]
+fn load_with_cross_file_reference_validates() {
+    let config = Config::load(&fixture_path("multi-file-cross-ref/config.yaml")).unwrap();
+
+    // Verify cross-references are correct
+    assert_eq!(config.rules.len(), 2);
+    assert_eq!(config.templates.len(), 3);
+
+    // Rule from .d/ references template from config.yaml
+    let dir_rule = config
+        .rules
+        .iter()
+        .find(|r| r.name == "dir_rule_uses_inline_template")
+        .unwrap();
+    assert_eq!(
+        dir_rule.notify.as_ref().unwrap().template,
+        Some("inline_template".to_string())
+    );
+
+    // Rule from config.yaml references template from .d/
+    let inline_rule = config
+        .rules
+        .iter()
+        .find(|r| r.name == "inline_rule_uses_dir_template")
+        .unwrap();
+    assert_eq!(
+        inline_rule.notify.as_ref().unwrap().template,
+        Some("template_from_dir".to_string())
+    );
+
+    // Validation should pass (cross-file references are valid)
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn load_with_invalid_yaml_in_directory_fails_with_filename() {
+    let result = Config::load(&fixture_path("multi-file-invalid/config.yaml"));
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::ConfigError::ValidationError(msg) => {
+            assert!(msg.contains("rules.d"));
+            assert!(msg.contains("bad.yaml"));
+        }
+        e => panic!("Expected ValidationError, got {:?}", e),
+    }
+}
+
+#[test]
+fn load_ignores_hidden_files_in_directory() {
+    // multi-file/rules.d/.hidden.yaml exists but should be ignored
+    let config = Config::load(&fixture_path("multi-file/config.yaml")).unwrap();
+
+    // Should still have only 3 rules (1 inline + 2 from extra.yaml)
+    // The hidden_rule_should_not_load from .hidden.yaml should not be present
+    assert_eq!(config.rules.len(), 3);
+
+    let rule_names: Vec<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
+    assert!(!rule_names.contains(&"hidden_rule_should_not_load"));
+}
+
+#[test]
+fn load_with_intra_directory_collision_fails() {
+    // Two files in rules.d/ define the same rule name
+    let result = Config::load(&fixture_path("multi-file-intra-collision/config.yaml"));
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::ConfigError::DuplicateName {
+            resource_type,
+            name,
+            source1,
+            source2,
+        } => {
+            assert_eq!(resource_type, "rules");
+            assert_eq!(name, "collision_rule");
+            // Due to sorting, a.yaml comes before b.yaml
+            assert!(source1.contains("a.yaml"));
+            assert!(source2.contains("b.yaml"));
+        }
+        e => panic!("Expected DuplicateName error, got {:?}", e),
+    }
+}

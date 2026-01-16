@@ -1,0 +1,5 @@
+# First file defines collision_rule
+collision_rule:
+  query: "_msg:from_a"
+  parser:
+    regex: ".*"

@@ -1,0 +1,14 @@
+# Extra rules in HashMap format (name = key)
+extra_rule_from_dir:
+  query: "_msg:warning"
+  parser:
+    json:
+      fields: [level, message]
+
+another_dir_rule:
+  query: "_msg:critical"
+  parser:
+    regex: "(?P<level>CRITICAL).*"
+  throttle:
+    count: 1
+    window: 5m

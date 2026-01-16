@@ -8,6 +8,36 @@
 # ==============================================================================
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ MULTI-FILE CONFIGURATION (rules.d/, templates.d/, notifiers.d/)            │
+# ├─────────────────────────────────────────────────────────────────────────────┤
+# │                                                                             │
+# │ For large deployments, you can split rules/templates/notifiers into        │
+# │ separate files in .d/ directories alongside config.yaml:                   │
+# │                                                                             │
+# │   /etc/valerter/                                                            │
+# │   ├── config.yaml         # Main config (this file)                        │
+# │   ├── rules.d/                                                              │
+# │   │   ├── security.yaml   # Security team rules                            │
+# │   │   └── infra.yaml      # Infrastructure rules                           │
+# │   ├── templates.d/                                                          │
+# │   │   └── custom.yaml     # Custom templates                               │
+# │   └── notifiers.d/                                                          │
+# │       └── team-channels.yaml                                                │
+# │                                                                             │
+# │ Format in .d/ files uses HashMap (name = YAML key):                        │
+# │                                                                             │
+# │   # rules.d/security.yaml                                                   │
+# │   auth_failure:                                                             │
+# │     query: "_msg:authentication AND status:failed"                         │
+# │     parser:                                                                 │
+# │       json:                                                                 │
+# │         fields: [user, ip]                                                  │
+# │                                                                             │
+# │ Names must be unique across config.yaml and all .d/ files.                 │
+# │ Collisions produce explicit errors indicating both source files.           │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
 # │ CONFIGURATION APPROACHES                                                    │
 # ├─────────────────────────────────────────────────────────────────────────────┤
 # │                                                                             │
