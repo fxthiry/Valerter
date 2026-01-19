@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::{BasicAuthConfig, SecretString, TlsConfig};
 use crate::error::StreamError;
@@ -199,7 +199,7 @@ impl TailClient {
 
             for line in lines {
                 if !line.is_empty() {
-                    info!(rule_name = %rule_name, "Received log line");
+                    trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
                     all_lines.push(line);
                 }
             }
@@ -274,7 +274,7 @@ impl TailClient {
 
         loop {
             let url = self.build_url();
-            info!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
+            debug!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
 
             // Start timing for query_duration metric
             let request_start = Instant::now();
@@ -282,7 +282,7 @@ impl TailClient {
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
-                    info!(rule_name = %rule_name, status = %resp.status(), "Connection successful, starting to stream");
+                    info!(rule_name = %rule_name, status = %resp.status(), "Connected to VictoriaLogs");
                     // Connection successful - mark VictoriaLogs as up
                     metrics::gauge!(
                         "valerter_victorialogs_up",
@@ -373,7 +373,7 @@ impl TailClient {
 
                         for line in lines {
                             if !line.is_empty() {
-                                info!(rule_name = %rule_name, "Received log line");
+                                trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
                                 line_handler(line).await?;
                             }
                         }
@@ -400,7 +400,7 @@ impl TailClient {
             // Stream ended (server closed connection) - reconnect
             if !had_failure {
                 // Normal stream end, not a failure - still need to reconnect
-                info!(rule_name = %rule_name, "Stream ended, reconnecting");
+                debug!(rule_name = %rule_name, "Stream ended, reconnecting");
             }
             had_failure = true;
         }

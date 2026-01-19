@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{
     BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig,
@@ -167,9 +167,11 @@ impl RuleEngine {
 
         for rule in &self.runtime_config.rules {
             if !rule.enabled {
-                info!(rule_name = %rule.name, "Rule disabled, skipping");
+                debug!(rule_name = %rule.name, "Rule disabled, skipping");
                 continue;
             }
+
+            debug!(rule_name = %rule.name, "Spawning rule task");
 
             let ctx = RuleSpawnContext {
                 rule: rule.clone(),
@@ -367,18 +369,33 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
     let span = tracing::info_span!("run_rule", rule_name = %ctx.rule.name);
     let _guard = span.enter();
 
-    info!("Rule task started");
+    debug!("Rule task started");
 
     // Create parser for this rule
     let parser = RuleParser::from_compiled(&ctx.rule.parser);
+    debug!(
+        has_regex = ctx.rule.parser.regex.is_some(),
+        has_json = ctx.rule.parser.json.is_some(),
+        "Parser initialized"
+    );
 
     // Create throttler for this rule (uses rule's config or defaults)
     let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
     let throttler = Arc::new(Throttler::new(Some(throttle_config), &ctx.rule.name));
+    debug!(
+        throttle_count = throttle_config.count,
+        throttle_window_secs = throttle_config.window.as_secs(),
+        "Throttler initialized"
+    );
 
     // Get template name and destinations for this rule (both are now required)
     let template_name = ctx.rule.notify.template.clone();
     let destinations = ctx.rule.notify.destinations.clone();
+    debug!(
+        template_name = %template_name,
+        destination_count = destinations.len(),
+        "Notify config loaded"
+    );
 
     // Wrap parser in Arc for sharing across closure invocations
     let parser = Arc::new(parser);
@@ -474,9 +491,14 @@ async fn process_log_line(
     queue: &NotificationQueue,
     timestamp_timezone: &str,
 ) -> Result<(), ProcessError> {
+    trace!(line_len = line.len(), "Processing log line");
+
     // Step 1: Parse the log line
     let fields = match parser.parse(line) {
-        Ok(f) => f,
+        Ok(f) => {
+            trace!(field_count = f.as_object().map(|o| o.len()).unwrap_or(0), "Parse successful");
+            f
+        }
         Err(e) => {
             record_parse_error(rule_name, &e);
             return Err(ProcessError::Parse);
@@ -529,6 +551,7 @@ async fn process_log_line(
         return Err(ProcessError::Queue);
     }
 
+    trace!("Alert queued successfully");
     Ok(())
 }
 
