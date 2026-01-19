@@ -220,6 +220,10 @@ notifiers:
   #     - "ops@example.com"
   #     - "admin@example.com"
   #   subject_template: "[{{ rule_name | upper }}] {{ title }}"
+  #   body_template: |                     # Optional: inline HTML body
+  #     <h2>{{ title }}</h2>
+  #     <p>{{ body }}</p>
+  #   # body_template_file: /etc/valerter/email-template.html  # Or: external file
 
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
@@ -243,6 +247,7 @@ rules:
   # ── Example 1: JSON logs with per-host throttling ──────────────────────────
 
   - name: high_cpu_alert
+    # enabled: false                       # Optional: disable rule (default: true)
     query: '_stream:{host="server1"} AND _msg:"cpu" | json | cpu:>90'
     parser:
       json:
