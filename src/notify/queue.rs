@@ -47,10 +47,13 @@ impl NotificationQueue {
     /// * `Ok(())` - Alert queued successfully.
     /// * `Err(QueueError::Closed)` - No active receivers.
     pub fn send(&self, payload: AlertPayload) -> Result<(), QueueError> {
+        tracing::trace!(rule_name = %payload.rule_name, "Enqueueing alert");
         self.tx.send(payload).map_err(|_| QueueError::Closed)?;
 
         // Update queue size metric (AD-05)
-        metrics::gauge!("valerter_queue_size").set(self.tx.len() as f64);
+        let queue_size = self.tx.len();
+        tracing::trace!(queue_size = queue_size, "Alert enqueued");
+        metrics::gauge!("valerter_queue_size").set(queue_size as f64);
 
         Ok(())
     }
@@ -110,7 +113,7 @@ impl NotificationWorker {
     ///
     /// * `cancel` - Cancellation token for graceful shutdown.
     pub async fn run(&mut self, cancel: CancellationToken) {
-        tracing::info!("Notification worker started");
+        tracing::debug!("Notification worker started");
 
         loop {
             tokio::select! {
@@ -135,13 +138,13 @@ impl NotificationWorker {
                             metrics::gauge!("valerter_queue_size").set(self.tx.len() as f64);
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Notification queue closed");
+                            tracing::debug!("Notification queue closed");
                             return;
                         }
                     }
                 }
                 _ = cancel.cancelled() => {
-                    tracing::info!("Notification worker shutting down gracefully");
+                    tracing::debug!("Notification worker shutting down gracefully");
                     return;
                 }
             }

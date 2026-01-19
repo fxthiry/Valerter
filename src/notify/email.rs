@@ -553,6 +553,7 @@ impl Notifier for EmailNotifier {
         // Render templates once for all recipients
         let subject = self.render_subject(alert)?;
         let body = self.render_body(alert)?;
+        tracing::trace!(subject_len = subject.len(), body_len = body.len(), "Templates rendered");
 
         // Track success/failure per recipient
         let mut success_count = 0;
@@ -583,7 +584,7 @@ impl Notifier for EmailNotifier {
         }
 
         // Log summary
-        tracing::info!(
+        tracing::debug!(
             success = success_count,
             failed = failure_count,
             total = self.to.len(),
@@ -603,6 +604,12 @@ impl Notifier for EmailNotifier {
             Ok(())
         } else {
             // All recipients failed
+            tracing::error!(
+                rule_name = %alert.rule_name,
+                notifier_name = %self.name,
+                recipient_count = failure_count,
+                "Email delivery failed to all recipients"
+            );
             metrics::counter!(
                 "valerter_notify_errors_total",
                 "rule_name" => alert.rule_name.clone(),

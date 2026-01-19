@@ -259,6 +259,7 @@ impl Notifier for WebhookNotifier {
                 })?
             }
         };
+        tracing::trace!(body_len = body.len(), "Request body built");
 
         // Retry loop with exponential backoff (AD-07)
         for attempt in 0..WEBHOOK_MAX_RETRIES {
@@ -271,7 +272,7 @@ impl Notifier for WebhookNotifier {
                 .await
             {
                 Ok(response) if response.status().is_success() => {
-                    tracing::info!("Webhook alert sent successfully");
+                    tracing::debug!("Webhook alert sent successfully");
                     metrics::counter!(
                         "valerter_alerts_sent_total",
                         "rule_name" => alert.rule_name.clone(),

@@ -174,6 +174,7 @@ impl Notifier for MattermostNotifier {
             self.username.as_deref(),
             self.icon_url.as_deref(),
         );
+        tracing::trace!(payload_size = std::mem::size_of_val(&mattermost_payload), "Payload built");
 
         // Use the notifier's own webhook_url (Story 6.2)
         let webhook_url = self.webhook_url.expose();
@@ -187,7 +188,7 @@ impl Notifier for MattermostNotifier {
                 .await
             {
                 Ok(response) if response.status().is_success() => {
-                    tracing::info!("Alert sent successfully");
+                    tracing::debug!("Alert sent successfully");
                     metrics::counter!(
                         "valerter_alerts_sent_total",
                         "rule_name" => alert.rule_name.clone(),
