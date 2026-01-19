@@ -2,7 +2,7 @@
 #                    VALERTER PERFORMANCE TEST CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Configuration for WP2 performance testing.
+# Configuration for performance testing.
 # Use with: valerter --config scripts/perf-test-config.yaml
 #
 

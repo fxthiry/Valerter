@@ -1,4 +1,4 @@
-# Performance Testing Guide - WP2
+# Performance Testing Guide
 
 This guide describes the complete procedure for running valerter performance tests.
 
