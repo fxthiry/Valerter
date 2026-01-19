@@ -117,6 +117,7 @@ rules:
 - **[Configuration](docs/configuration.md)** — Full configuration reference
 - **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost setup
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
+- **[Performance](docs/performance.md)** — Benchmarks and capacity planning
 - **[Architecture](docs/architecture.md)** — How Valerter works
 - **[Examples](examples/)** — Real-world configurations
 
