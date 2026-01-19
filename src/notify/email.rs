@@ -553,7 +553,11 @@ impl Notifier for EmailNotifier {
         // Render templates once for all recipients
         let subject = self.render_subject(alert)?;
         let body = self.render_body(alert)?;
-        tracing::trace!(subject_len = subject.len(), body_len = body.len(), "Templates rendered");
+        tracing::trace!(
+            subject_len = subject.len(),
+            body_len = body.len(),
+            "Templates rendered"
+        );
 
         // Track success/failure per recipient
         let mut success_count = 0;

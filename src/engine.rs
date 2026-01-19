@@ -496,7 +496,10 @@ async fn process_log_line(
     // Step 1: Parse the log line
     let fields = match parser.parse(line) {
         Ok(f) => {
-            trace!(field_count = f.as_object().map(|o| o.len()).unwrap_or(0), "Parse successful");
+            trace!(
+                field_count = f.as_object().map(|o| o.len()).unwrap_or(0),
+                "Parse successful"
+            );
             f
         }
         Err(e) => {

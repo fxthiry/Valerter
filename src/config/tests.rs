@@ -1261,7 +1261,11 @@ rules:
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("notify"), "Error should mention 'notify': {}", err);
+    assert!(
+        err.contains("notify"),
+        "Error should mention 'notify': {}",
+        err
+    );
 }
 
 // ============================================================
@@ -1297,9 +1301,16 @@ rules:
 unknown_root_field: "should fail"
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field at root level should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field at root level should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_root_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_root_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1331,9 +1342,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in victorialogs should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in victorialogs should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_vl_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_vl_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1368,9 +1386,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in metrics should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in metrics should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_metrics_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_metrics_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1402,9 +1427,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in throttle should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in throttle should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_throttle_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_throttle_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1436,9 +1468,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in template should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in template should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_template_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_template_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1472,7 +1511,11 @@ rules:
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
     assert!(result.is_err(), "Unknown field in rule should be rejected");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_rule_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_rule_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1502,9 +1545,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in parser should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in parser should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_parser_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_parser_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1536,9 +1586,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in json parser should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in json parser should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_json_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_json_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1570,9 +1627,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in mattermost notifier should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in mattermost notifier should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_mm_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_mm_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1605,9 +1669,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in webhook notifier should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in webhook notifier should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_webhook_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_webhook_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1644,9 +1715,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in email notifier should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in email notifier should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_email_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_email_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 #[test]
@@ -1683,9 +1761,16 @@ rules:
       destinations: ["test"]
 "#;
     let result: Result<Config, _> = serde_yaml::from_str(yaml);
-    assert!(result.is_err(), "Unknown field in smtp config should be rejected");
+    assert!(
+        result.is_err(),
+        "Unknown field in smtp config should be rejected"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unknown_smtp_field"), "Error should mention the unknown field: {}", err);
+    assert!(
+        err.contains("unknown_smtp_field"),
+        "Error should mention the unknown field: {}",
+        err
+    );
 }
 
 // ============================================================
@@ -1721,7 +1806,10 @@ rules:
 "#;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
-    assert!(result.is_err(), "Invalid URL in victorialogs should be rejected");
+    assert!(
+        result.is_err(),
+        "Invalid URL in victorialogs should be rejected"
+    );
 }
 
 #[test]
@@ -1754,5 +1842,8 @@ rules:
 "#;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
     let result = config.validate();
-    assert!(result.is_err(), "Invalid URL in webhook notifier should be rejected");
+    assert!(
+        result.is_err(),
+        "Invalid URL in webhook notifier should be rejected"
+    );
 }

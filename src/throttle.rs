@@ -155,7 +155,11 @@ impl Throttler {
             .cache
             .get_with(key.clone(), || Arc::new(AtomicU32::new(0)));
         let count = entry.fetch_add(1, Ordering::SeqCst) + 1;
-        tracing::trace!(count = count, max_count = self.max_count, "Throttle count updated");
+        tracing::trace!(
+            count = count,
+            max_count = self.max_count,
+            "Throttle count updated"
+        );
 
         // L1: Pre-convert rule_name to String once for metrics (required for 'static)
         let rule_name_str = self.rule_name.to_string();

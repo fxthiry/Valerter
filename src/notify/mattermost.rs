@@ -174,7 +174,10 @@ impl Notifier for MattermostNotifier {
             self.username.as_deref(),
             self.icon_url.as_deref(),
         );
-        tracing::trace!(payload_size = std::mem::size_of_val(&mattermost_payload), "Payload built");
+        tracing::trace!(
+            payload_size = std::mem::size_of_val(&mattermost_payload),
+            "Payload built"
+        );
 
         // Use the notifier's own webhook_url (Story 6.2)
         let webhook_url = self.webhook_url.expose();
