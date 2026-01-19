@@ -9,7 +9,7 @@
 | Component | Specification |
 |-----------|---------------|
 | **CPU** | Intel Core i7-14700 (20 cores) |
-| **RAM** | 32 GB |
+| **RAM** | 32 GB DDR5 |
 | **Storage** | Samsung 990 PRO NVMe 1TB |
 | **OS** | Linux (CachyOS 6.18) |
 | **VictoriaLogs** | Docker container (local) |
