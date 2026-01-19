@@ -1,0 +1,36 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#                    DOCKER COMPOSE FOR PERFORMANCE TESTING
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Usage:
+#   docker compose -f scripts/docker-compose-perf.yaml up -d
+#   docker compose -f scripts/docker-compose-perf.yaml down
+#
+# This starts:
+#   - VictoriaLogs on port 9428
+#   - Mailhog on ports 1025 (SMTP) and 8025 (Web UI)
+#
+
+services:
+  victorialogs:
+    image: victoriametrics/victoria-logs:latest
+    container_name: valerter-perf-vl
+    ports:
+      - "9428:9428"
+    volumes:
+      - victorialogs-data:/victoria-logs-data
+    command:
+      - "-storageDataPath=/victoria-logs-data"
+      - "-retentionPeriod=1d"
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: valerter-perf-mailhog
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+    restart: unless-stopped
+
+volumes:
+  victorialogs-data:
