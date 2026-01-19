@@ -46,11 +46,11 @@ rules:
           - cpu
           - message
           - timestamp
-    # Phase 2: Throttle activé - 5 notifications par host par minute
+    # Phase 1: No throttle (high limit)
     throttle:
       key: "{{ host }}"
-      count: 5
-      window: 60s
+      count: 100000
+      window: 1s
     notify:
       template: perf_alert
       destinations:
