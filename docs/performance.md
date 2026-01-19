@@ -1,9 +1,18 @@
-# Performance Test Report - WP2
+# Performance Test Report
 
 **Date:** 2026-01-19
-**Version tested:** valerter 1.0.0-rc.4
-**Branch:** feature/rc5-perf-testing
+**Version tested:** valerter 1.0.0-rc.5
 **Load generator:** Rust (`tools/load-generator`)
+
+## Test Environment
+
+| Component | Specification |
+|-----------|---------------|
+| **CPU** | Intel Core i7-14700 (20 cores) |
+| **RAM** | 32 GB |
+| **Storage** | Samsung 990 PRO NVMe 1TB |
+| **OS** | Linux (CachyOS 6.18) |
+| **VictoriaLogs** | Docker container (local) |
 
 ---
 
