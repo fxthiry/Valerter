@@ -209,7 +209,7 @@ impl NotificationWorker {
         for (dest_name, notifier_name, result) in results {
             match result {
                 Ok(()) => {
-                    tracing::debug!(
+                    tracing::info!(
                         notifier = %notifier_name,
                         rule_name = %payload.rule_name,
                         "Notification sent successfully"
