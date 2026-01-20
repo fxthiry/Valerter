@@ -21,7 +21,9 @@ metrics:
 | `valerter_alerts_passed_total` | `rule_name` | Alerts that passed throttling |
 | `valerter_alerts_dropped_total` | - | Alerts dropped (queue full, global counter) |
 | `valerter_alerts_failed_total` | `rule_name`, `notifier_name`, `notifier_type` | Alerts that permanently failed |
+| `valerter_email_recipient_errors_total` | `rule_name`, `notifier_name` | Email delivery failures per recipient |
 | `valerter_logs_matched_total` | `rule_name` | Logs matched by rule (before throttling) |
+| `valerter_notifier_config_errors_total` | `notifier`, `error_type` | Notifier configuration errors (e.g., env var resolution) |
 | `valerter_notify_errors_total` | `rule_name`, `notifier_name`, `notifier_type` | Notification send errors |
 | `valerter_parse_errors_total` | `rule_name`, `error_type` | Parsing errors |
 | `valerter_reconnections_total` | `rule_name` | VictoriaLogs reconnections |
