@@ -1,0 +1,62 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#                    VALERTER PERFORMANCE TEST CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Configuration for performance testing.
+# Use with: valerter --config scripts/perf-test-config.yaml
+#
+
+victorialogs:
+  url: "http://127.0.0.1:9428"
+
+defaults:
+  throttle:
+    count: 1000         # High limit for Phase 1 (no throttle)
+    window: 1s
+  timestamp_timezone: "Europe/Paris"
+
+templates:
+  perf_alert:
+    title: "CPU Alert: {{ host }}"
+    body: |
+      Host: {{ host }}
+      CPU: {{ cpu }}%
+      Message: {{ message }}
+    accent_color: "#e74c3c"
+
+notifiers:
+  # Mock Mattermost (run: python3 scripts/mock-mattermost.py)
+  mock-mattermost:
+    type: mattermost
+    webhook_url: "http://localhost:8065/hooks/test"
+
+  # Mock Webhook (run: python3 scripts/mock-webhook.py)
+  mock-webhook:
+    type: webhook
+    url: "http://localhost:8080/webhook"
+
+rules:
+  # Rule that matches load-generator output
+  - name: perf_test_rule
+    query: '_stream:{app="perf-test"} AND level:error'
+    parser:
+      json:
+        fields:
+          - host
+          - cpu
+          - message
+          - timestamp
+    # Phase 1: No throttle (high limit)
+    throttle:
+      key: "{{ host }}"
+      count: 100000
+      window: 1s
+    notify:
+      template: perf_alert
+      destinations:
+        - mock-mattermost
+        - mock-webhook
+
+metrics:
+  enabled: true
+  port: 9090

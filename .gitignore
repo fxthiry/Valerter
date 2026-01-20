@@ -1,5 +1,6 @@
 # Build artifacts
 /target
+/tools/*/target/
 
 # Local config (secrets)
 config/prod/

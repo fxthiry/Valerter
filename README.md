@@ -15,7 +15,7 @@
 
 ## What is Valerter?
 
-Valerter streams logs from VictoriaLogs in real-time and sends alerts with the **actual log content** — not just aggregated statistics.
+Valerter streams logs from VictoriaLogs in real-time and sends notifications with the actual log line plus extracted context (host, site, service, port, user, etc.). The goal is to put the key debugging context in the alert itself (full log line + fields), so you can start investigating right away.
 
 <p align="center">
   <img src="assets/svg/pipeline.svg" alt="Pipeline: VictoriaLogs → Parse → Throttle → Template → Notify" width="700">
@@ -23,18 +23,29 @@ Valerter streams logs from VictoriaLogs in real-time and sends alerts with the *
 
 ## Why Valerter?
 
-Unlike [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) which evaluates queries periodically and returns aggregated statistics, Valerter provides **real-time, per-event alerting**:
+Some alerts are about trends ("how many errors over 5 minutes"). Others are about a **critical event that just happened** and requires immediate action.
 
-|                   | vmalert                                 | Valerter                       |
-| ----------------- | --------------------------------------- | ------------------------------ |
-| **Mode**          | Periodic queries                        | Real-time streaming            |
-| **API**           | `/stats_query`                          | `/tail`                        |
-| **Alert content** | Aggregated stats ("500 errors in 5min") | **Full log line with context** |
-| **Latency**       | Evaluation interval (e.g., 1min)        | < 5 seconds                    |
+Valerter is built for the second category: must-not-miss events where you want the full raw log line and enough context to act immediately—without jumping into a log explorer first.
 
-**Use vmalert**: "More than 100 errors in the last 5 minutes"
+### When Valerter is the right tool
 
-**Use Valerter**: "Payment failed for user X: connection timeout to stripe.com"
+Use Valerter when the question is:
+- "Do I need to act on this immediately?"
+- "What exactly happened (full log line) and where?"
+
+**Examples:**
+- "BPDU Guard triggered: port disabled on CORE-SW-01 Gi1/0/24"
+- "Disk I/O error on db-prod-01: sda sector 22563104"
+- "OOM killer on worker-03: killed process nginx (pid 2603)"
+
+|                      | Valerter                          |
+| -------------------- | --------------------------------- |
+| **Mode**             | Real-time streaming               |
+| **VictoriaLogs API** | `/tail`                           |
+| **Alert content**    | Full log line + extracted context |
+| **Typical latency**  | < 5 seconds                       |
+
+See [Cisco Switches example](examples/cisco-switches/) for a complete implementation.
 
 ## Features
 
@@ -117,6 +128,7 @@ rules:
 - **[Configuration](docs/configuration.md)** — Full configuration reference
 - **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost setup
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
+- **[Performance](docs/performance.md)** — Benchmarks and capacity planning
 - **[Architecture](docs/architecture.md)** — How Valerter works
 - **[Examples](examples/)** — Real-world configurations
 

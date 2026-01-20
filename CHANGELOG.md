@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] - 2026-01-20
+
+**Final RC** - Hardening and observability improvements before 1.0.0 stable.
+
+### Added
+- **TCP keepalive** - Prevents silent connection drops on long-lived VictoriaLogs streams (60s keepalive on reqwest client)
+- **StreamBuffer size limit** - 1MB max line size with `valerter_lines_discarded_total{reason=oversized}` metric to prevent OOM from malformed input
+- **Strict config validation** - `deny_unknown_fields` rejects typos, URL format validation for VictoriaLogs and webhook endpoints
+- **Rust load-generator** - High-performance testing tool achieving 100k logs/sec for stress testing
+- **Comprehensive debug logging** - Strategic debug/trace logs across all modules for troubleshooting
+- **Performance test suite** - Load testing scripts and documented results (10k+ logs/sec sustained)
+
+### Fixed
+- **Tracing span propagation** - Use `instrument()` for async-safe span propagation in all notifier functions (engine, queue, mattermost, webhook, email)
+- **Notification success logging** - Promoted from debug to info level for production visibility
+- **Metrics label cleanup** - Removed unused `rule_name` label from `alerts_dropped_total` (global metric, not per-rule)
+- **RUST_LOG support** - Now properly respects environment variable for log filtering
+
+### Changed
+- **Documentation overhaul** - Rewrote README "Why Valerter" section, updated metrics docs with `valerter_email_recipient_errors_total` and `valerter_notifier_config_errors_total`, added performance report
+
 ## [1.0.0-rc.4] - 2026-01-16
 
 **Feature freeze** - From this release, only bug fixes until 1.0.0 stable. No new features or refactoring.
@@ -111,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.4...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.5...HEAD
+[1.0.0-rc.5]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.4...v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.2...v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.1...v1.0.0-rc.2

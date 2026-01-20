@@ -1,0 +1,82 @@
+# Test configuration for all 3 notifiers
+# Usage: cargo run -- --config scripts/test-notifiers/config-test-notifiers.yaml
+
+victorialogs:
+  url: http://localhost:9428
+
+defaults:
+  throttle:
+    count: 1
+    window: 1s
+  timestamp_timezone: Europe/Paris
+
+templates:
+  test-alert:
+    title: "Test Alert: {{ rule_name }}"
+    body: |
+      Alert triggered at {{ timestamp }}
+      Host: {{ host | default("unknown") }}
+      Message: {{ _msg | default("N/A") }}
+    body_html: |
+      <h2>Alert triggered at {{ timestamp }}</h2>
+      <p><strong>Host:</strong> {{ host | default("unknown") }}</p>
+      <p><strong>Message:</strong> {{ _msg | default("N/A") }}</p>
+    accent_color: "#FF5733"
+
+notifiers:
+  # Notifier 1: Mattermost (mock - will fail but we verify the attempt)
+  test-mattermost:
+    type: mattermost
+    webhook_url: http://localhost:18080/mattermost-hook
+
+  # Notifier 2: Webhook (mock server)
+  test-webhook:
+    type: webhook
+    url: http://localhost:18080/webhook
+    method: POST
+    headers:
+      Content-Type: application/json
+      X-Custom-Header: valerter-test
+    body_template: |
+      {
+        "rule": "{{ rule_name }}",
+        "title": "{{ title }}",
+        "body": "{{ body }}",
+        "timestamp": "{{ timestamp }}"
+      }
+
+  # Notifier 3: Email via Mailhog
+  test-email:
+    type: email
+    smtp:
+      host: localhost
+      port: 1025
+      tls: none
+      tls_verify: false
+    from: valerter-test@example.com
+    to:
+      - ops@example.com
+      - admin@example.com
+    subject_template: "[VALERTER] {{ rule_name }}: {{ title }}"
+
+rules:
+  - name: test-all-notifiers
+    query: '_stream:{app="test-notifiers"}'
+    parser:
+      json:
+        fields:
+          - level
+          - host
+          - message
+    throttle:
+      count: 1
+      window: 1s
+    notify:
+      template: test-alert
+      destinations:
+        - test-mattermost
+        - test-webhook
+        - test-email
+
+metrics:
+  enabled: false

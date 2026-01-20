@@ -1,6 +1,6 @@
 [package]
 name = "valerter"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 edition = "2024"
 description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"
@@ -58,6 +58,7 @@ tokio-test = "0.4"
 portpicker = "0.1"
 serial_test = "3.2"
 temp-env = "0.3"
+tempfile = "3.20"
 
 # Debian packaging configuration
 [package.metadata.deb]

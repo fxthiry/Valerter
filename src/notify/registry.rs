@@ -181,7 +181,7 @@ impl NotifierRegistry {
                     http_client.clone(),
                 );
 
-                tracing::info!(
+                tracing::debug!(
                     notifier_name = %name,
                     notifier_type = "mattermost",
                     channel = ?mm_config.channel,
@@ -193,7 +193,7 @@ impl NotifierRegistry {
             NotifierConfig::Webhook(wh_config) => {
                 let notifier = WebhookNotifier::from_config(name, wh_config, http_client.clone())?;
 
-                tracing::info!(
+                tracing::debug!(
                     notifier_name = %name,
                     notifier_type = "webhook",
                     method = %wh_config.method,
@@ -205,7 +205,7 @@ impl NotifierRegistry {
             NotifierConfig::Email(email_config) => {
                 let notifier = EmailNotifier::from_config(name, email_config, config_dir)?;
 
-                tracing::info!(
+                tracing::debug!(
                     notifier_name = %name,
                     notifier_type = "email",
                     from = %email_config.from,

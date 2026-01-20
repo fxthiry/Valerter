@@ -32,6 +32,13 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates a URL string.
+pub(crate) fn validate_url(url: &str) -> Result<(), String> {
+    reqwest::Url::parse(url)
+        .map(|_| ())
+        .map_err(|e| format!("invalid URL '{}': {}", url, e))
+}
+
 /// Validates a hex color string in format #rrggbb.
 pub(crate) fn validate_hex_color(color: &str) -> Result<(), String> {
     static HEX_COLOR_REGEX: LazyLock<Regex> =

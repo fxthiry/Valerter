@@ -2,7 +2,7 @@
 
 use super::notifiers::{NotifiersConfig, default_true};
 use super::secret::SecretString;
-use super::validation::{validate_hex_color, validate_jinja_template};
+use super::validation::{validate_hex_color, validate_jinja_template, validate_url};
 use crate::error::ConfigError;
 use regex::Regex;
 use serde::Deserialize;
@@ -15,6 +15,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/valerter/config.yaml";
 
 /// Main configuration structure for valerter.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// VictoriaLogs connection settings.
     pub victorialogs: VictoriaLogsConfig,
@@ -36,6 +37,7 @@ pub struct Config {
 
 /// VictoriaLogs connection configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VictoriaLogsConfig {
     /// URL of the VictoriaLogs instance.
     pub url: String,
@@ -92,6 +94,7 @@ impl<'de> Deserialize<'de> for BasicAuthConfig {
 
 /// TLS configuration for VictoriaLogs connection.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default = "default_true")]
     pub verify: bool,
@@ -99,6 +102,7 @@ pub struct TlsConfig {
 
 /// Metrics exposition configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Whether metrics exposition is enabled.
     #[serde(default = "default_true")]
@@ -123,6 +127,7 @@ impl Default for MetricsConfig {
 
 /// Default configuration values.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultsConfig {
     pub throttle: ThrottleConfig,
     /// Timezone for formatted timestamps (e.g., "UTC", "Europe/Paris").
@@ -136,6 +141,7 @@ fn default_timestamp_timezone() -> String {
 
 /// Throttle configuration for rate limiting.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThrottleConfig {
     #[serde(default)]
     pub key: Option<String>,
@@ -146,6 +152,7 @@ pub struct ThrottleConfig {
 
 /// Template configuration for message formatting.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateConfig {
     pub title: String,
     pub body: String,
@@ -157,6 +164,7 @@ pub struct TemplateConfig {
 
 /// Alert rule configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub name: String,
     #[serde(default = "default_true")]
@@ -171,6 +179,7 @@ pub struct RuleConfig {
 /// Rule configuration without the `name` field, for deserializing `.d/` files.
 /// In `.d/` files, the rule name is the YAML key, not a field.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleConfigWithoutName {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -197,6 +206,7 @@ impl RuleConfigWithoutName {
 
 /// Parser configuration for extracting data from log lines.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParserConfig {
     #[serde(default)]
     pub regex: Option<String>,
@@ -206,6 +216,7 @@ pub struct ParserConfig {
 
 /// JSON parser configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonParserConfig {
     pub fields: Vec<String>,
 }
@@ -456,6 +467,43 @@ impl Config {
     /// Possible errors: `InvalidRegex`, `InvalidTemplate`, `ValidationError` (for invalid colors).
     pub fn validate(&self) -> Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
+
+        // ===== URL validations =====
+
+        // Validate victorialogs.url
+        if let Err(e) = validate_url(&self.victorialogs.url) {
+            errors.push(ConfigError::ValidationError(format!(
+                "victorialogs.url: {}",
+                e
+            )));
+        }
+
+        // Validate notifier URLs
+        if let Some(notifiers) = &self.notifiers {
+            for (name, notifier) in notifiers {
+                match notifier {
+                    super::notifiers::NotifierConfig::Mattermost(cfg) => {
+                        if let Err(e) = validate_url(&cfg.webhook_url) {
+                            errors.push(ConfigError::ValidationError(format!(
+                                "notifier '{}': webhook_url: {}",
+                                name, e
+                            )));
+                        }
+                    }
+                    super::notifiers::NotifierConfig::Webhook(cfg) => {
+                        if let Err(e) = validate_url(&cfg.url) {
+                            errors.push(ConfigError::ValidationError(format!(
+                                "notifier '{}': url: {}",
+                                name, e
+                            )));
+                        }
+                    }
+                    super::notifiers::NotifierConfig::Email(_) => {
+                        // Email notifier doesn't have URLs to validate
+                    }
+                }
+            }
+        }
 
         // ===== Mandatory config sections (after .d/ merge) =====
 

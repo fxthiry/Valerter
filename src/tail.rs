@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::{BasicAuthConfig, SecretString, TlsConfig};
 use crate::error::StreamError;
@@ -43,12 +43,16 @@ use crate::stream_buffer::StreamBuffer;
 // Note: No read_timeout - VictoriaLogs tail endpoint doesn't send keepalives,
 // so we rely on CancellationToken for shutdown. Connection health is implicit
 // (if VL dies, the stream ends and we reconnect via backoff).
+// TCP Keepalive is enabled (TCP_KEEPALIVE) to detect dead connections through firewalls/NAT.
 
 /// Base delay for exponential backoff (AD-07).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// Maximum delay for exponential backoff (AD-07).
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// TCP keepalive interval to detect dead connections through firewalls/NAT.
+pub const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 /// Configuration for connecting to VictoriaLogs tail endpoint.
 #[derive(Debug, Clone)]
@@ -94,6 +98,7 @@ impl TailClient {
         }
 
         let client = builder
+            .tcp_keepalive(TCP_KEEPALIVE)
             .build()
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
@@ -194,12 +199,26 @@ impl TailClient {
                 chunk_result.map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
             // Push chunk to buffer and extract complete lines
-            self.buffer.push(&chunk);
+            if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk) {
+                warn!(
+                    rule_name = %rule_name,
+                    size_bytes = size,
+                    max_bytes = max,
+                    "Discarding oversized log line, buffer cleared"
+                );
+                metrics::counter!(
+                    "valerter_lines_discarded_total",
+                    "rule_name" => rule_name.to_string(),
+                    "reason" => "oversized"
+                )
+                .increment(1);
+                continue;
+            }
             let lines = self.buffer.drain_complete_lines()?;
 
             for line in lines {
                 if !line.is_empty() {
-                    info!(rule_name = %rule_name, "Received log line");
+                    trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
                     all_lines.push(line);
                 }
             }
@@ -274,7 +293,7 @@ impl TailClient {
 
         loop {
             let url = self.build_url();
-            info!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
+            debug!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
 
             // Start timing for query_duration metric
             let request_start = Instant::now();
@@ -282,7 +301,7 @@ impl TailClient {
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
-                    info!(rule_name = %rule_name, status = %resp.status(), "Connection successful, starting to stream");
+                    info!(rule_name = %rule_name, status = %resp.status(), "Connected to VictoriaLogs");
                     // Connection successful - mark VictoriaLogs as up
                     metrics::gauge!(
                         "valerter_victorialogs_up",
@@ -368,12 +387,27 @@ impl TailClient {
                         )
                         .set(now);
 
-                        self.buffer.push(&chunk);
+                        if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk)
+                        {
+                            warn!(
+                                rule_name = %rule_name,
+                                size_bytes = size,
+                                max_bytes = max,
+                                "Discarding oversized log line, buffer cleared"
+                            );
+                            metrics::counter!(
+                                "valerter_lines_discarded_total",
+                                "rule_name" => rule_name.to_string(),
+                                "reason" => "oversized"
+                            )
+                            .increment(1);
+                            continue;
+                        }
                         let lines = self.buffer.drain_complete_lines()?;
 
                         for line in lines {
                             if !line.is_empty() {
-                                info!(rule_name = %rule_name, "Received log line");
+                                trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
                                 line_handler(line).await?;
                             }
                         }
@@ -400,7 +434,7 @@ impl TailClient {
             // Stream ended (server closed connection) - reconnect
             if !had_failure {
                 // Normal stream end, not a failure - still need to reconnect
-                info!(rule_name = %rule_name, "Stream ended, reconnecting");
+                debug!(rule_name = %rule_name, "Stream ended, reconnecting");
             }
             had_failure = true;
         }
@@ -723,19 +757,21 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // Simulate receiving chunked JSON lines like VictoriaLogs sends
-        buffer.push(br#"{"_msg":"test1"}"#);
-        buffer.push(b"\n");
+        buffer.push(br#"{"_msg":"test1"}"#).unwrap();
+        buffer.push(b"\n").unwrap();
 
         let lines = buffer.drain_complete_lines().unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], r#"{"_msg":"test1"}"#);
 
         // Simulate multiple lines in one chunk
-        buffer.push(
-            br#"{"_msg":"test2"}
+        buffer
+            .push(
+                br#"{"_msg":"test2"}
 {"_msg":"test3"}
 "#,
-        );
+            )
+            .unwrap();
 
         let lines = buffer.drain_complete_lines().unwrap();
         assert_eq!(lines.len(), 2);
@@ -748,14 +784,14 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // Partial JSON (no newline yet)
-        buffer.push(br#"{"_msg":"partial"#);
+        buffer.push(br#"{"_msg":"partial"#).unwrap();
 
         let lines = buffer.drain_complete_lines().unwrap();
         assert!(lines.is_empty()); // No complete lines yet
 
         // Complete it
-        buffer.push(br#""}"#);
-        buffer.push(b"\n");
+        buffer.push(br#""}"#).unwrap();
+        buffer.push(b"\n").unwrap();
 
         let lines = buffer.drain_complete_lines().unwrap();
         assert_eq!(lines.len(), 1);

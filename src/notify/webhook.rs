@@ -14,6 +14,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Backoff base delay for webhook retries (AD-07).
 const WEBHOOK_BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -247,111 +248,115 @@ impl Notifier for WebhookNotifier {
             rule_name = %alert.rule_name,
             notifier_name = %self.name
         );
-        let _guard = span.enter();
 
-        // Build request body
-        let body = match &self.body_template_source {
-            Some(template_source) => render_body_template(template_source, alert)?,
-            None => {
-                let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
-                serde_json::to_string(&payload).map_err(|e| {
-                    NotifyError::SendFailed(format!("JSON serialization error: {}", e))
-                })?
-            }
-        };
+        async {
+            // Build request body
+            let body = match &self.body_template_source {
+                Some(template_source) => render_body_template(template_source, alert)?,
+                None => {
+                    let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
+                    serde_json::to_string(&payload).map_err(|e| {
+                        NotifyError::SendFailed(format!("JSON serialization error: {}", e))
+                    })?
+                }
+            };
+            tracing::trace!(body_len = body.len(), "Request body built");
 
-        // Retry loop with exponential backoff (AD-07)
-        for attempt in 0..WEBHOOK_MAX_RETRIES {
-            match self
-                .client
-                .request(self.method.clone(), self.url.expose())
-                .headers(self.headers.clone())
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    tracing::info!("Webhook alert sent successfully");
-                    metrics::counter!(
-                        "valerter_alerts_sent_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "webhook"
-                    )
-                    .increment(1);
-                    return Ok(());
+            // Retry loop with exponential backoff (AD-07)
+            for attempt in 0..WEBHOOK_MAX_RETRIES {
+                match self
+                    .client
+                    .request(self.method.clone(), self.url.expose())
+                    .headers(self.headers.clone())
+                    .body(body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::debug!("Webhook alert sent successfully");
+                        metrics::counter!(
+                            "valerter_alerts_sent_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "webhook"
+                        )
+                        .increment(1);
+                        return Ok(());
+                    }
+                    Ok(response) if response.status().is_client_error() => {
+                        // 4xx errors: don't retry (AC5)
+                        let status = response.status();
+                        tracing::error!(
+                            status = %status,
+                            "Webhook returned client error, not retrying"
+                        );
+                        metrics::counter!(
+                            "valerter_notify_errors_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "webhook"
+                        )
+                        .increment(1);
+                        // Permanent failure - count as failed alert
+                        metrics::counter!(
+                            "valerter_alerts_failed_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "webhook"
+                        )
+                        .increment(1);
+                        return Err(NotifyError::SendFailed(format!("client error: {}", status)));
+                    }
+                    Ok(response) => {
+                        // 5xx errors: retry (AC5)
+                        tracing::warn!(
+                            attempt = attempt,
+                            status = %response.status(),
+                            "Webhook returned server error, retrying"
+                        );
+                    }
+                    Err(e) => {
+                        // Network errors: retry (AC5)
+                        tracing::warn!(
+                            attempt = attempt,
+                            error = %e,
+                            "Failed to send webhook, retrying"
+                        );
+                    }
                 }
-                Ok(response) if response.status().is_client_error() => {
-                    // 4xx errors: don't retry (AC5)
-                    let status = response.status();
-                    tracing::error!(
-                        status = %status,
-                        "Webhook returned client error, not retrying"
-                    );
-                    metrics::counter!(
-                        "valerter_notify_errors_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "webhook"
-                    )
-                    .increment(1);
-                    // Permanent failure - count as failed alert
-                    metrics::counter!(
-                        "valerter_alerts_failed_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "webhook"
-                    )
-                    .increment(1);
-                    return Err(NotifyError::SendFailed(format!("client error: {}", status)));
-                }
-                Ok(response) => {
-                    // 5xx errors: retry (AC5)
-                    tracing::warn!(
-                        attempt = attempt,
-                        status = %response.status(),
-                        "Webhook returned server error, retrying"
-                    );
-                }
-                Err(e) => {
-                    // Network errors: retry (AC5)
-                    tracing::warn!(
-                        attempt = attempt,
-                        error = %e,
-                        "Failed to send webhook, retrying"
-                    );
+
+                // Apply backoff delay before next retry (except after last attempt)
+                if attempt < WEBHOOK_MAX_RETRIES - 1 {
+                    let delay = backoff_delay(attempt, WEBHOOK_BACKOFF_BASE, WEBHOOK_BACKOFF_MAX);
+                    tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
+                    tokio::time::sleep(delay).await;
                 }
             }
 
-            // Apply backoff delay before next retry (except after last attempt)
-            if attempt < WEBHOOK_MAX_RETRIES - 1 {
-                let delay = backoff_delay(attempt, WEBHOOK_BACKOFF_BASE, WEBHOOK_BACKOFF_MAX);
-                tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
-                tokio::time::sleep(delay).await;
-            }
+            // All retries exhausted
+            tracing::error!(
+                max_retries = WEBHOOK_MAX_RETRIES,
+                "Failed to send webhook alert after all retries"
+            );
+            metrics::counter!(
+                "valerter_notify_errors_total",
+                "rule_name" => alert.rule_name.clone(),
+                "notifier_name" => self.name.clone(),
+                "notifier_type" => "webhook"
+            )
+            .increment(1);
+            // Permanent failure after retries exhausted
+            metrics::counter!(
+                "valerter_alerts_failed_total",
+                "rule_name" => alert.rule_name.clone(),
+                "notifier_name" => self.name.clone(),
+                "notifier_type" => "webhook"
+            )
+            .increment(1);
+            Err(NotifyError::MaxRetriesExceeded)
         }
-
-        // All retries exhausted
-        tracing::error!(
-            max_retries = WEBHOOK_MAX_RETRIES,
-            "Failed to send webhook alert after all retries"
-        );
-        metrics::counter!(
-            "valerter_notify_errors_total",
-            "rule_name" => alert.rule_name.clone(),
-            "notifier_name" => self.name.clone(),
-            "notifier_type" => "webhook"
-        )
-        .increment(1);
-        // Permanent failure after retries exhausted
-        metrics::counter!(
-            "valerter_alerts_failed_total",
-            "rule_name" => alert.rule_name.clone(),
-            "notifier_name" => self.name.clone(),
-            "notifier_type" => "webhook"
-        )
-        .increment(1);
-        Err(NotifyError::MaxRetriesExceeded)
+        .instrument(span)
+        .await
     }
 }
 
@@ -813,5 +818,66 @@ mod tests {
     fn validate_body_template_rejects_invalid_template() {
         let result = validate_body_template("{% if unclosed");
         assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // Invalid header tests (config validation)
+    // ===================================================================
+
+    #[test]
+    fn from_config_rejects_invalid_header_name() {
+        let config = WebhookNotifierConfig {
+            url: "https://api.example.com/alerts".to_string(),
+            method: "POST".to_string(),
+            headers: {
+                let mut h = HashMap::new();
+                // Header names cannot contain spaces or special chars
+                h.insert("Invalid Header Name".to_string(), "value".to_string());
+                h
+            },
+            body_template: None,
+        };
+
+        let client = reqwest::Client::new();
+        let result = WebhookNotifier::from_config("bad-header-webhook", &config, client);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-header-webhook");
+                assert!(message.contains("invalid header name"));
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_header_value() {
+        let config = WebhookNotifierConfig {
+            url: "https://api.example.com/alerts".to_string(),
+            method: "POST".to_string(),
+            headers: {
+                let mut h = HashMap::new();
+                // Header values cannot contain control characters (e.g., newlines)
+                h.insert("X-Custom".to_string(), "value\nwith\nnewlines".to_string());
+                h
+            },
+            body_template: None,
+        };
+
+        let client = reqwest::Client::new();
+        let result = WebhookNotifier::from_config("bad-value-webhook", &config, client);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-value-webhook");
+                assert!(message.contains("invalid header value"));
+                assert!(message.contains("X-Custom"));
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
     }
 }

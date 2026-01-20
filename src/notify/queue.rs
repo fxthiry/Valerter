@@ -6,6 +6,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::{AlertPayload, NotifierRegistry};
 use crate::error::QueueError;
@@ -47,10 +48,13 @@ impl NotificationQueue {
     /// * `Ok(())` - Alert queued successfully.
     /// * `Err(QueueError::Closed)` - No active receivers.
     pub fn send(&self, payload: AlertPayload) -> Result<(), QueueError> {
+        tracing::trace!(rule_name = %payload.rule_name, "Enqueueing alert");
         self.tx.send(payload).map_err(|_| QueueError::Closed)?;
 
         // Update queue size metric (AD-05)
-        metrics::gauge!("valerter_queue_size").set(self.tx.len() as f64);
+        let queue_size = self.tx.len();
+        tracing::trace!(queue_size = queue_size, "Alert enqueued");
+        metrics::gauge!("valerter_queue_size").set(queue_size as f64);
 
         Ok(())
     }
@@ -110,7 +114,7 @@ impl NotificationWorker {
     ///
     /// * `cancel` - Cancellation token for graceful shutdown.
     pub async fn run(&mut self, cancel: CancellationToken) {
-        tracing::info!("Notification worker started");
+        tracing::debug!("Notification worker started");
 
         loop {
             tokio::select! {
@@ -135,13 +139,13 @@ impl NotificationWorker {
                             metrics::gauge!("valerter_queue_size").set(self.tx.len() as f64);
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Notification queue closed");
+                            tracing::debug!("Notification queue closed");
                             return;
                         }
                     }
                 }
                 _ = cancel.cancelled() => {
-                    tracing::info!("Notification worker shutting down gracefully");
+                    tracing::debug!("Notification worker shutting down gracefully");
                     return;
                 }
             }
@@ -157,20 +161,20 @@ impl NotificationWorker {
             "process_notification",
             rule_name = %payload.rule_name
         );
-        let _guard = span.enter();
 
-        // Use configured destinations (validated at startup to be non-empty)
-        let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
+        async {
+            // Use configured destinations (validated at startup to be non-empty)
+            let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
 
-        tracing::debug!(
-            destination_count = destinations.len(),
-            destinations = ?destinations,
-            "Processing alert with fan-out"
-        );
+            tracing::debug!(
+                destination_count = destinations.len(),
+                destinations = ?destinations,
+                "Processing alert with fan-out"
+            );
 
-        // AC #2: Send to all destinations in PARALLEL
-        // AC #7: each destination failure is independent
-        let futures: Vec<_> = destinations
+            // AC #2: Send to all destinations in PARALLEL
+            // AC #7: each destination failure is independent
+            let futures: Vec<_> = destinations
             .iter()
             .filter_map(|dest_name| {
                 match self.registry.get(dest_name) {
@@ -199,31 +203,34 @@ impl NotificationWorker {
             })
             .collect();
 
-        // Execute all sends in parallel and collect results
-        let results = join_all(futures).await;
+            // Execute all sends in parallel and collect results
+            let results = join_all(futures).await;
 
-        // Log results (AC #7: each result logged independently)
-        for (dest_name, notifier_name, result) in results {
-            match result {
-                Ok(()) => {
-                    tracing::debug!(
-                        notifier = %notifier_name,
-                        rule_name = %payload.rule_name,
-                        "Notification sent successfully"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        notifier = %notifier_name,
-                        destination = %dest_name,
-                        rule_name = %payload.rule_name,
-                        "Failed to send notification after all retries"
-                    );
-                    // Metrics are already recorded in the notifier implementation
+            // Log results (AC #7: each result logged independently)
+            for (dest_name, notifier_name, result) in results {
+                match result {
+                    Ok(()) => {
+                        tracing::info!(
+                            notifier = %notifier_name,
+                            rule_name = %payload.rule_name,
+                            "Notification sent successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            notifier = %notifier_name,
+                            destination = %dest_name,
+                            rule_name = %payload.rule_name,
+                            "Failed to send notification after all retries"
+                        );
+                        // Metrics are already recorded in the notifier implementation
+                    }
                 }
             }
         }
+        .instrument(span)
+        .await
     }
 }
 

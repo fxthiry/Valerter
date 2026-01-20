@@ -164,9 +164,13 @@ impl RuleParser {
     /// - `ParseError::InvalidJson` if the line is not valid JSON
     /// - `ParseError::NoMatch` if regex is configured but doesn't match `_msg`
     pub fn parse(&self, line: &str) -> Result<Value, ParseError> {
+        tracing::trace!(line_len = line.len(), "Starting parse");
+
         // Step 1: Parse the complete JSON - all fields are already at root
         let mut log: Map<String, Value> =
             serde_json::from_str(line).map_err(|e| ParseError::InvalidJson(e.to_string()))?;
+
+        tracing::trace!(field_count = log.len(), "JSON parsed");
 
         // Step 2: If regex configured, apply to _msg
         if let Some(ref regex) = self.regex {
@@ -175,6 +179,7 @@ impl RuleParser {
             })?;
 
             let extracted = self.parse_regex(regex, msg)?;
+            tracing::debug!(extracted_count = extracted.len(), "Regex matched");
             for (key, value) in extracted {
                 log.insert(key, value);
             }
@@ -185,6 +190,7 @@ impl RuleParser {
         if let Some(ref fields) = self.json_fields {
             let root_value = Value::Object(log.clone());
             let extracted = self.extract_json_fields(&root_value, fields);
+            tracing::debug!(extracted_count = extracted.len(), "JSON fields extracted");
             for (key, value) in extracted {
                 log.insert(key, value);
             }
@@ -193,6 +199,7 @@ impl RuleParser {
         // Step 4: Parse nested JSON strings (e.g., StringInserts)
         self.parse_nested_json_strings(&mut log);
 
+        tracing::trace!(total_fields = log.len(), "Parse complete");
         Ok(Value::Object(log))
     }
 

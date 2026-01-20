@@ -148,12 +148,18 @@ impl Throttler {
     pub fn check(&self, fields: &Value) -> ThrottleResult {
         // Render throttle key from template (FR22)
         let key = self.render_key(fields);
+        tracing::trace!(throttle_key = %key, "Checking throttle");
 
         // Get or create entry in cache
         let entry = self
             .cache
             .get_with(key.clone(), || Arc::new(AtomicU32::new(0)));
         let count = entry.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::trace!(
+            count = count,
+            max_count = self.max_count,
+            "Throttle count updated"
+        );
 
         // L1: Pre-convert rule_name to String once for metrics (required for 'static)
         let rule_name_str = self.rule_name.to_string();
@@ -197,7 +203,10 @@ impl Throttler {
             Some(template) => {
                 // H1 fix: Use pre-created jinja_env instead of creating new one
                 match self.jinja_env.render_str(template, fields) {
-                    Ok(key) => key,
+                    Ok(key) => {
+                        tracing::trace!(rendered_key = %key, "Throttle key rendered");
+                        key
+                    }
                     Err(e) => {
                         // Template error - log and use fallback
                         tracing::warn!(
@@ -221,8 +230,9 @@ impl Throttler {
     ///
     /// Called after VictoriaLogs reconnection (FR7) to clear stale state.
     pub fn reset(&self) {
+        let entry_count = self.cache.entry_count();
         self.cache.invalidate_all();
-        tracing::info!(rule_name = %self.rule_name, "Throttle cache reset");
+        tracing::debug!(rule_name = %self.rule_name, entries_cleared = entry_count, "Throttle cache reset");
     }
 }
 

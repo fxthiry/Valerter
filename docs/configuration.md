@@ -309,17 +309,19 @@ notifiers:
     webhook_url: "${MATTERMOST_WEBHOOK}"
 ```
 
-Variables are resolved at startup from the process environment.
+Variables are resolved at startup from the process environment. You can use **any environment variable** - there is no predefined list. Common examples:
 
-## Environment Variables
+- `${VL_USER}`, `${VL_PASS}` - VictoriaLogs credentials
+- `${SMTP_USER}`, `${SMTP_PASSWORD}` - Email credentials
+- `${SLACK_WEBHOOK_URL}`, `${PAGERDUTY_TOKEN}` - Notification services
+
+## Runtime Environment Variables
+
+These variables are read directly by the process (not substituted in config):
 
 | Variable | Description |
 |----------|-------------|
-| `VL_USER` | VictoriaLogs Basic Auth username |
-| `VL_PASS` | VictoriaLogs Basic Auth password |
-| `SMTP_USER` | SMTP authentication username |
-| `SMTP_PASSWORD` | SMTP authentication password |
-| `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| `RUST_LOG` | Log level: `error`, `warn`, `info` (default), `debug`, `trace` |
 | `LOG_FORMAT` | Output format: `text` (default), `json` |
 
 ## CLI Options

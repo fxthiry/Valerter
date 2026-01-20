@@ -123,6 +123,8 @@ impl TemplateEngine {
         template_name: &str,
         fields: &Value,
     ) -> Result<RenderedMessage, TemplateError> {
+        tracing::trace!(template_name = %template_name, "Starting template render");
+
         // Look up template
         let template =
             self.templates
@@ -144,6 +146,12 @@ impl TemplateEngine {
 
         // accent_color is passed through (no template rendering)
         // It is a static value from config
+        tracing::trace!(
+            title_len = title.len(),
+            body_len = body.len(),
+            has_body_html = body_html.is_some(),
+            "Template rendered successfully"
+        );
         Ok(RenderedMessage {
             title,
             body,
@@ -197,7 +205,10 @@ impl TemplateEngine {
         rule_name: &str,
     ) -> RenderedMessage {
         match self.render(template_name, fields) {
-            Ok(msg) => msg,
+            Ok(msg) => {
+                tracing::trace!(rule_name = %rule_name, "Template render successful");
+                msg
+            }
             Err(e) => {
                 tracing::warn!(
                     rule_name = %rule_name,
