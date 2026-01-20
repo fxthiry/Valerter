@@ -8,6 +8,42 @@ Valerter is a real-time log alerting daemon that streams logs from VictoriaLogs 
 
 ![Pipeline: VictoriaLogs → Parse → Throttle → Template → Notify](../assets/svg/pipeline.svg)
 
+## Project Structure
+
+```
+src/
+├── main.rs              # Entry point, startup, shutdown
+├── lib.rs               # Library root, module re-exports
+├── cli.rs               # CLI argument parsing (clap)
+├── engine.rs            # RuleEngine - orchestrates rule tasks
+├── error.rs             # Error types (thiserror)
+├── tail.rs              # VictoriaLogs streaming client
+├── parser.rs            # Regex/JSON field extraction
+├── throttle.rs          # LRU cache-based rate limiting
+├── template.rs          # Jinja2 templating (minijinja)
+├── stream_buffer.rs     # UTF-8 safe NDJSON buffering
+├── metrics.rs           # Prometheus metrics server
+├── config/              # Configuration module
+│   ├── mod.rs           # Module root
+│   ├── types.rs         # Config, RuleConfig, etc.
+│   ├── notifiers.rs     # Notifier-specific configs
+│   ├── runtime.rs       # Compiled runtime config
+│   ├── validation.rs    # Validation functions
+│   ├── env.rs           # Environment variable resolution
+│   ├── secret.rs        # SecretString for sensitive values
+│   └── tests.rs         # Config tests
+└── notify/              # Notification module
+    ├── mod.rs           # Module root
+    ├── traits.rs        # Notifier async trait
+    ├── registry.rs      # NotifierRegistry
+    ├── payload.rs       # AlertPayload structure
+    ├── queue.rs         # NotificationQueue + Worker
+    ├── mattermost.rs    # Mattermost notifier
+    ├── email.rs         # Email notifier (SMTP)
+    ├── webhook.rs       # Webhook notifier
+    └── tests.rs         # Notify tests
+```
+
 ## Pipeline Stages
 
 ### 1. Tail (Streaming)
@@ -47,34 +83,38 @@ Renders the final message using Jinja2 templates (via minijinja):
 
 ### 5. Notify
 
-Sends alerts to configured destinations:
+Sends alerts to configured destinations via `NotifierRegistry`:
 
-- **Fan-out:** One alert can go to multiple notifiers in parallel
+- **Fan-out:** One alert can go to multiple notifiers in parallel (`join_all`)
 - **Retry:** Exponential backoff (500ms → 5s, max 3 retries)
 - **Drop Oldest:** If queue is full, oldest alerts are dropped (not newest)
+- **Notifier types:** Mattermost, Email (SMTP), Webhook (generic HTTP)
+- **Timestamps:** `log_timestamp` (ISO 8601) and `log_timestamp_formatted` (human-readable with timezone)
 
 ## Concurrency Model
 
 ```
 main.rs
     │
-    ├── MetricsServer (tokio task)
+    ├── MetricsServer::run() ────────────────► :9090/metrics
     │
-    ├── NotificationWorker (tokio task)
-    │       └── consumes from broadcast queue
+    ├── NotificationWorker::run() ───────────► consumes from bounded queue
     │
-    └── RuleEngine
-            ├── Rule 1 (tokio task) ──► tail → parse → throttle → template → queue
-            ├── Rule 2 (tokio task) ──► tail → parse → throttle → template → queue
-            └── Rule N (tokio task) ──► ...
+    └── RuleEngine::run()
+            │
+            └── JoinSet<()>
+                    ├── rule_task("rule-1") ──► tail → parse → throttle → template → queue
+                    ├── rule_task("rule-2") ──► tail → parse → throttle → template → queue
+                    └── rule_task("rule-N") ──► ...
 ```
 
 **Key properties:**
 
-- **1 task per rule:** Rules are fully isolated
+- **1 task per rule:** Rules are fully isolated via `JoinSet`
 - **Error isolation:** One rule's failure doesn't affect others
-- **Panic recovery:** Panicked rules are auto-restarted after 5 seconds
-- **Graceful shutdown:** All tasks respect the cancellation token
+- **Panic recovery:** Panicked rules are respawned after 5s delay (`PANIC_RESTART_DELAY`)
+- **Graceful shutdown:** All tasks respect the `CancellationToken`
+- **Metric:** `valerter_rule_panics_total{rule_name}` tracks panics per rule
 
 ## Reconnection Strategy
 
@@ -89,23 +129,52 @@ When VictoriaLogs connection fails:
 
 Uses Tokio's `broadcast` channel with ring buffer semantics:
 
-- **Capacity:** 100 alerts (configurable via code)
-- **Drop Oldest:** When full, oldest alerts are overwritten
-- **Metric:** `valerter_alerts_dropped_total` tracks dropped alerts
+- **Capacity:** 100 alerts (constant `DEFAULT_QUEUE_CAPACITY`)
+- **Drop Oldest:** When full, oldest alerts are overwritten (native broadcast behavior)
+- **Metric:** `valerter_alerts_dropped_total` tracks dropped alerts globally via `RecvError::Lagged(n)`
 - **Non-blocking:** Producers never block when queue is full
+- **Fan-out:** `NotificationWorker` sends to ALL destinations in parallel via `join_all`
+
+```
+RuleEngine (producers)              NotificationWorker (consumer)
+    │                                       │
+    ├── rule_task ─┐                        │
+    ├── rule_task ──┼── broadcast::Sender ──┼── broadcast::Receiver
+    └── rule_task ─┘                        │
+                                            ▼
+                                    NotifierRegistry
+                                       ├── mattermost-ops
+                                       ├── email-alerts
+                                       └── webhook-pagerduty
+```
 
 ## Fail-Fast Validation
 
-At startup, Valerter validates:
+At startup, Valerter validates (in order):
 
-1. **YAML syntax** - Config file is valid YAML
-2. **Required fields** - All mandatory fields present
-3. **Template syntax** - All templates compile
-4. **Notifier config** - URLs, credentials resolve correctly
-5. **Destinations exist** - Rule destinations match notifier names
-6. **Email body_html** - Templates used with email have `body_html`
+1. **YAML syntax** — Config file is valid YAML
+2. **Required fields** — All mandatory fields present
+3. **Template syntax** — All templates compile (minijinja)
+4. **Notifier config** — URLs, credentials, env vars resolve correctly
+5. **Destinations exist** — Rule destinations match notifier names in registry
+6. **Email body_html** — Templates used with email destinations have `body_html`
+7. **Mattermost channel warning** — Warns if `mattermost_channel` set but no Mattermost notifier in destinations
 
 If any validation fails, Valerter exits immediately with a clear error message.
+
+### Multi-File Configuration
+
+Config can be split across multiple files:
+
+```
+/etc/valerter/
+├── config.yaml         # Main config (victorialogs, defaults, metrics)
+├── rules.d/            # Rules as HashMap (name: config)
+├── templates.d/        # Templates as HashMap
+└── notifiers.d/        # Notifiers as HashMap
+```
+
+Files are loaded alphabetically. Duplicate names across files cause startup failure.
 
 ## Metrics Pipeline
 

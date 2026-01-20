@@ -19,7 +19,7 @@ metrics:
 | `valerter_alerts_sent_total` | `rule_name`, `notifier_name`, `notifier_type` | Alerts sent successfully |
 | `valerter_alerts_throttled_total` | `rule_name` | Alerts blocked by throttling |
 | `valerter_alerts_passed_total` | `rule_name` | Alerts that passed throttling |
-| `valerter_alerts_dropped_total` | `rule_name` | Alerts dropped (queue full) |
+| `valerter_alerts_dropped_total` | - | Alerts dropped (queue full, global counter) |
 | `valerter_alerts_failed_total` | `rule_name`, `notifier_name`, `notifier_type` | Alerts that permanently failed |
 | `valerter_logs_matched_total` | `rule_name` | Logs matched by rule (before throttling) |
 | `valerter_notify_errors_total` | `rule_name`, `notifier_name`, `notifier_type` | Notification send errors |
