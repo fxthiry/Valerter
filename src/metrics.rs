@@ -212,6 +212,9 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
     // Initialize counters without labels (global counters)
     counter!("valerter_reconnections_total").absolute(0);
 
+    // Initialize global counters (no labels)
+    counter!("valerter_alerts_dropped_total").absolute(0);
+
     // Initialize per-rule counters
     for rule_name in rule_names {
         counter!("valerter_logs_matched_total", "rule_name" => rule_name.to_string()).absolute(0);
@@ -219,7 +222,6 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
         counter!("valerter_alerts_throttled_total", "rule_name" => rule_name.to_string())
             .absolute(0);
         counter!("valerter_alerts_passed_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_alerts_dropped_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_parse_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_rule_panics_total", "rule_name" => rule_name.to_string()).absolute(0);
         counter!("valerter_rule_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
