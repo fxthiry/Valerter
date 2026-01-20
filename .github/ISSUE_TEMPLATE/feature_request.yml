@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest an improvement or a new capability
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature category
+      options:
+        - New notifier type
+        - Rule matching / parser
+        - Throttling / deduplication
+        - Template system
+        - Configuration options
+        - Metrics / observability
+        - CLI / UX
+        - Performance
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Problem / use case
+      description: What alerting scenario are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What should Valerter do?
+        If relevant, include example config YAML.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you considered using the webhook notifier or other workarounds?
+    validations:
+      required: false

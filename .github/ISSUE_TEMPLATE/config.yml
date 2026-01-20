@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/fxthiry/valerter/discussions/new?category=q-a
+    about: Use Discussions for configuration help and questions
+  - name: Configuration Reference
+    url: https://github.com/fxthiry/valerter/blob/main/docs/configuration.md
+    about: Complete config documentation with examples
+  - name: Notifiers Guide
+    url: https://github.com/fxthiry/valerter/blob/main/docs/notifiers.md
+    about: Setup guides for Mattermost, Email, Webhook (Slack, Discord, PagerDuty)

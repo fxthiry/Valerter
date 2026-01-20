@@ -1,0 +1,105 @@
+name: Bug report
+description: Report a reproducible problem with Valerter
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Streaming / tail (VictoriaLogs connection)
+        - Parser (regex or JSON field extraction)
+        - Throttling
+        - Template rendering (minijinja)
+        - Notifier - Mattermost
+        - Notifier - Email (SMTP)
+        - Notifier - Webhook
+        - Configuration loading / validation
+        - Metrics endpoint (/metrics)
+        - CLI (flags, --validate)
+        - Other / Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: valerter_version
+    attributes:
+      label: Valerter version
+      placeholder: "v1.0.0-rc.5 or git commit"
+    validations:
+      required: true
+
+  - type: input
+    id: victorialogs_version
+    attributes:
+      label: VictoriaLogs version
+      placeholder: "e.g. v1.15.0"
+    validations:
+      required: false
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "Debian 12 / Alpine 3.19 / Docker"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration (redact secrets!)
+      description: |
+        Paste the smallest config that reproduces the issue.
+        Replace secrets with placeholders: `password: "${REDACTED}"`
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Run with `RUST_LOG=valerter=debug` for detailed output.
+        Use `--log-format json` if you prefer structured logs.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create config with rule...
+        2. Start valerter with `valerter -c config.yaml`
+        3. Send log line to VictoriaLogs...
+        4. Observe...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: validate
+    attributes:
+      label: Pre-checks
+      options:
+        - label: I ran `valerter --validate -c config.yaml` and it passed
+          required: false
