@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 use crate::config::{
     BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig,
@@ -367,9 +367,9 @@ impl ReconnectCallback for ThrottleResetCallback {
 /// All recoverable errors are logged and the loop continues (Log+Continue pattern).
 async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<(), RuleError> {
     let span = tracing::info_span!("run_rule", rule_name = %ctx.rule.name);
-    let _guard = span.enter();
 
-    debug!("Rule task started");
+    async move {
+        debug!("Rule task started");
 
     // Create parser for this rule
     let parser = RuleParser::from_compiled(&ctx.rule.parser);
@@ -471,6 +471,9 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
 
     // If we get here, stream ended unexpectedly
     stream_result.map_err(RuleError::Stream)
+    }
+    .instrument(span)
+    .await
 }
 
 /// Process a single log line through the pipeline.
