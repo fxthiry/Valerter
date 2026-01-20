@@ -819,4 +819,65 @@ mod tests {
         let result = validate_body_template("{% if unclosed");
         assert!(result.is_err());
     }
+
+    // ===================================================================
+    // Invalid header tests (config validation)
+    // ===================================================================
+
+    #[test]
+    fn from_config_rejects_invalid_header_name() {
+        let config = WebhookNotifierConfig {
+            url: "https://api.example.com/alerts".to_string(),
+            method: "POST".to_string(),
+            headers: {
+                let mut h = HashMap::new();
+                // Header names cannot contain spaces or special chars
+                h.insert("Invalid Header Name".to_string(), "value".to_string());
+                h
+            },
+            body_template: None,
+        };
+
+        let client = reqwest::Client::new();
+        let result = WebhookNotifier::from_config("bad-header-webhook", &config, client);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-header-webhook");
+                assert!(message.contains("invalid header name"));
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_header_value() {
+        let config = WebhookNotifierConfig {
+            url: "https://api.example.com/alerts".to_string(),
+            method: "POST".to_string(),
+            headers: {
+                let mut h = HashMap::new();
+                // Header values cannot contain control characters (e.g., newlines)
+                h.insert("X-Custom".to_string(), "value\nwith\nnewlines".to_string());
+                h
+            },
+            body_template: None,
+        };
+
+        let client = reqwest::Client::new();
+        let result = WebhookNotifier::from_config("bad-value-webhook", &config, client);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::InvalidNotifier { name, message } => {
+                assert_eq!(name, "bad-value-webhook");
+                assert!(message.contains("invalid header value"));
+                assert!(message.contains("X-Custom"));
+            }
+            _ => panic!("Expected InvalidNotifier, got {:?}", err),
+        }
+    }
 }
