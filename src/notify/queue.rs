@@ -6,6 +6,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::{AlertPayload, NotifierRegistry};
 use crate::error::QueueError;
@@ -160,10 +161,10 @@ impl NotificationWorker {
             "process_notification",
             rule_name = %payload.rule_name
         );
-        let _guard = span.enter();
 
-        // Use configured destinations (validated at startup to be non-empty)
-        let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
+        async {
+            // Use configured destinations (validated at startup to be non-empty)
+            let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
 
         tracing::debug!(
             destination_count = destinations.len(),
@@ -227,6 +228,9 @@ impl NotificationWorker {
                 }
             }
         }
+        }
+        .instrument(span)
+        .await
     }
 }
 

@@ -14,6 +14,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Backoff base delay for webhook retries (AD-07).
 const WEBHOOK_BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -247,9 +248,9 @@ impl Notifier for WebhookNotifier {
             rule_name = %alert.rule_name,
             notifier_name = %self.name
         );
-        let _guard = span.enter();
 
-        // Build request body
+        async {
+            // Build request body
         let body = match &self.body_template_source {
             Some(template_source) => render_body_template(template_source, alert)?,
             None => {
@@ -352,7 +353,10 @@ impl Notifier for WebhookNotifier {
             "notifier_type" => "webhook"
         )
         .increment(1);
-        Err(NotifyError::MaxRetriesExceeded)
+            Err(NotifyError::MaxRetriesExceeded)
+        }
+        .instrument(span)
+        .await
     }
 }
 

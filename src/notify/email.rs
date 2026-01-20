@@ -22,6 +22,7 @@ use minijinja::{Environment, context};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Default HTML template for email body, embedded at compile time.
 const DEFAULT_BODY_TEMPLATE: &str = include_str!(concat!(
@@ -548,9 +549,9 @@ impl Notifier for EmailNotifier {
             rule_name = %alert.rule_name,
             notifier_name = %self.name
         );
-        let _guard = span.enter();
 
-        // Render templates once for all recipients
+        async {
+            // Render templates once for all recipients
         let subject = self.render_subject(alert)?;
         let body = self.render_body(alert)?;
         tracing::trace!(
@@ -634,6 +635,9 @@ impl Notifier for EmailNotifier {
                 failure_count
             )))
         }
+        }
+        .instrument(span)
+        .await
     }
 }
 

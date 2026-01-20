@@ -9,6 +9,7 @@ use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Backoff base delay for Mattermost retries (AD-07).
 const MATTERMOST_BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -164,9 +165,9 @@ impl Notifier for MattermostNotifier {
             rule_name = %alert.rule_name,
             notifier_name = %self.name
         );
-        let _guard = span.enter();
 
-        let mattermost_payload = build_mattermost_payload(
+        async {
+            let mattermost_payload = build_mattermost_payload(
             &alert.message,
             &alert.rule_name,
             &alert.log_timestamp_formatted,
@@ -271,7 +272,10 @@ impl Notifier for MattermostNotifier {
             "notifier_type" => "mattermost"
         )
         .increment(1);
-        Err(NotifyError::MaxRetriesExceeded)
+            Err(NotifyError::MaxRetriesExceeded)
+        }
+        .instrument(span)
+        .await
     }
 }
 
