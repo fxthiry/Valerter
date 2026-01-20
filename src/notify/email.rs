@@ -552,89 +552,89 @@ impl Notifier for EmailNotifier {
 
         async {
             // Render templates once for all recipients
-        let subject = self.render_subject(alert)?;
-        let body = self.render_body(alert)?;
-        tracing::trace!(
-            subject_len = subject.len(),
-            body_len = body.len(),
-            "Templates rendered"
-        );
+            let subject = self.render_subject(alert)?;
+            let body = self.render_body(alert)?;
+            tracing::trace!(
+                subject_len = subject.len(),
+                body_len = body.len(),
+                "Templates rendered"
+            );
 
-        // Track success/failure per recipient
-        let mut success_count = 0;
-        let mut failure_count = 0;
+            // Track success/failure per recipient
+            let mut success_count = 0;
+            let mut failure_count = 0;
 
-        // Send to each recipient individually (AC7: continue on rejection)
-        for recipient in &self.to {
-            match self.send_to_recipient(&subject, &body, recipient).await {
-                Ok(()) => {
-                    success_count += 1;
-                }
-                Err(e) => {
-                    failure_count += 1;
-                    tracing::warn!(
-                        recipient = %recipient,
-                        error = %e,
-                        "Failed to send email to recipient, continuing to next"
-                    );
-                    // Metrics for per-recipient failures
-                    metrics::counter!(
-                        "valerter_email_recipient_errors_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone()
-                    )
-                    .increment(1);
+            // Send to each recipient individually (AC7: continue on rejection)
+            for recipient in &self.to {
+                match self.send_to_recipient(&subject, &body, recipient).await {
+                    Ok(()) => {
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        tracing::warn!(
+                            recipient = %recipient,
+                            error = %e,
+                            "Failed to send email to recipient, continuing to next"
+                        );
+                        // Metrics for per-recipient failures
+                        metrics::counter!(
+                            "valerter_email_recipient_errors_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone()
+                        )
+                        .increment(1);
+                    }
                 }
             }
-        }
 
-        // Log summary
-        tracing::debug!(
-            success = success_count,
-            failed = failure_count,
-            total = self.to.len(),
-            "Email send complete"
-        );
-
-        // Determine overall result
-        if success_count > 0 {
-            // At least one recipient succeeded
-            metrics::counter!(
-                "valerter_alerts_sent_total",
-                "rule_name" => alert.rule_name.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "email"
-            )
-            .increment(1);
-            Ok(())
-        } else {
-            // All recipients failed
-            tracing::error!(
-                rule_name = %alert.rule_name,
-                notifier_name = %self.name,
-                recipient_count = failure_count,
-                "Email delivery failed to all recipients"
+            // Log summary
+            tracing::debug!(
+                success = success_count,
+                failed = failure_count,
+                total = self.to.len(),
+                "Email send complete"
             );
-            metrics::counter!(
-                "valerter_notify_errors_total",
-                "rule_name" => alert.rule_name.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "email"
-            )
-            .increment(1);
-            // Permanent failure - all recipients failed
-            metrics::counter!(
-                "valerter_alerts_failed_total",
-                "rule_name" => alert.rule_name.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "email"
-            )
-            .increment(1);
-            Err(NotifyError::SendFailed(format!(
-                "all {} recipients failed",
-                failure_count
-            )))
-        }
+
+            // Determine overall result
+            if success_count > 0 {
+                // At least one recipient succeeded
+                metrics::counter!(
+                    "valerter_alerts_sent_total",
+                    "rule_name" => alert.rule_name.clone(),
+                    "notifier_name" => self.name.clone(),
+                    "notifier_type" => "email"
+                )
+                .increment(1);
+                Ok(())
+            } else {
+                // All recipients failed
+                tracing::error!(
+                    rule_name = %alert.rule_name,
+                    notifier_name = %self.name,
+                    recipient_count = failure_count,
+                    "Email delivery failed to all recipients"
+                );
+                metrics::counter!(
+                    "valerter_notify_errors_total",
+                    "rule_name" => alert.rule_name.clone(),
+                    "notifier_name" => self.name.clone(),
+                    "notifier_type" => "email"
+                )
+                .increment(1);
+                // Permanent failure - all recipients failed
+                metrics::counter!(
+                    "valerter_alerts_failed_total",
+                    "rule_name" => alert.rule_name.clone(),
+                    "notifier_name" => self.name.clone(),
+                    "notifier_type" => "email"
+                )
+                .increment(1);
+                Err(NotifyError::SendFailed(format!(
+                    "all {} recipients failed",
+                    failure_count
+                )))
+            }
         }
         .instrument(span)
         .await

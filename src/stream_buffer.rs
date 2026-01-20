@@ -170,7 +170,9 @@ mod tests {
 
         // 🚨 = F0 9F 9A A8
         // Chunk 1: "Hello " + first 2 bytes of emoji
-        buffer.push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xF0, 0x9F]).unwrap();
+        buffer
+            .push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xF0, 0x9F])
+            .unwrap();
 
         // Should return no complete lines yet (no newline)
         let lines = buffer.drain_complete_lines().unwrap();
@@ -232,7 +234,9 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // 0xFF is never valid in UTF-8
-        buffer.push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0xFF, 0x0A]).unwrap();
+        buffer
+            .push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0xFF, 0x0A])
+            .unwrap();
 
         let result = buffer.drain_complete_lines();
         assert!(result.is_err());

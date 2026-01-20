@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::config::{
     BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig,
@@ -371,106 +371,106 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
     async move {
         debug!("Rule task started");
 
-    // Create parser for this rule
-    let parser = RuleParser::from_compiled(&ctx.rule.parser);
-    debug!(
-        has_regex = ctx.rule.parser.regex.is_some(),
-        has_json = ctx.rule.parser.json.is_some(),
-        "Parser initialized"
-    );
+        // Create parser for this rule
+        let parser = RuleParser::from_compiled(&ctx.rule.parser);
+        debug!(
+            has_regex = ctx.rule.parser.regex.is_some(),
+            has_json = ctx.rule.parser.json.is_some(),
+            "Parser initialized"
+        );
 
-    // Create throttler for this rule (uses rule's config or defaults)
-    let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
-    let throttler = Arc::new(Throttler::new(Some(throttle_config), &ctx.rule.name));
-    debug!(
-        throttle_count = throttle_config.count,
-        throttle_window_secs = throttle_config.window.as_secs(),
-        "Throttler initialized"
-    );
+        // Create throttler for this rule (uses rule's config or defaults)
+        let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
+        let throttler = Arc::new(Throttler::new(Some(throttle_config), &ctx.rule.name));
+        debug!(
+            throttle_count = throttle_config.count,
+            throttle_window_secs = throttle_config.window.as_secs(),
+            "Throttler initialized"
+        );
 
-    // Get template name and destinations for this rule (both are now required)
-    let template_name = ctx.rule.notify.template.clone();
-    let destinations = ctx.rule.notify.destinations.clone();
-    debug!(
-        template_name = %template_name,
-        destination_count = destinations.len(),
-        "Notify config loaded"
-    );
+        // Get template name and destinations for this rule (both are now required)
+        let template_name = ctx.rule.notify.template.clone();
+        let destinations = ctx.rule.notify.destinations.clone();
+        debug!(
+            template_name = %template_name,
+            destination_count = destinations.len(),
+            "Notify config loaded"
+        );
 
-    // Wrap parser in Arc for sharing across closure invocations
-    let parser = Arc::new(parser);
+        // Wrap parser in Arc for sharing across closure invocations
+        let parser = Arc::new(parser);
 
-    // Create callback for throttle reset on reconnection
-    let reconnect_callback = ThrottleResetCallback::new(Arc::clone(&throttler));
+        // Create callback for throttle reset on reconnection
+        let reconnect_callback = ThrottleResetCallback::new(Arc::clone(&throttler));
 
-    // Create TailClient for VictoriaLogs
-    let tail_config = TailConfig {
-        base_url: ctx.vl_url.clone(),
-        query: ctx.rule.query.clone(),
-        start: None,
-        basic_auth: ctx.vl_basic_auth.clone(),
-        headers: ctx.vl_headers.clone(),
-        tls: ctx.vl_tls.clone(),
-    };
+        // Create TailClient for VictoriaLogs
+        let tail_config = TailConfig {
+            base_url: ctx.vl_url.clone(),
+            query: ctx.rule.query.clone(),
+            start: None,
+            basic_auth: ctx.vl_basic_auth.clone(),
+            headers: ctx.vl_headers.clone(),
+            tls: ctx.vl_tls.clone(),
+        };
 
-    let mut tail_client = TailClient::new(tail_config).map_err(RuleError::Stream)?;
+        let mut tail_client = TailClient::new(tail_config).map_err(RuleError::Stream)?;
 
-    // Stream with reconnection - runs until cancelled
-    let rule_name = ctx.rule.name.clone();
-    let template_name = Arc::new(template_name);
-    let destinations = Arc::new(destinations);
-    let template_engine = ctx.template_engine;
-    let queue = ctx.queue;
-    let timestamp_timezone = Arc::new(ctx.timestamp_timezone.clone());
+        // Stream with reconnection - runs until cancelled
+        let rule_name = ctx.rule.name.clone();
+        let template_name = Arc::new(template_name);
+        let destinations = Arc::new(destinations);
+        let template_engine = ctx.template_engine;
+        let queue = ctx.queue;
+        let timestamp_timezone = Arc::new(ctx.timestamp_timezone.clone());
 
-    let stream_result = tail_client
-        .stream_with_reconnect(&rule_name, Some(&reconnect_callback), |line| {
-            // Process each log line
-            // Clone Arcs for the async block (cheap reference counting)
-            let queue = queue.clone();
-            let parser = Arc::clone(&parser);
-            let throttler = Arc::clone(&throttler);
-            let template_engine = Arc::clone(&template_engine);
-            let template_name = Arc::clone(&template_name);
-            let rule_name = rule_name.clone();
-            let destinations = Arc::clone(&destinations);
-            let timestamp_timezone = Arc::clone(&timestamp_timezone);
+        let stream_result = tail_client
+            .stream_with_reconnect(&rule_name, Some(&reconnect_callback), |line| {
+                // Process each log line
+                // Clone Arcs for the async block (cheap reference counting)
+                let queue = queue.clone();
+                let parser = Arc::clone(&parser);
+                let throttler = Arc::clone(&throttler);
+                let template_engine = Arc::clone(&template_engine);
+                let template_name = Arc::clone(&template_name);
+                let rule_name = rule_name.clone();
+                let destinations = Arc::clone(&destinations);
+                let timestamp_timezone = Arc::clone(&timestamp_timezone);
 
-            async move {
-                // Pattern Log+Continue: never propagate errors, just log and continue
-                if let Err(e) = process_log_line(
-                    &line,
-                    &parser,
-                    &throttler,
-                    &template_engine,
-                    &template_name,
-                    &rule_name,
-                    &destinations,
-                    &queue,
-                    &timestamp_timezone,
-                )
-                .await
-                {
-                    // Log at appropriate level based on error type
-                    debug!(
-                        rule_name = %rule_name,
-                        error = %e,
-                        "Failed to process log line, continuing"
-                    );
+                async move {
+                    // Pattern Log+Continue: never propagate errors, just log and continue
+                    if let Err(e) = process_log_line(
+                        &line,
+                        &parser,
+                        &throttler,
+                        &template_engine,
+                        &template_name,
+                        &rule_name,
+                        &destinations,
+                        &queue,
+                        &timestamp_timezone,
+                    )
+                    .await
+                    {
+                        // Log at appropriate level based on error type
+                        debug!(
+                            rule_name = %rule_name,
+                            error = %e,
+                            "Failed to process log line, continuing"
+                        );
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
-        .await;
+            })
+            .await;
 
-    // Check if we were cancelled or had an error
-    if cancel.is_cancelled() {
-        info!("Rule task stopping due to cancellation");
-        return Ok(());
-    }
+        // Check if we were cancelled or had an error
+        if cancel.is_cancelled() {
+            info!("Rule task stopping due to cancellation");
+            return Ok(());
+        }
 
-    // If we get here, stream ended unexpectedly
-    stream_result.map_err(RuleError::Stream)
+        // If we get here, stream ended unexpectedly
+        stream_result.map_err(RuleError::Stream)
     }
     .instrument(span)
     .await

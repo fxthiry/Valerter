@@ -168,110 +168,111 @@ impl Notifier for MattermostNotifier {
 
         async {
             let mattermost_payload = build_mattermost_payload(
-            &alert.message,
-            &alert.rule_name,
-            &alert.log_timestamp_formatted,
-            self.channel.as_deref(),
-            self.username.as_deref(),
-            self.icon_url.as_deref(),
-        );
-        tracing::trace!(
-            payload_size = std::mem::size_of_val(&mattermost_payload),
-            "Payload built"
-        );
+                &alert.message,
+                &alert.rule_name,
+                &alert.log_timestamp_formatted,
+                self.channel.as_deref(),
+                self.username.as_deref(),
+                self.icon_url.as_deref(),
+            );
+            tracing::trace!(
+                payload_size = std::mem::size_of_val(&mattermost_payload),
+                "Payload built"
+            );
 
-        // Use the notifier's own webhook_url (Story 6.2)
-        let webhook_url = self.webhook_url.expose();
+            // Use the notifier's own webhook_url (Story 6.2)
+            let webhook_url = self.webhook_url.expose();
 
-        for attempt in 0..MATTERMOST_MAX_RETRIES {
-            match self
-                .client
-                .post(webhook_url)
-                .json(&mattermost_payload)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    tracing::debug!("Alert sent successfully");
-                    metrics::counter!(
-                        "valerter_alerts_sent_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "mattermost"
-                    )
-                    .increment(1);
-                    return Ok(());
+            for attempt in 0..MATTERMOST_MAX_RETRIES {
+                match self
+                    .client
+                    .post(webhook_url)
+                    .json(&mattermost_payload)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::debug!("Alert sent successfully");
+                        metrics::counter!(
+                            "valerter_alerts_sent_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "mattermost"
+                        )
+                        .increment(1);
+                        return Ok(());
+                    }
+                    Ok(response) if response.status().is_client_error() => {
+                        // 4xx errors: don't retry (invalid payload, bad webhook)
+                        let status = response.status();
+                        tracing::error!(
+                            status = %status,
+                            "Mattermost returned client error, not retrying"
+                        );
+                        metrics::counter!(
+                            "valerter_notify_errors_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "mattermost"
+                        )
+                        .increment(1);
+                        // Permanent failure - count as failed alert
+                        metrics::counter!(
+                            "valerter_alerts_failed_total",
+                            "rule_name" => alert.rule_name.clone(),
+                            "notifier_name" => self.name.clone(),
+                            "notifier_type" => "mattermost"
+                        )
+                        .increment(1);
+                        return Err(NotifyError::SendFailed(format!("client error: {}", status)));
+                    }
+                    Ok(response) => {
+                        // 5xx errors: retry
+                        tracing::warn!(
+                            attempt = attempt,
+                            status = %response.status(),
+                            "Mattermost returned server error, retrying"
+                        );
+                    }
+                    Err(e) => {
+                        // Network errors: retry
+                        tracing::warn!(
+                            attempt = attempt,
+                            error = %e,
+                            "Failed to send to Mattermost, retrying"
+                        );
+                    }
                 }
-                Ok(response) if response.status().is_client_error() => {
-                    // 4xx errors: don't retry (invalid payload, bad webhook)
-                    let status = response.status();
-                    tracing::error!(
-                        status = %status,
-                        "Mattermost returned client error, not retrying"
-                    );
-                    metrics::counter!(
-                        "valerter_notify_errors_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "mattermost"
-                    )
-                    .increment(1);
-                    // Permanent failure - count as failed alert
-                    metrics::counter!(
-                        "valerter_alerts_failed_total",
-                        "rule_name" => alert.rule_name.clone(),
-                        "notifier_name" => self.name.clone(),
-                        "notifier_type" => "mattermost"
-                    )
-                    .increment(1);
-                    return Err(NotifyError::SendFailed(format!("client error: {}", status)));
-                }
-                Ok(response) => {
-                    // 5xx errors: retry
-                    tracing::warn!(
-                        attempt = attempt,
-                        status = %response.status(),
-                        "Mattermost returned server error, retrying"
-                    );
-                }
-                Err(e) => {
-                    // Network errors: retry
-                    tracing::warn!(
-                        attempt = attempt,
-                        error = %e,
-                        "Failed to send to Mattermost, retrying"
-                    );
+
+                // Apply backoff delay before next retry (except after last attempt)
+                if attempt < MATTERMOST_MAX_RETRIES - 1 {
+                    let delay =
+                        backoff_delay(attempt, MATTERMOST_BACKOFF_BASE, MATTERMOST_BACKOFF_MAX);
+                    tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
+                    tokio::time::sleep(delay).await;
                 }
             }
 
-            // Apply backoff delay before next retry (except after last attempt)
-            if attempt < MATTERMOST_MAX_RETRIES - 1 {
-                let delay = backoff_delay(attempt, MATTERMOST_BACKOFF_BASE, MATTERMOST_BACKOFF_MAX);
-                tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
-                tokio::time::sleep(delay).await;
-            }
-        }
-
-        // All retries exhausted
-        tracing::error!(
-            max_retries = MATTERMOST_MAX_RETRIES,
-            "Failed to send alert after all retries"
-        );
-        metrics::counter!(
-            "valerter_notify_errors_total",
-            "rule_name" => alert.rule_name.clone(),
-            "notifier_name" => self.name.clone(),
-            "notifier_type" => "mattermost"
-        )
-        .increment(1);
-        // Permanent failure after retries exhausted
-        metrics::counter!(
-            "valerter_alerts_failed_total",
-            "rule_name" => alert.rule_name.clone(),
-            "notifier_name" => self.name.clone(),
-            "notifier_type" => "mattermost"
-        )
-        .increment(1);
+            // All retries exhausted
+            tracing::error!(
+                max_retries = MATTERMOST_MAX_RETRIES,
+                "Failed to send alert after all retries"
+            );
+            metrics::counter!(
+                "valerter_notify_errors_total",
+                "rule_name" => alert.rule_name.clone(),
+                "notifier_name" => self.name.clone(),
+                "notifier_type" => "mattermost"
+            )
+            .increment(1);
+            // Permanent failure after retries exhausted
+            metrics::counter!(
+                "valerter_alerts_failed_total",
+                "rule_name" => alert.rule_name.clone(),
+                "notifier_name" => self.name.clone(),
+                "notifier_type" => "mattermost"
+            )
+            .increment(1);
             Err(NotifyError::MaxRetriesExceeded)
         }
         .instrument(span)

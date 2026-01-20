@@ -387,8 +387,7 @@ impl TailClient {
                         )
                         .set(now);
 
-                        if let Err(StreamError::LineTooLarge(size, max)) =
-                            self.buffer.push(&chunk)
+                        if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk)
                         {
                             warn!(
                                 rule_name = %rule_name,

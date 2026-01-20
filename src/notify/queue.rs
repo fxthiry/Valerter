@@ -166,15 +166,15 @@ impl NotificationWorker {
             // Use configured destinations (validated at startup to be non-empty)
             let destinations: Vec<&str> = payload.destinations.iter().map(String::as_str).collect();
 
-        tracing::debug!(
-            destination_count = destinations.len(),
-            destinations = ?destinations,
-            "Processing alert with fan-out"
-        );
+            tracing::debug!(
+                destination_count = destinations.len(),
+                destinations = ?destinations,
+                "Processing alert with fan-out"
+            );
 
-        // AC #2: Send to all destinations in PARALLEL
-        // AC #7: each destination failure is independent
-        let futures: Vec<_> = destinations
+            // AC #2: Send to all destinations in PARALLEL
+            // AC #7: each destination failure is independent
+            let futures: Vec<_> = destinations
             .iter()
             .filter_map(|dest_name| {
                 match self.registry.get(dest_name) {
@@ -203,31 +203,31 @@ impl NotificationWorker {
             })
             .collect();
 
-        // Execute all sends in parallel and collect results
-        let results = join_all(futures).await;
+            // Execute all sends in parallel and collect results
+            let results = join_all(futures).await;
 
-        // Log results (AC #7: each result logged independently)
-        for (dest_name, notifier_name, result) in results {
-            match result {
-                Ok(()) => {
-                    tracing::info!(
-                        notifier = %notifier_name,
-                        rule_name = %payload.rule_name,
-                        "Notification sent successfully"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        notifier = %notifier_name,
-                        destination = %dest_name,
-                        rule_name = %payload.rule_name,
-                        "Failed to send notification after all retries"
-                    );
-                    // Metrics are already recorded in the notifier implementation
+            // Log results (AC #7: each result logged independently)
+            for (dest_name, notifier_name, result) in results {
+                match result {
+                    Ok(()) => {
+                        tracing::info!(
+                            notifier = %notifier_name,
+                            rule_name = %payload.rule_name,
+                            "Notification sent successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            notifier = %notifier_name,
+                            destination = %dest_name,
+                            rule_name = %payload.rule_name,
+                            "Failed to send notification after all retries"
+                        );
+                        // Metrics are already recorded in the notifier implementation
+                    }
                 }
             }
-        }
         }
         .instrument(span)
         .await
