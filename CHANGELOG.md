@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-04-14
+
+Promote `1.0.0-rc.5` to stable. No functional changes.
+
+### Security
+- Dependency updates via `cargo update` to pick up patched versions:
+  - `aws-lc-sys` 0.35.0 → 0.39.1 (GHSA advisories on AWS-LC crypto/x509)
+  - `quinn-proto` 0.11.13 → 0.11.14 (QUIC transport parameter DoS)
+  - `rustls-webpki` 0.103.8 → 0.103.11 (CRL scope check)
+  - `bytes` 1.11.0 → 1.11.1 (`BytesMut::reserve` integer overflow)
+
 ## [1.0.0-rc.5] - 2026-01-20
 
 **Final RC** - Hardening and observability improvements before 1.0.0 stable.
@@ -132,7 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.5...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.5...v1.0.0
 [1.0.0-rc.5]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.4...v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.2...v1.0.0-rc.3
