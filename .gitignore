@@ -4,6 +4,7 @@
 
 # Local config (secrets)
 config/prod/
+config/prod-*/
 config/test/
 config/minimal/
 
