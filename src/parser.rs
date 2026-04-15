@@ -256,9 +256,167 @@ impl RuleParser {
     }
 }
 
+/// Expand flat dotted keys (e.g. `"a.b.c": "x"`) into nested objects, additively.
+///
+/// VictoriaLogs emits fields like `{"nginx.http.request_id": "x"}` as literal flat
+/// keys. minijinja interprets `a.b.c` as nested attribute access, so users writing
+/// `{{ nginx.http.request_id }}` need a nested view of the data.
+///
+/// Behavior:
+/// - Original flat key is preserved (compat with existing `event['a.b']` workarounds).
+/// - Nested objects are added; deep-merged with any pre-existing nested structure.
+/// - On collision (top-level scalar already exists for the first segment), the
+///   scalar wins, the dotted key is left untouched, and a `warn!` is emitted.
+/// - Non-objects pass through unchanged.
+pub(crate) fn unflatten_dotted_keys(value: &Value) -> Value {
+    let Some(map) = value.as_object() else {
+        return value.clone();
+    };
+
+    let mut out: Map<String, Value> = map.clone();
+
+    for (key, val) in map {
+        if !key.contains('.') {
+            continue;
+        }
+        let segments: Vec<&str> = key.split('.').collect();
+        let head = segments[0];
+
+        match out.get(head) {
+            Some(existing) if !existing.is_object() => {
+                tracing::warn!(
+                    conflicting_key = %key,
+                    head_segment = %head,
+                    "skipping dotted-key expansion: top-level scalar already exists"
+                );
+                continue;
+            }
+            _ => {}
+        }
+
+        insert_nested(&mut out, &segments, val.clone());
+    }
+
+    Value::Object(out)
+}
+
+fn insert_nested(out: &mut Map<String, Value>, segments: &[&str], leaf: Value) {
+    let head = segments[0];
+    if segments.len() == 1 {
+        out.insert(head.to_string(), leaf);
+        return;
+    }
+
+    let entry = out
+        .entry(head.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+
+    if !entry.is_object() {
+        tracing::warn!(
+            head_segment = %head,
+            "skipping nested merge: intermediate scalar collides with nested path"
+        );
+        return;
+    }
+
+    let nested = entry.as_object_mut().expect("checked is_object above");
+    insert_nested(nested, &segments[1..], leaf);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // unflatten_dotted_keys tests (issue #25)
+    // ============================================================
+
+    #[test]
+    fn unflatten_basic_single_dotted_key() {
+        let input = serde_json::json!({"nginx.http.request_id": "x"});
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        // Original flat key preserved (additive)
+        assert_eq!(obj.get("nginx.http.request_id").unwrap(), "x");
+        // Nested structure added
+        assert_eq!(
+            obj.get("nginx")
+                .unwrap()
+                .get("http")
+                .unwrap()
+                .get("request_id")
+                .unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn unflatten_depth_one() {
+        let input = serde_json::json!({"a.b": 1});
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        assert_eq!(obj.get("a.b").unwrap(), 1);
+        assert_eq!(obj.get("a").unwrap().get("b").unwrap(), 1);
+    }
+
+    #[test]
+    fn unflatten_no_dots_unchanged() {
+        let input = serde_json::json!({"simple": 1, "_msg": "x"});
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.get("simple").unwrap(), 1);
+        assert_eq!(obj.get("_msg").unwrap(), "x");
+    }
+
+    #[test]
+    fn unflatten_deep_merges_with_existing_nested() {
+        let input = serde_json::json!({"a": {"c": 1}, "a.b": 2});
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        // Flat key preserved
+        assert_eq!(obj.get("a.b").unwrap(), 2);
+        let a = obj.get("a").unwrap();
+        // Existing nested key preserved
+        assert_eq!(a.get("c").unwrap(), 1);
+        // Dotted key merged in
+        assert_eq!(a.get("b").unwrap(), 2);
+    }
+
+    #[test]
+    fn unflatten_scalar_collision_skips_expansion() {
+        let input = serde_json::json!({"a": "scalar", "a.b": 1});
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        // Scalar wins
+        assert_eq!(obj.get("a").unwrap(), "scalar");
+        // Flat key preserved
+        assert_eq!(obj.get("a.b").unwrap(), 1);
+        // No nested expansion
+        assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn unflatten_multiple_dotted_keys_share_root() {
+        let input = serde_json::json!({
+            "host": "h1",
+            "nginx.http.request_id": "abc",
+            "nginx.http.method": "GET"
+        });
+        let out = unflatten_dotted_keys(&input);
+        let obj = out.as_object().unwrap();
+        let nginx_http = obj.get("nginx").unwrap().get("http").unwrap();
+        assert_eq!(nginx_http.get("request_id").unwrap(), "abc");
+        assert_eq!(nginx_http.get("method").unwrap(), "GET");
+        assert_eq!(obj.get("host").unwrap(), "h1");
+    }
+
+    #[test]
+    fn unflatten_non_object_passes_through() {
+        let input = serde_json::json!("just a string");
+        let out = unflatten_dotted_keys(&input);
+        assert_eq!(out, input);
+    }
 
     // ============================================================
     // Task 1: VictoriaLogs envelope parsing tests
