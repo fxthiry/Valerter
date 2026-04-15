@@ -110,10 +110,10 @@ fn create_notifier_registry(
     Ok(registry)
 }
 
-/// Validate that templates used with email destinations have body_html.
+/// Validate that templates used with email destinations have email_body_html.
 ///
 /// For each enabled rule, if any of its destinations is an email notifier,
-/// the template must have body_html defined. This is a fail-fast validation
+/// the template must have email_body_html defined. This is a fail-fast validation
 /// to prevent runtime errors.
 fn validate_email_templates(
     config: &valerter::config::RuntimeConfig,
@@ -149,9 +149,9 @@ fn validate_email_templates(
         // Get the template name for this rule
         let template_name = &rule.notify.template;
 
-        // Check if template has body_html
+        // Check if template has email_body_html
         if let Some(template) = config.templates.get(template_name)
-            && template.body_html.is_none()
+            && template.email_body_html.is_none()
         {
             let email_dests: Vec<_> = destinations
                 .iter()
@@ -164,7 +164,7 @@ fn validate_email_templates(
                 .collect();
 
             errors.push(format!(
-                "template '{}' requires body_html field when used with email destination{} {} (rule '{}')",
+                "template '{}' requires email_body_html field when used with email destination{} {} (rule '{}')",
                 template_name,
                 if email_dests.len() > 1 { "s" } else { "" },
                 email_dests.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
@@ -307,7 +307,7 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     }
     info!("All rule destinations validated successfully");
 
-    // Validate that templates used with email destinations have body_html (fail-fast)
+    // Validate that templates used with email destinations have email_body_html (fail-fast)
     if let Err(errors) = validate_email_templates(&runtime_config, &registry) {
         for e in &errors {
             error!(error = %e, "Email template validation error");

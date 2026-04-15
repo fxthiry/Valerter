@@ -520,7 +520,7 @@ mod tests {
             message: RenderedMessage {
                 title: title.to_string(),
                 body: body.to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: None,
             },
             rule_name: "test_rule".to_string(),

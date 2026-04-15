@@ -1,4 +1,4 @@
-# Configuration fixture: email notifier with template missing body_html
+# Configuration fixture: email notifier with template missing email_body_html
 # This should fail validation at startup (AC7)
 
 victorialogs:
@@ -13,7 +13,7 @@ templates:
   alert:
     title: "Alert: {{ _msg }}"
     body: "Message: {{ _msg }}"
-    # body_html is missing - should fail validation when used with email
+    # email_body_html is missing - should fail validation when used with email
     accent_color: "#ff0000"
 
 notifiers:

@@ -157,7 +157,7 @@ pub struct TemplateConfig {
     pub title: String,
     pub body: String,
     #[serde(default)]
-    pub body_html: Option<String>,
+    pub email_body_html: Option<String>,
     #[serde(default)]
     pub accent_color: Option<String>,
 }
@@ -596,12 +596,12 @@ impl Config {
                     message: format!("body: {}", e),
                 });
             }
-            if let Some(body_html) = &template.body_html
-                && let Err(e) = validate_jinja_template(body_html)
+            if let Some(email_body_html) = &template.email_body_html
+                && let Err(e) = validate_jinja_template(email_body_html)
             {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
-                    message: format!("body_html: {}", e),
+                    message: format!("email_body_html: {}", e),
                 });
             }
         }
@@ -620,12 +620,12 @@ impl Config {
                     message: format!("body render: {}", e),
                 });
             }
-            if let Some(body_html) = &template.body_html
-                && let Err(e) = super::validation::validate_template_render(body_html)
+            if let Some(email_body_html) = &template.email_body_html
+                && let Err(e) = super::validation::validate_template_render(email_body_html)
             {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
-                    message: format!("body_html render: {}", e),
+                    message: format!("email_body_html render: {}", e),
                 });
             }
         }

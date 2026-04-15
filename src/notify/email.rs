@@ -391,7 +391,7 @@ impl EmailNotifier {
 
     /// Render the body template with alert context.
     ///
-    /// Uses `body_html` from the template engine (already HTML-escaped) if available,
+    /// Uses `email_body_html` from the template engine (already HTML-escaped) if available,
     /// otherwise falls back to `body`. The body is marked as "safe" (pre-escaped) so
     /// the template doesn't need `| safe` filter - this prevents user errors if they
     /// edit the email template and accidentally remove the filter.
@@ -406,10 +406,10 @@ impl EmailNotifier {
             .get_template("body")
             .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
 
-        // Use body_html if available (already HTML-escaped), otherwise fall back to body
+        // Use email_body_html if available (already HTML-escaped), otherwise fall back to body
         let body_content = alert
             .message
-            .body_html
+            .email_body_html
             .as_ref()
             .unwrap_or(&alert.message.body);
 
@@ -795,7 +795,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
@@ -1325,9 +1325,9 @@ mod tests {
         );
 
         let mut alert = make_alert_payload("html_test");
-        // body_html is pre-escaped by TemplateEngine, injected with | safe
+        // email_body_html is pre-escaped by TemplateEngine, injected with | safe
         // Using pre-escaped content simulates what TemplateEngine produces
-        alert.message.body_html =
+        alert.message.email_body_html =
             Some("&lt;h1&gt;Alert!&lt;/h1&gt;&lt;p&gt;Something happened&lt;/p&gt;".to_string());
 
         let result = notifier.send(&alert).await;
@@ -1335,10 +1335,10 @@ mod tests {
         assert!(result.is_ok());
         let emails = mock.sent_emails();
         assert_eq!(emails.len(), 1);
-        // body_html content (pre-escaped) is injected directly with | safe
+        // email_body_html content (pre-escaped) is injected directly with | safe
         assert!(
             emails[0].body.contains("&lt;h1&gt;Alert!&lt;"),
-            "Pre-escaped body_html should be in email, got: {}",
+            "Pre-escaped email_body_html should be in email, got: {}",
             emails[0].body
         );
         assert!(

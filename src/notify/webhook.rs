@@ -383,7 +383,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
@@ -653,7 +653,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Simple".to_string(),
                 body: "Body".to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: None,
             },
             rule_name: "simple_rule".to_string(),
@@ -793,7 +793,7 @@ mod tests {
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: "test_rule".to_string(),

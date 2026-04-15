@@ -213,7 +213,7 @@ fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload 
         message: RenderedMessage {
             title: title.to_string(),
             body: body.to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
@@ -377,8 +377,8 @@ async fn test_send_email_multiple_recipients() {
     );
 }
 
-/// Test sending HTML formatted email with body_html (pre-escaped HTML content).
-/// AC #4: Verify body_html content is included in email
+/// Test sending HTML formatted email with email_body_html (pre-escaped HTML content).
+/// AC #4: Verify email_body_html content is included in email
 #[tokio::test]
 #[ignore] // Requires running Mailhog
 async fn test_send_email_html_format() {
@@ -392,13 +392,13 @@ async fn test_send_email_html_format() {
     // Create notifier with HTML format
     let notifier = create_mailhog_notifier("html-test");
 
-    // body_html is used for pre-rendered HTML content (from TemplateEngine)
-    // This simulates what TemplateEngine produces when rendering body_html
+    // email_body_html is used for pre-rendered HTML content (from TemplateEngine)
+    // This simulates what TemplateEngine produces when rendering email_body_html
     let alert = AlertPayload {
         message: RenderedMessage {
             title: "HTML Alert".to_string(),
             body: "Fallback plain text".to_string(),
-            body_html: Some(
+            email_body_html: Some(
                 "<h1>Alert!</h1><p>Something <strong>important</strong> happened.</p>".to_string(),
             ),
             accent_color: Some("#ff0000".to_string()),
@@ -435,20 +435,20 @@ async fn test_send_email_html_format() {
         content_type
     );
 
-    // Verify HTML content from body_html is in the email body
-    // body_html is injected as safe (pre-escaped) into the default template
-    // Check for content that appears in body_html (may be quoted-printable encoded)
+    // Verify HTML content from email_body_html is in the email body
+    // email_body_html is injected as safe (pre-escaped) into the default template
+    // Check for content that appears in email_body_html (may be quoted-printable encoded)
     assert!(
         message.content.body.contains("Alert!"),
-        "Body should contain the alert content from body_html"
+        "Body should contain the alert content from email_body_html"
     );
     assert!(
         message.content.body.contains("important"),
-        "Body should contain content from body_html"
+        "Body should contain content from email_body_html"
     );
 }
 
-/// Test sending email with plain text body (no body_html).
+/// Test sending email with plain text body (no email_body_html).
 /// AC #4: Verify plain text body is included in HTML email template
 #[tokio::test]
 #[ignore] // Requires running Mailhog
@@ -463,7 +463,7 @@ async fn test_send_email_text_format() {
     // Create notifier - all emails are now HTML with the default template
     let notifier = create_mailhog_notifier("text-test");
 
-    // No body_html - the plain text body will be used in the HTML template
+    // No email_body_html - the plain text body will be used in the HTML template
     let alert = make_alert_payload(
         "text_rule",
         "Plain Text Alert",
