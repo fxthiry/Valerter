@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::config::{NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars};
 use crate::error::ConfigError;
 
-use super::{EmailNotifier, MattermostNotifier, Notifier, WebhookNotifier};
+use super::{EmailNotifier, MattermostNotifier, Notifier, TelegramNotifier, WebhookNotifier};
 
 /// Registry for managing named notifiers.
 ///
@@ -211,6 +211,18 @@ impl NotifierRegistry {
                     from = %email_config.from,
                     to_count = email_config.to.len(),
                     "Registered email notifier from config"
+                );
+
+                Ok(Arc::new(notifier))
+            }
+            NotifierConfig::Telegram(tg_config) => {
+                let notifier = TelegramNotifier::from_config(name, tg_config, http_client.clone())?;
+
+                tracing::debug!(
+                    notifier_name = %name,
+                    notifier_type = "telegram",
+                    chat_count = tg_config.chat_ids.len(),
+                    "Registered telegram notifier from config"
                 );
 
                 Ok(Arc::new(notifier))

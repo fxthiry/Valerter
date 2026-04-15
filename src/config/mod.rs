@@ -14,7 +14,7 @@ mod validation;
 pub use env::{resolve_body_template, resolve_env_vars};
 pub use notifiers::{
     EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, NotifiersConfig, SmtpConfig,
-    TlsMode, WebhookNotifierConfig,
+    TelegramNotifierConfig, TlsMode, WebhookNotifierConfig,
 };
 pub use runtime::{
     CompiledParser, CompiledRule, CompiledTemplate, CompiledThrottle, RuntimeConfig,

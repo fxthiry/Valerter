@@ -50,6 +50,10 @@ pub fn register_metric_descriptions() {
         "Total number of notification errors after retries exhausted"
     );
     describe_counter!(
+        "valerter_alerts_truncated_total",
+        "Total number of alerts whose message body was truncated to fit the notifier length limit"
+    );
+    describe_counter!(
         "valerter_parse_errors_total",
         "Total number of log parsing errors (regex no-match or invalid JSON)"
     );

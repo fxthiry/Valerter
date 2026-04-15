@@ -17,6 +17,8 @@ pub enum NotifierConfig {
     Webhook(WebhookNotifierConfig),
     #[serde(rename = "email")]
     Email(EmailNotifierConfig),
+    #[serde(rename = "telegram")]
+    Telegram(TelegramNotifierConfig),
 }
 
 /// Configuration for a Mattermost notifier instance.
@@ -59,6 +61,28 @@ pub struct EmailNotifierConfig {
     pub body_template: Option<String>,
     #[serde(default)]
     pub body_template_file: Option<String>,
+}
+
+/// Configuration for a Telegram Bot notifier instance.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramNotifierConfig {
+    /// Bot API token (supports `${ENV_VAR}` substitution).
+    pub bot_token: String,
+    /// One or more Telegram chat IDs to send messages to. Must be non-empty.
+    pub chat_ids: Vec<String>,
+    /// Telegram parse mode for the message text. Defaults to `HTML`.
+    #[serde(default)]
+    pub parse_mode: Option<String>,
+    /// When true, delivery is silent (no push sound).
+    #[serde(default)]
+    pub disable_notification: Option<bool>,
+    /// When true, Telegram does not expand link previews in the message.
+    #[serde(default)]
+    pub disable_web_page_preview: Option<bool>,
+    /// Optional Jinja template for the message body. Defaults to the built-in HTML template.
+    #[serde(default)]
+    pub body_template: Option<String>,
 }
 
 /// SMTP server configuration.
@@ -153,6 +177,68 @@ mod tests {
             }
             _ => panic!("Expected Email variant"),
         }
+    }
+
+    #[test]
+    fn telegram_notifier_config_parses() {
+        let yaml = r#"
+            type: telegram
+            bot_token: "${TELEGRAM_BOT_TOKEN}"
+            chat_ids:
+              - "-100123456789"
+              - "-100987654321"
+            parse_mode: HTML
+            disable_notification: false
+            disable_web_page_preview: true
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Telegram(cfg) => {
+                assert_eq!(cfg.bot_token, "${TELEGRAM_BOT_TOKEN}");
+                assert_eq!(cfg.chat_ids.len(), 2);
+                assert_eq!(cfg.parse_mode.as_deref(), Some("HTML"));
+                assert_eq!(cfg.disable_notification, Some(false));
+                assert_eq!(cfg.disable_web_page_preview, Some(true));
+                assert!(cfg.body_template.is_none());
+            }
+            _ => panic!("Expected Telegram variant"),
+        }
+    }
+
+    #[test]
+    fn telegram_notifier_config_defaults() {
+        let yaml = r#"
+            type: telegram
+            bot_token: "token123"
+            chat_ids: ["-100"]
+        "#;
+        let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            NotifierConfig::Telegram(cfg) => {
+                assert_eq!(cfg.bot_token, "token123");
+                assert_eq!(cfg.chat_ids, vec!["-100".to_string()]);
+                assert!(cfg.parse_mode.is_none());
+                assert!(cfg.disable_notification.is_none());
+                assert!(cfg.disable_web_page_preview.is_none());
+                assert!(cfg.body_template.is_none());
+            }
+            _ => panic!("Expected Telegram variant"),
+        }
+    }
+
+    #[test]
+    fn telegram_notifier_config_rejects_unknown_fields() {
+        let yaml = r#"
+            type: telegram
+            bot_token: "x"
+            chat_ids: ["-1"]
+            icon_url: "nope"
+        "#;
+        let result: Result<NotifierConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "icon_url should be rejected by deny_unknown_fields"
+        );
     }
 
     #[test]

@@ -501,6 +501,14 @@ impl Config {
                     super::notifiers::NotifierConfig::Email(_) => {
                         // Email notifier doesn't have URLs to validate
                     }
+                    super::notifiers::NotifierConfig::Telegram(cfg) => {
+                        if cfg.chat_ids.is_empty() {
+                            errors.push(ConfigError::ValidationError(format!(
+                                "notifier '{}': chat_ids must not be empty",
+                                name
+                            )));
+                        }
+                    }
                 }
             }
         }

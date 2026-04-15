@@ -49,7 +49,7 @@ See [Cisco Switches example](examples/cisco-switches/) for a complete implementa
 
 ## Features
 
-- **Multi-channel notifications** — Webhook (PagerDuty, Slack, Discord), Email SMTP, Mattermost
+- **Multi-channel notifications** — Webhook (PagerDuty, Slack, Discord), Email SMTP, Mattermost, Telegram
 - **Full log context** — Alerts include the actual log line and extracted fields
 - **Intelligent throttling** — Avoid alert spam with per-key rate limiting
 - **Real-time alerting** — Less than 5 seconds from log event to notification
@@ -126,7 +126,7 @@ rules:
 
 - **[Getting Started](docs/getting-started.md)** — Installation and first setup
 - **[Configuration](docs/configuration.md)** — Full configuration reference
-- **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost setup
+- **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost, Telegram setup
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
 - **[Performance](docs/performance.md)** — Benchmarks and capacity planning
 - **[Architecture](docs/architecture.md)** — How Valerter works
