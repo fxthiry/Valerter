@@ -113,7 +113,11 @@ defaults:
 #    the slots valerter fills and hands off to notifiers:
 #      title         Alert title (required)
 #      body          Alert body, plain text or Markdown (required)
-#      body_html     HTML version for email (optional, falls back to body)
+#      body_html     HTML-enriched version used ONLY by the email notifier
+#                    (Telegram, Mattermost, and webhook all read `body` and
+#                    ignore `body_html`). To format a Telegram alert, put
+#                    `<b>`/`<i>`/`<code>` inline in `body` — `parse_mode: HTML`
+#                    is Telegram's default.
 #      accent_color  Hex color for visual indicators (optional, e.g., "#ff0000")
 #
 # Note: `title` and `body` are NOT variables you can reference on the right.

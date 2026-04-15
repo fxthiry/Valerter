@@ -15,6 +15,13 @@ Valerter supports multiple notification channels. Configure them in the `notifie
 
 The most flexible notifier - works with any HTTP API.
 
+> **Note about `body_html`** — Webhook reads the outer template's `body`
+> output key (and `title`, `rule_name`, `log_timestamp`, `log_timestamp_formatted`)
+> inside its own `body_template`. It does **not** receive `body_html`;
+> `body_html` is email-only. If your HTTP target needs HTML, put it in `body`
+> at the outer template and reference `{{ body }}` from the webhook
+> `body_template`.
+
 ### Configuration
 
 ```yaml
@@ -218,6 +225,11 @@ notifiers:
 
 Send alerts to Mattermost channels via incoming webhooks.
 
+> **Note about `body_html`** — Mattermost reads the outer template's `body`
+> output key, **not** `body_html`. `body_html` is email-only. Mattermost
+> renders Markdown in `body` (`**bold**`, `*italic*`, fenced code blocks,
+> lists, links); write your formatting there.
+
 ### Configuration
 
 ```yaml
@@ -264,6 +276,13 @@ This helps operators quickly locate the original log entry in VictoriaLogs.
 ## Telegram
 
 Send alerts to one or more Telegram chats via the Bot API.
+
+> **Note about `body_html`** — Telegram reads the outer template's `body`
+> output key, **not** `body_html`. `body_html` is email-only. For rich
+> formatting inside Telegram, put the markup directly in `body` using
+> Telegram's supported HTML subset: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`,
+> `<pre>`, `<blockquote>`, `<a href="…">`, `<span>`, `<tg-spoiler>`.
+> Keep `parse_mode: HTML` (the default) so the Bot API interprets those tags.
 
 ### Prerequisites
 
