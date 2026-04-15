@@ -700,6 +700,7 @@ mod tests {
     // earlier unit tests cannot exercise. Requests are redirected to a local
     // wiremock server via `TelegramNotifier::new_for_tests`.
 
+    use serial_test::serial;
     use wiremock::matchers::{body_partial_json, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -710,6 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_all_chats_success_returns_ok() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -727,6 +729,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_partial_success_returns_ok_and_does_not_stop_after_failure() {
         let server = MockServer::start().await;
         // Every chat gets 200 — we verify the important property: 3 requests
@@ -753,6 +756,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_one_permanent_failure_in_middle_still_returns_ok_partial() {
         // wiremock can't route per chat_id (it's in the JSON body), but we can
         // assert the partial-success behaviour by exhausting a single mock
@@ -795,6 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_all_chats_permanent_failure_returns_err() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -814,6 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_payload_has_expected_fields() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -833,6 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_retries_on_5xx_then_succeeds() {
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicU32::new(0));
@@ -859,6 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_exhausts_retries_on_persistent_5xx() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -875,26 +883,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_network_error_exhausts_retries() {
-        // Start then immediately drop the mock server so requests fail at the
-        // TCP level. Gives us coverage of the Err(reqwest::Error) branch in
-        // the retry loop.
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
-        let endpoint = format!("{}/botTESTTOKEN/sendMessage", uri);
-        let notifier = TelegramNotifier::new_for_tests(
-            "tg-test",
-            endpoint,
-            vec!["-100A".to_string()],
-            reqwest::Client::new(),
-        );
+        // Point the notifier at a TEST-NET-1 address (RFC 5737, reserved for
+        // documentation and never routed). The connection attempt fails at
+        // the TCP level, exercising the Err(reqwest::Error) branch of the
+        // retry loop without depending on a released port.
+        let endpoint = "http://192.0.2.1:1/botTESTTOKEN/sendMessage".to_string();
+        // Short timeout on the shared client so the test doesn't take 30s
+        // waiting for three TCP timeouts to fire.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let notifier =
+            TelegramNotifier::new_for_tests("tg-test", endpoint, vec!["-100A".to_string()], client);
         let alert = sample_alert("hi", "body");
         let err = notifier.send(&alert).await.unwrap_err();
         assert!(matches!(err, NotifyError::SendFailed(_)));
     }
 
     #[tokio::test]
+    #[serial]
     async fn send_body_under_limit_is_not_truncated() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
