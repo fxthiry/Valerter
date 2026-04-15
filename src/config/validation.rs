@@ -170,8 +170,7 @@ mod tests {
         // would silently skip this `{% if %}` body (falsy undefined) and miss
         // the unknown filter. TruthyChainable keeps is_true() = true so the
         // body is walked.
-        let result =
-            validate_template_render("{% if a.b %}{{ x | nosuchfilter }}{% endif %}");
+        let result = validate_template_render("{% if a.b %}{{ x | nosuchfilter }}{% endif %}");
         assert!(
             result.is_err(),
             "unknown filter inside if-block should still be caught"
@@ -189,8 +188,7 @@ mod tests {
     fn validate_template_render_allows_for_loop_over_undefined() {
         // Regression guard: initial TruthyChainable had NonEnumerable + Plain repr,
         // which errored on `{% for %}` even though Lenient + json!({}) didn't.
-        let result =
-            validate_template_render("{% for x in items %}{{ x }}{% endfor %}");
+        let result = validate_template_render("{% for x in items %}{{ x }}{% endfor %}");
         assert!(
             result.is_ok(),
             "for-loop over undefined should validate cleanly: {:?}",

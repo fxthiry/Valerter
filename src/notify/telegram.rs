@@ -1051,10 +1051,7 @@ mod tests {
         // produce a payload that Telegram's HTML parse_mode would reject.
         let alert = sample_alert("<script>alert(&amp;)</script>", "");
         let (text, _) = fallback_if_empty("", &alert).unwrap();
-        assert_eq!(
-            text,
-            "<b>&lt;script&gt;alert(&amp;amp;)&lt;/script&gt;</b>"
-        );
+        assert_eq!(text, "<b>&lt;script&gt;alert(&amp;amp;)&lt;/script&gt;</b>");
     }
 
     #[test]

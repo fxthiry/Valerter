@@ -633,7 +633,11 @@ mod tests {
     // Task 9: Tests email_body_html rendering with HTML auto-escape
     // ===================================================================
 
-    fn make_template_with_email_body_html(title: &str, body: &str, email_body_html: &str) -> CompiledTemplate {
+    fn make_template_with_email_body_html(
+        title: &str,
+        body: &str,
+        email_body_html: &str,
+    ) -> CompiledTemplate {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
