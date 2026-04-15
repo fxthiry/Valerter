@@ -10,7 +10,9 @@ use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
 use minijinja::{Environment, context};
+use regex::Regex;
 use serde::Serialize;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::Instrument;
 
@@ -100,6 +102,56 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
         log_timestamp_formatted => &alert.log_timestamp_formatted,
     })
     .map_err(|e| NotifyError::TemplateError(e.to_string()))
+}
+
+/// Strips tags like `<b>`, `<i></i>` from a rendered Telegram HTML body.
+static HTML_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]*>").expect("valid regex"));
+
+/// Cap on title length when wrapping into `<b>…</b>` for the fallback, to stay
+/// under `TELEGRAM_TEXT_MAX_CODEPOINTS` even after HTML-escaping and wrapping.
+const FALLBACK_TITLE_MAX_CODEPOINTS: usize = TELEGRAM_TEXT_MAX_CODEPOINTS - 16;
+
+/// Escape the three characters Telegram's HTML parse_mode treats as markup.
+fn escape_telegram_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Return a fallback text + reason when `text` has no visible content, else `None`.
+fn fallback_if_empty(text: &str, alert: &AlertPayload) -> Option<(String, &'static str)> {
+    let reason = if text.is_empty() {
+        "empty_after_render"
+    } else if text.trim().is_empty() {
+        "whitespace_only"
+    } else if HTML_TAG_REGEX.replace_all(text, "").trim().is_empty() {
+        "no_text_content"
+    } else {
+        return None;
+    };
+
+    let fallback = if !alert.message.title.trim().is_empty() {
+        let capped: String = alert
+            .message
+            .title
+            .chars()
+            .take(FALLBACK_TITLE_MAX_CODEPOINTS)
+            .collect();
+        format!("<b>{}</b>", escape_telegram_html(&capped))
+    } else if !alert.rule_name.trim().is_empty() {
+        format!("Alert: {}", escape_telegram_html(&alert.rule_name))
+    } else {
+        "(valerter alert, empty render)".to_string()
+    };
+    Some((fallback, reason))
 }
 
 /// Clamp a parsed retry-after value to the `[RETRY_AFTER_MIN, RETRY_AFTER_MAX]`
@@ -237,7 +289,18 @@ impl TelegramNotifier {
             .as_deref()
             .unwrap_or(DEFAULT_BODY_TEMPLATE);
         let rendered = render_body_template(template, alert)?;
-        Ok(truncate_text(&rendered))
+        let guarded = if let Some((fallback, reason)) = fallback_if_empty(&rendered, alert) {
+            tracing::warn!(
+                rule_name = %alert.rule_name,
+                notifier_name = %self.name,
+                reason = reason,
+                "Telegram body_template rendered empty, applied fallback"
+            );
+            fallback
+        } else {
+            rendered
+        };
+        Ok(truncate_text(&guarded))
     }
 
     /// Send the prepared text to a single chat_id with retry. Returns `Ok` on
@@ -928,4 +991,138 @@ mod tests {
     //    churn in the rest of the module).
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ── fallback_if_empty (#26 empty-render guard) ───────────────────────
+
+    #[test]
+    fn fallback_if_empty_triggers_on_empty() {
+        let alert = sample_alert("", "");
+        let out = fallback_if_empty("", &alert);
+        assert!(out.is_some(), "empty string should trigger fallback");
+        let (_, reason) = out.unwrap();
+        assert_eq!(reason, "empty_after_render");
+    }
+
+    #[test]
+    fn fallback_if_empty_triggers_on_whitespace() {
+        let alert = sample_alert("", "");
+        let out = fallback_if_empty("  \n\t ", &alert);
+        assert!(out.is_some(), "whitespace-only should trigger fallback");
+        let (_, reason) = out.unwrap();
+        assert_eq!(reason, "whitespace_only");
+    }
+
+    #[test]
+    fn fallback_if_empty_triggers_on_html_only() {
+        let alert = sample_alert("", "");
+        let out = fallback_if_empty("<b></b>\n", &alert);
+        assert!(out.is_some(), "html-only should trigger fallback");
+        let (_, reason) = out.unwrap();
+        assert_eq!(reason, "no_text_content");
+    }
+
+    #[test]
+    fn fallback_if_empty_uses_title_when_available() {
+        let alert = sample_alert("Disk full", "");
+        let (text, _) = fallback_if_empty("<b></b>\n", &alert).unwrap();
+        assert_eq!(text, "<b>Disk full</b>");
+    }
+
+    #[test]
+    fn fallback_if_empty_uses_rule_name_as_fallback() {
+        // title is empty → fallback leans on rule_name.
+        let mut alert = sample_alert("", "");
+        alert.rule_name = "nginx-5xx".to_string();
+        let (text, _) = fallback_if_empty("", &alert).unwrap();
+        assert_eq!(text, "Alert: nginx-5xx");
+    }
+
+    #[test]
+    fn fallback_if_empty_uses_literal_when_all_empty() {
+        let mut alert = sample_alert("", "");
+        alert.rule_name = String::new();
+        let (text, _) = fallback_if_empty("", &alert).unwrap();
+        assert_eq!(text, "(valerter alert, empty render)");
+    }
+
+    #[test]
+    fn fallback_escapes_html_specials_in_title() {
+        // Post-review guard: a title containing `<`, `>`, or `&` must not
+        // produce a payload that Telegram's HTML parse_mode would reject.
+        let alert = sample_alert("<script>alert(&amp;)</script>", "");
+        let (text, _) = fallback_if_empty("", &alert).unwrap();
+        assert_eq!(
+            text,
+            "<b>&lt;script&gt;alert(&amp;amp;)&lt;/script&gt;</b>"
+        );
+    }
+
+    #[test]
+    fn fallback_escapes_html_specials_in_rule_name() {
+        let mut alert = sample_alert("", "");
+        alert.rule_name = "a<b & c".to_string();
+        let (text, _) = fallback_if_empty("", &alert).unwrap();
+        assert_eq!(text, "Alert: a&lt;b &amp; c");
+    }
+
+    #[test]
+    fn fallback_caps_long_title_to_stay_under_telegram_limit() {
+        // A pathological 10k-codepoint title must not overflow the
+        // Telegram `text` limit once wrapped in `<b>…</b>`.
+        let long_title: String = "x".repeat(10_000);
+        let alert = sample_alert(&long_title, "");
+        let (text, _) = fallback_if_empty("", &alert).unwrap();
+        assert!(text.chars().count() <= TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(text.starts_with("<b>"));
+        assert!(text.ends_with("</b>"));
+    }
+
+    #[test]
+    fn fallback_if_empty_returns_none_for_non_empty() {
+        let alert = sample_alert("", "");
+        assert!(fallback_if_empty("Hello world", &alert).is_none());
+    }
+
+    #[test]
+    fn fallback_if_empty_returns_none_for_html_with_text() {
+        let alert = sample_alert("", "");
+        assert!(fallback_if_empty("<b>ok</b>", &alert).is_none());
+    }
+
+    // ── prepare_text empty-guard integration ─────────────────────────────
+
+    #[test]
+    fn prepare_text_substitutes_on_empty_render() {
+        // A body_template that renders to literally empty (no vars in context).
+        let client = reqwest::Client::new();
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some("".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
+        let alert = sample_alert("Disk full", "");
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        assert!(!text.trim().is_empty(), "fallback text must not be empty");
+        assert_eq!(text, "<b>Disk full</b>");
+    }
+
+    #[test]
+    fn prepare_text_substitutes_on_html_only_render() {
+        // Reproduces issue #26: default template + empty title/body → "<b></b>\n".
+        let client = reqwest::Client::new();
+        let cfg = config_with(vec!["-100".to_string()]);
+        let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
+        let mut alert = sample_alert("", "");
+        alert.rule_name = "nginx-5xx".to_string();
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        assert_eq!(text, "Alert: nginx-5xx");
+    }
+
+    #[test]
+    fn prepare_text_preserves_non_empty_render() {
+        let client = reqwest::Client::new();
+        let cfg = config_with(vec!["-100".to_string()]);
+        let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
+        let alert = sample_alert("hello", "world");
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        assert_eq!(text, "<b>hello</b>\nworld");
+    }
 }
