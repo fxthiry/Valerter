@@ -298,7 +298,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test Alert".to_string(),
             body: "Something happened".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         };
 
@@ -332,7 +332,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Simple Alert".to_string(),
             body: "Body text".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: None,
         };
 
@@ -354,7 +354,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: None,
         };
 
@@ -380,7 +380,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#00ff00".to_string()),
         };
 
@@ -411,7 +411,7 @@ mod tests {
         let message = RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: None,
         };
 

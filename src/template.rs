@@ -41,7 +41,7 @@ pub struct RenderedMessage {
     /// Body text of the message (attachment text for Mattermost).
     pub body: String,
     /// Optional HTML body for email notifications (rendered with HTML auto-escape).
-    pub body_html: Option<String>,
+    pub email_body_html: Option<String>,
     /// Optional accent color for visual indicators (hex format: #rrggbb).
     /// Used for email colored dot and Mattermost sidebar color.
     pub accent_color: Option<String>,
@@ -59,7 +59,7 @@ pub struct RenderedMessage {
 pub struct TemplateEngine {
     /// Pre-created Jinja environment (created once, reused for performance).
     env: Environment<'static>,
-    /// Pre-created Jinja environment with HTML auto-escape (for body_html rendering).
+    /// Pre-created Jinja environment with HTML auto-escape (for email_body_html rendering).
     html_env: Environment<'static>,
     /// Compiled templates indexed by name.
     templates: HashMap<String, CompiledTemplate>,
@@ -87,7 +87,7 @@ impl TemplateEngine {
         // This returns empty string instead of erroring on undefined variables
         env.set_undefined_behavior(UndefinedBehavior::Lenient);
 
-        // Pre-create HTML environment for body_html rendering (performance optimization)
+        // Pre-create HTML environment for email_body_html rendering (performance optimization)
         let mut html_env = Environment::new();
         html_env.set_undefined_behavior(UndefinedBehavior::Lenient);
         html_env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
@@ -137,9 +137,9 @@ impl TemplateEngine {
         let title = self.render_string(&template.title, fields)?;
         let body = self.render_string(&template.body, fields)?;
 
-        // Render body_html with HTML auto-escape if present
-        let body_html = if let Some(body_html_template) = &template.body_html {
-            Some(self.render_string_html_escaped(body_html_template, fields)?)
+        // Render email_body_html with HTML auto-escape if present
+        let email_body_html = if let Some(email_body_html_template) = &template.email_body_html {
+            Some(self.render_string_html_escaped(email_body_html_template, fields)?)
         } else {
             None
         };
@@ -149,35 +149,37 @@ impl TemplateEngine {
         tracing::trace!(
             title_len = title.len(),
             body_len = body.len(),
-            has_body_html = body_html.is_some(),
+            has_email_body_html = email_body_html.is_some(),
             "Template rendered successfully"
         );
         Ok(RenderedMessage {
             title,
             body,
-            body_html,
+            email_body_html,
             accent_color: template.accent_color.clone(),
         })
     }
 
     /// Render a single template string with fields (no auto-escape).
     fn render_string(&self, template_str: &str, fields: &Value) -> Result<String, TemplateError> {
+        let ctx = crate::parser::unflatten_dotted_keys(fields);
         self.env
-            .render_str(template_str, fields)
+            .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
     }
 
     /// Render a single template string with HTML auto-escape for security.
-    /// Used for body_html to prevent XSS from log data injected into emails.
+    /// Used for email_body_html to prevent XSS from log data injected into emails.
     fn render_string_html_escaped(
         &self,
         template_str: &str,
         fields: &Value,
     ) -> Result<String, TemplateError> {
+        let ctx = crate::parser::unflatten_dotted_keys(fields);
         self.html_env
-            .render_str(template_str, fields)
+            .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
@@ -223,7 +225,7 @@ impl TemplateEngine {
                 RenderedMessage {
                     title: format!("[{}] Alert", rule_name),
                     body: format!("Template render failed: {}\n\nCheck logs for details.", e),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: Some("#ff0000".to_string()), // Red for error
                 }
             }
@@ -249,7 +251,7 @@ mod tests {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: None,
         }
     }
@@ -262,7 +264,7 @@ mod tests {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: accent_color.map(String::from),
         }
     }
@@ -551,14 +553,14 @@ mod tests {
         let msg1 = RenderedMessage {
             title: "Title".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#000000".to_string()),
         };
 
         let msg2 = RenderedMessage {
             title: "Title".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#000000".to_string()),
         };
 
@@ -628,24 +630,28 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 9: Tests body_html rendering with HTML auto-escape
+    // Task 9: Tests email_body_html rendering with HTML auto-escape
     // ===================================================================
 
-    fn make_template_with_body_html(title: &str, body: &str, body_html: &str) -> CompiledTemplate {
+    fn make_template_with_email_body_html(
+        title: &str,
+        body: &str,
+        email_body_html: &str,
+    ) -> CompiledTemplate {
         CompiledTemplate {
             title: title.to_string(),
             body: body.to_string(),
-            body_html: Some(body_html.to_string()),
+            email_body_html: Some(email_body_html.to_string()),
             accent_color: None,
         }
     }
 
     #[test]
-    fn render_body_html_is_populated() {
+    fn render_email_body_html_is_populated() {
         let mut templates = HashMap::new();
         templates.insert(
             "email_alert".to_string(),
-            make_template_with_body_html(
+            make_template_with_email_body_html(
                 "Alert: {{ host }}",
                 "Host {{ host }} down",
                 "<p><strong>Host:</strong> {{ host }}</p>",
@@ -659,20 +665,20 @@ mod tests {
 
         assert_eq!(result.title, "Alert: server-01");
         assert_eq!(result.body, "Host server-01 down");
-        assert!(result.body_html.is_some());
+        assert!(result.email_body_html.is_some());
         assert_eq!(
-            result.body_html.unwrap(),
+            result.email_body_html.unwrap(),
             "<p><strong>Host:</strong> server-01</p>"
         );
     }
 
     #[test]
-    fn render_body_html_escapes_html_in_variables() {
+    fn render_email_body_html_escapes_html_in_variables() {
         // AC3: Variables with HTML should be escaped
         let mut templates = HashMap::new();
         templates.insert(
             "email_alert".to_string(),
-            make_template_with_body_html("Alert", "body", "<p>Hostname: {{ hostname }}</p>"),
+            make_template_with_email_body_html("Alert", "body", "<p>Hostname: {{ hostname }}</p>"),
         );
 
         let engine = TemplateEngine::new(templates);
@@ -680,22 +686,81 @@ mod tests {
 
         let result = engine.render("email_alert", &fields).unwrap();
 
-        let body_html = result.body_html.unwrap();
+        let email_body_html = result.email_body_html.unwrap();
         // HTML should be escaped
         assert!(
-            body_html.contains("&lt;script&gt;"),
+            email_body_html.contains("&lt;script&gt;"),
             "Script tags should be escaped: {}",
-            body_html
+            email_body_html
         );
         assert!(
-            !body_html.contains("<script>"),
+            !email_body_html.contains("<script>"),
             "Raw script tags should NOT be present: {}",
-            body_html
+            email_body_html
+        );
+    }
+
+    // ===================================================================
+    // Issue #25: dotted flat-key resolution at render time
+    // ===================================================================
+
+    #[test]
+    fn render_resolves_dotted_flat_key_via_unflatten() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "alert".to_string(),
+            make_template(
+                "{{ nginx.http.request_id }}",
+                "id={{ nginx.http.request_id }}",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"nginx.http.request_id": "abc"});
+
+        let result = engine.render("alert", &fields).unwrap();
+        assert_eq!(result.title, "abc");
+        assert_eq!(result.body, "id=abc");
+    }
+
+    #[test]
+    fn render_issue_25_full_template_end_to_end() {
+        // Mirrors the user's config in issue #25.
+        let mut templates = HashMap::new();
+        templates.insert(
+            "my_template".to_string(),
+            make_template_with_email_body_html(
+                "{{ title }}",
+                "{{ body }}",
+                "<p>{{ hostname }} - {{ nginx.http.request_id }} - {{ nginx.http.method }}</p>",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({
+            "title": "T",
+            "body": "B",
+            "hostname": "srv-01",
+            "nginx.http.request_id": "req-42",
+            "nginx.http.method": "GET",
+            "nginx.http.status_code": "400"
+        });
+
+        let result = engine.render("my_template", &fields).unwrap();
+        assert_eq!(result.title, "T");
+        assert_eq!(result.body, "B");
+        let email_body_html = result.email_body_html.unwrap();
+        assert!(
+            email_body_html.contains("srv-01")
+                && email_body_html.contains("req-42")
+                && email_body_html.contains("GET"),
+            "expected all dotted fields rendered, got: {}",
+            email_body_html
         );
     }
 
     #[test]
-    fn render_body_html_none_when_template_has_no_body_html() {
+    fn render_email_body_html_none_when_template_has_no_email_body_html() {
         let mut templates = HashMap::new();
         templates.insert(
             "mattermost_alert".to_string(),
@@ -708,8 +773,8 @@ mod tests {
         let result = engine.render("mattermost_alert", &fields).unwrap();
 
         assert!(
-            result.body_html.is_none(),
-            "body_html should be None when template doesn't have it"
+            result.email_body_html.is_none(),
+            "email_body_html should be None when template doesn't have it"
         );
     }
 }

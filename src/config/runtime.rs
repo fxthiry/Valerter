@@ -53,7 +53,7 @@ pub struct CompiledThrottle {
 pub struct CompiledTemplate {
     pub title: String,
     pub body: String,
-    pub body_html: Option<String>,
+    pub email_body_html: Option<String>,
     pub accent_color: Option<String>,
 }
 
@@ -146,7 +146,7 @@ impl Config {
                     CompiledTemplate {
                         title: template.title,
                         body: template.body,
-                        body_html: template.body_html,
+                        email_body_html: template.email_body_html,
                         accent_color: template.accent_color,
                     },
                 )

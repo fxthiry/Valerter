@@ -1,8 +1,45 @@
 //! Template and color validation utilities.
 
+use minijinja::value::{Enumerator, Object, ObjectRepr, Value};
 use minijinja::{Environment, UndefinedBehavior};
 use regex::Regex;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+
+/// Sentinel context object used during template validation.
+///
+/// Issue #25: validating templates that reference dotted VictoriaLogs fields
+/// (`{{ nginx.http.request_id }}`) used to fail because chained attribute access
+/// against an empty `json!({})` returned `undefined` instead of another value.
+///
+/// `TruthyChainable` returns itself on every attribute access (so chains never
+/// hit `undefined`), is always truthy (so `{% if x.y %}` walks the body and
+/// validates filters/syntax inside), stringifies as empty, and iterates as an
+/// empty sequence (so `{% for x in tc %}` and `{{ tc | length }}` do not error
+/// — matching the prior `Lenient + json!({})` behaviour).
+#[derive(Debug)]
+struct TruthyChainable;
+
+impl Object for TruthyChainable {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    fn get_value(self: &Arc<Self>, _key: &Value) -> Option<Value> {
+        Some(Value::from_dyn_object(self.clone()))
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Empty
+    }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
+    }
+
+    fn render(self: &Arc<Self>, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
 
 /// Validates Jinja template syntax.
 pub(crate) fn validate_jinja_template(source: &str) -> Result<(), String> {
@@ -26,7 +63,7 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
     let tmpl = env
         .get_template("_render_test")
         .map_err(|e| e.to_string())?;
-    tmpl.render(serde_json::json!({}))
+    tmpl.render(Value::from_object(TruthyChainable))
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -109,5 +146,63 @@ mod tests {
     fn validate_jinja_template_accepts_valid_syntax() {
         let result = validate_jinja_template("{{ name }} - {% if x %}yes{% endif %}");
         assert!(result.is_ok());
+    }
+
+    // ============================================================
+    // Issue #25: dotted-field template validation
+    // ============================================================
+
+    #[test]
+    fn validate_template_render_accepts_chained_undefined() {
+        // The bug: `{{ a.b.c }}` against `json!({})` returned "undefined value".
+        // With TruthyChainable, chained access on undefined should resolve.
+        let result = validate_template_render("{{ a.b.c }}");
+        assert!(
+            result.is_ok(),
+            "chained undefined access should validate cleanly: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_template_render_still_catches_filter_in_if_block() {
+        // Regression guard: a straight switch to UndefinedBehavior::Chainable
+        // would silently skip this `{% if %}` body (falsy undefined) and miss
+        // the unknown filter. TruthyChainable keeps is_true() = true so the
+        // body is walked.
+        let result = validate_template_render("{% if a.b %}{{ x | nosuchfilter }}{% endif %}");
+        assert!(
+            result.is_err(),
+            "unknown filter inside if-block should still be caught"
+        );
+        assert!(result.unwrap_err().contains("nosuchfilter"));
+    }
+
+    #[test]
+    fn validate_template_render_catches_syntax_errors() {
+        let result = validate_template_render("{{ foo.");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_template_render_allows_for_loop_over_undefined() {
+        // Regression guard: initial TruthyChainable had NonEnumerable + Plain repr,
+        // which errored on `{% for %}` even though Lenient + json!({}) didn't.
+        let result = validate_template_render("{% for x in items %}{{ x }}{% endfor %}");
+        assert!(
+            result.is_ok(),
+            "for-loop over undefined should validate cleanly: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_template_render_allows_length_on_undefined() {
+        let result = validate_template_render("{{ (items | length) > 0 }}");
+        assert!(
+            result.is_ok(),
+            "length on undefined should validate cleanly: {:?}",
+            result
+        );
     }
 }

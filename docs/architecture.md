@@ -157,7 +157,7 @@ At startup, Valerter validates (in order):
 3. **Template syntax** — All templates compile (minijinja)
 4. **Notifier config** — URLs, credentials, env vars resolve correctly
 5. **Destinations exist** — Rule destinations match notifier names in registry
-6. **Email body_html** — Templates used with email destinations have `body_html`
+6. **Email template body** — Templates used with email destinations have `email_body_html`
 7. **Mattermost channel warning** — Warns if `mattermost_channel` set but no Mattermost notifier in destinations
 
 If any validation fails, Valerter exits immediately with a clear error message.
@@ -211,7 +211,7 @@ tokio::spawn(async { process().unwrap(); }); // Silent crash
 ## Security
 
 - **Config file:** `chmod 600` recommended (secrets in plaintext)
-- **HTML escaping:** `body_html` templates auto-escape variables (XSS prevention)
+- **HTML escaping:** `email_body_html` templates auto-escape variables (XSS prevention)
 - **TLS verification:** Enabled by default (`tls.verify: true`)
 - **No shell execution:** No user input ever reaches a shell
 

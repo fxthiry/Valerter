@@ -17,7 +17,7 @@ templates:
       Alert triggered at {{ timestamp }}
       Host: {{ host | default("unknown") }}
       Message: {{ _msg | default("N/A") }}
-    body_html: |
+    email_body_html: |
       <h2>Alert triggered at {{ timestamp }}</h2>
       <p><strong>Host:</strong> {{ host | default("unknown") }}</p>
       <p><strong>Message:</strong> {{ _msg | default("N/A") }}</p>

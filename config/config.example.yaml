@@ -97,24 +97,38 @@ defaults:
 # └────────────────────────────────────────────────────────────────────────────┘
 # Message templates using Jinja2 syntax (minijinja).
 #
-# Built-in variables:
-#   rule_name                - Name of the triggered rule
-#   log_timestamp            - Original log timestamp (ISO8601)
-#   log_timestamp_formatted  - Human-readable timestamp (uses defaults.timestamp_timezone)
+# A template entry has two sides:
 #
-# Parser variables:
-#   Any field extracted by the rule's parser (JSON fields or regex named groups)
+# 1. Template variables AVAILABLE on the right-hand side of each line below.
+#    These come from the matched VictoriaLogs event and the runtime:
+#      _msg, _time, _stream                   VL built-in event fields
+#                                             (`_stream_id` is present only on
+#                                              streams configured server-side)
+#      <any parser-extracted field>           JSON field or named regex group
+#      rule_name                              name of the triggered rule
+#      log_timestamp                          event timestamp (ISO8601)
+#      log_timestamp_formatted                human timestamp (defaults.timestamp_timezone)
 #
-# Fields:
-#   title        - Alert title (required)
-#   body         - Alert body, plain text or Markdown (required)
-#   body_html    - HTML version for email (optional, falls back to body)
-#   accent_color - Hex color for visual indicators (optional, e.g., "#ff0000")
+# 2. Template OUTPUT KEYS that you define below (left-hand side). These are
+#    the slots valerter fills and hands off to notifiers:
+#      title         Alert title (required)
+#      body          Alert body, plain text or Markdown (required)
+#      email_body_html     HTML-enriched version used ONLY by the email notifier
+#                    (Telegram, Mattermost, and webhook all read `body` and
+#                    ignore `email_body_html`). To format a Telegram alert, put
+#                    `<b>`/`<i>`/`<code>` inline in `body` — `parse_mode: HTML`
+#                    is Telegram's default.
+#      accent_color  Hex color for visual indicators (optional, e.g., "#ff0000")
+#
+# Note: `title` and `body` are NOT variables you can reference on the right.
+# If you want the raw log line, use `{{ _msg }}`.
 
 templates:
   default_alert:
-    title: "{{ title | default('Alert') }}"
-    body: "{{ body }}"
+    title: "{{ rule_name }}"
+    # _msg is the raw log line from VictoriaLogs — works on any event without
+    # needing a parser. Replace with a parsed field for richer templates.
+    body: "{{ _msg }}"
     accent_color: "#3498db"
 
   # ── Example: Severity-based template ───────────────────────────────────────
@@ -124,7 +138,7 @@ templates:
   #   body: |
   #     **Host:** {{ host }}
   #     **Message:** {{ message }}
-  #   body_html: |
+  #   email_body_html: |
   #     <h2 style="color: red;">{{ title }}</h2>
   #     <p><strong>Host:</strong> {{ host }}</p>
   #     <p>{{ message }}</p>

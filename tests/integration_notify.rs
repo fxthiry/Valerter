@@ -23,7 +23,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),

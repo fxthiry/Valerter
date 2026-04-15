@@ -23,7 +23,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
@@ -38,7 +38,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: rule_name.to_string(),
@@ -636,7 +636,7 @@ fn alert_payload_clone_works() {
         message: RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
-            body_html: None,
+            email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
         },
         rule_name: "my_rule".to_string(),

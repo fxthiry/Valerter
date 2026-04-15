@@ -125,7 +125,7 @@ templates:
       ```
       {{ _msg }}
       ```
-    body_html: |
+    email_body_html: |
       <!-- HTML version for email -->
 ```
 
