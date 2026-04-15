@@ -9,6 +9,7 @@ Valerter supports multiple notification channels. Configure them in the `notifie
 | `webhook` | Generic HTTP endpoint | PagerDuty, Slack, Discord, custom APIs |
 | `email` | SMTP email | Ops teams, compliance, audit trails |
 | `mattermost` | Mattermost incoming webhook | Team chat notifications |
+| `telegram` | Telegram Bot API | Mobile alerts, small teams, channels |
 
 ## Webhook (Generic HTTP)
 
@@ -259,6 +260,77 @@ Log time: 15/01/2026 11:00:00 CET
 ```
 
 This helps operators quickly locate the original log entry in VictoriaLogs.
+
+## Telegram
+
+Send alerts to one or more Telegram chats via the Bot API.
+
+### Prerequisites
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) and note the token it gives you.
+2. Add the bot to each target chat/group/channel — it must be a member (or admin, for channels) to post.
+3. Get the `chat_id` for each destination. The simplest way: send a message in the chat, then call `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id` from the response. For channels the id is negative (starts with `-100`).
+
+### Configuration
+
+```yaml
+notifiers:
+  telegram-alerts:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"   # REQUIRED (supports ${ENV_VAR})
+    chat_ids:                             # REQUIRED (non-empty)
+      - "-100123456789"
+      - "-100987654321"
+    parse_mode: HTML                      # Optional (default: HTML)
+    disable_notification: false           # Optional (silent delivery)
+    disable_web_page_preview: true        # Optional (avoid link-preview noise)
+    body_template: |                      # Optional (Jinja)
+      <b>{{ title|e }}</b>
+      {{ body|e }}
+```
+
+### Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `bot_token` | Yes | Bot API token from @BotFather. Stored as a secret; never logged. |
+| `chat_ids` | Yes | List of target chat IDs. Must be non-empty; each element must be non-empty. |
+| `parse_mode` | No | `HTML` (default) or `MarkdownV2`. Passed through to the Bot API. |
+| `disable_notification` | No | When `true`, Telegram delivers silently (no push sound). |
+| `disable_web_page_preview` | No | When `true`, Telegram does not expand link previews. |
+| `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. |
+
+### Multi-chat delivery
+
+Each `chat_id` receives one **sequential** `sendMessage` call — Telegram rate-limits at 1 message per second per chat, so parallel delivery wouldn't help. The order in `chat_ids` is preserved.
+
+If at least one chat succeeds, the alert is counted as delivered (`Ok`). Per-chat failures are logged at `error` level and recorded in `valerter_notify_errors_total` / `valerter_alerts_failed_total`.
+
+### Message length
+
+Telegram's hard limit is **4096 Unicode codepoints** per message. Longer messages are truncated to 4095 codepoints + `…` (one Unicode codepoint). Each truncation increments `valerter_alerts_truncated_total{notifier_type="telegram"}` **once per alert** (not per chat) and emits a `warn` log.
+
+### Rate limits and retries
+
+Telegram returns HTTP 429 with a `Retry-After` header when you hit a rate limit. The notifier honors it (clamped to `[1s, 60s]`) and the retry counts against the same 3-attempt pool as 5xx and network errors.
+
+### HTML escaping
+
+With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`, or `&`. The default `body_template` uses the `|e` Jinja filter to escape these automatically. If you provide a custom `body_template`, make sure to escape user-controlled fields (`title`, `body`) the same way, or your messages will be rejected with a 400.
+
+### Example: two destinations, silent delivery
+
+```yaml
+notifiers:
+  telegram-oncall:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-1001111111111"   # #oncall channel
+      - "-1002222222222"   # #leadership channel
+    disable_notification: false
+    disable_web_page_preview: true
+```
 
 ## Multi-Destination Routing
 

@@ -13,6 +13,7 @@ mod traits;
 
 pub mod email;
 pub mod mattermost;
+pub mod telegram;
 pub mod webhook;
 
 // Re-exports
@@ -21,6 +22,7 @@ pub use mattermost::MattermostNotifier;
 pub use payload::{AlertPayload, format_log_timestamp};
 pub use queue::{DEFAULT_QUEUE_CAPACITY, NotificationQueue, NotificationWorker, backoff_delay};
 pub use registry::NotifierRegistry;
+pub use telegram::TelegramNotifier;
 pub use traits::Notifier;
 pub use webhook::WebhookNotifier;
 

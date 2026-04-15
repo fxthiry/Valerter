@@ -225,6 +225,32 @@ notifiers:
   #     <p>{{ body }}</p>
   #   # body_template_file: /etc/valerter/email-template.html  # Or: external file
 
+  # ── Telegram (Bot API) ─────────────────────────────────────────────────────
+  # Send alerts to one or more Telegram chats via the Bot API.
+  #
+  # Required: bot_token, chat_ids (non-empty)
+  # Optional: parse_mode (default: HTML), disable_notification,
+  #           disable_web_page_preview, body_template
+  #
+  # The endpoint URL is built internally and never logged (contains the token).
+  # Each chat_id triggers one sequential HTTP call; a 429 response honors
+  # Telegram's Retry-After header before retrying.
+  # Message text is truncated at 4096 Unicode codepoints (Telegram hard limit)
+  # and the event is counted in valerter_alerts_truncated_total.
+
+  # telegram-alerts:
+  #   type: telegram
+  #   bot_token: "${TELEGRAM_BOT_TOKEN}"
+  #   chat_ids:
+  #     - "-100123456789"
+  #     - "-100987654321"
+  #   parse_mode: HTML                       # Default: HTML (also: MarkdownV2)
+  #   disable_notification: false            # Default: not set (Telegram default = false)
+  #   disable_web_page_preview: true         # Default: not set
+  #   body_template: |                       # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}"
+  #     <b>{{ title|e }}</b>
+  #     {{ body|e }}
+
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
 # │ RULES                                                            [REQUIRED]│

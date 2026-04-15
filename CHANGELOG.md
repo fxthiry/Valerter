@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-15
+
+### Added
+- **Telegram notifier** (issue #22) — native `type: telegram` notifier using the
+  Bot API `sendMessage` endpoint. Supports multi-chat delivery (one sequential
+  HTTP call per `chat_id`), HTML `parse_mode` by default, 429 `Retry-After`
+  handling, automatic codepoint-safe truncation at Telegram's 4096 character
+  limit, and a new `valerter_alerts_truncated_total` Prometheus counter.
+
+### Known Limitations
+- Templates define a single `body` field that is shared across all notifiers. If
+  you write a Markdown-flavored body (e.g. `**bold**`, triple-backtick fences)
+  for Mattermost, Telegram will render those markers literally because it is
+  configured with `parse_mode: HTML`. Workaround: override `body_template` on
+  the Telegram notifier with HTML-friendly Jinja, for example
+  `body_template: "<b>{{ title|e }}</b>\n<pre>{{ body|e }}</pre>"`. A proper
+  render-pipeline-per-notifier abstraction is planned for 1.2.
+
 ## [1.0.0] - 2026-04-14
 
 Promote `1.0.0-rc.5` to stable. No functional changes.
@@ -143,7 +161,8 @@ Promote `1.0.0-rc.5` to stable. No functional changes.
 - Debian package (.deb) and tarball releases
 - systemd service integration
 
-[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/fxthiry/valerter/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/fxthiry/valerter/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.5...v1.0.0
 [1.0.0-rc.5]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.4...v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/fxthiry/valerter/compare/v1.0.0-rc.3...v1.0.0-rc.4
