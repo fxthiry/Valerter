@@ -162,8 +162,9 @@ impl TemplateEngine {
 
     /// Render a single template string with fields (no auto-escape).
     fn render_string(&self, template_str: &str, fields: &Value) -> Result<String, TemplateError> {
+        let ctx = crate::parser::unflatten_dotted_keys(fields);
         self.env
-            .render_str(template_str, fields)
+            .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
@@ -176,8 +177,9 @@ impl TemplateEngine {
         template_str: &str,
         fields: &Value,
     ) -> Result<String, TemplateError> {
+        let ctx = crate::parser::unflatten_dotted_keys(fields);
         self.html_env
-            .render_str(template_str, fields)
+            .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
@@ -690,6 +692,65 @@ mod tests {
         assert!(
             !body_html.contains("<script>"),
             "Raw script tags should NOT be present: {}",
+            body_html
+        );
+    }
+
+    // ===================================================================
+    // Issue #25: dotted flat-key resolution at render time
+    // ===================================================================
+
+    #[test]
+    fn render_resolves_dotted_flat_key_via_unflatten() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "alert".to_string(),
+            make_template(
+                "{{ nginx.http.request_id }}",
+                "id={{ nginx.http.request_id }}",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"nginx.http.request_id": "abc"});
+
+        let result = engine.render("alert", &fields).unwrap();
+        assert_eq!(result.title, "abc");
+        assert_eq!(result.body, "id=abc");
+    }
+
+    #[test]
+    fn render_issue_25_full_template_end_to_end() {
+        // Mirrors the user's config in issue #25.
+        let mut templates = HashMap::new();
+        templates.insert(
+            "my_template".to_string(),
+            make_template_with_body_html(
+                "{{ title }}",
+                "{{ body }}",
+                "<p>{{ hostname }} - {{ nginx.http.request_id }} - {{ nginx.http.method }}</p>",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({
+            "title": "T",
+            "body": "B",
+            "hostname": "srv-01",
+            "nginx.http.request_id": "req-42",
+            "nginx.http.method": "GET",
+            "nginx.http.status_code": "400"
+        });
+
+        let result = engine.render("my_template", &fields).unwrap();
+        assert_eq!(result.title, "T");
+        assert_eq!(result.body, "B");
+        let body_html = result.body_html.unwrap();
+        assert!(
+            body_html.contains("srv-01")
+                && body_html.contains("req-42")
+                && body_html.contains("GET"),
+            "expected all dotted fields rendered, got: {}",
             body_html
         );
     }
