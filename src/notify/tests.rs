@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::config::{
-    EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig, TlsMode,
-    WebhookNotifierConfig,
+    EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig,
+    TelegramNotifierConfig, TlsMode, WebhookNotifierConfig,
 };
 use crate::error::NotifyError;
 use crate::template::RenderedMessage;
@@ -940,4 +940,61 @@ fn registry_from_config_all_three_notifier_types() {
             assert_eq!(registry.get("email").unwrap().notifier_type(), "email");
         },
     );
+}
+
+#[test]
+#[serial]
+fn registry_from_config_creates_telegram_notifier() {
+    let mut notifiers_config = HashMap::new();
+    notifiers_config.insert(
+        "telegram-infra".to_string(),
+        NotifierConfig::Telegram(TelegramNotifierConfig {
+            bot_token: "fake-token-123".to_string(),
+            chat_ids: vec!["-100123".to_string(), "-100456".to_string()],
+            parse_mode: Some("HTML".to_string()),
+            disable_notification: None,
+            disable_web_page_preview: Some(true),
+            body_template: None,
+        }),
+    );
+
+    let client = reqwest::Client::new();
+    let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+
+    assert!(
+        result.is_ok(),
+        "Telegram notifier registration should succeed: {:?}",
+        result.err()
+    );
+    let registry = result.unwrap();
+    assert_eq!(registry.len(), 1);
+
+    let notifier = registry
+        .get("telegram-infra")
+        .expect("should be registered");
+    assert_eq!(notifier.name(), "telegram-infra");
+    assert_eq!(notifier.notifier_type(), "telegram");
+}
+
+#[test]
+#[serial]
+fn registry_from_config_propagates_telegram_validation_errors() {
+    let mut notifiers_config = HashMap::new();
+    notifiers_config.insert(
+        "telegram-broken".to_string(),
+        NotifierConfig::Telegram(TelegramNotifierConfig {
+            bot_token: "fake-token".to_string(),
+            chat_ids: vec![],
+            parse_mode: None,
+            disable_notification: None,
+            disable_web_page_preview: None,
+            body_template: None,
+        }),
+    );
+
+    let client = reqwest::Client::new();
+    let result = NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir());
+
+    let errs = result.unwrap_err();
+    assert!(errs.iter().any(|e| e.to_string().contains("chat_ids")));
 }

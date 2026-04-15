@@ -833,6 +833,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_retries_on_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(503).set_body_string("server error")
+                } else {
+                    ResponseTemplate::new(200).set_body_string("{\"ok\":true}")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let notifier = test_notifier(&server, vec!["-100A".to_string()]);
+        let alert = sample_alert("hi", "body");
+        notifier
+            .send(&alert)
+            .await
+            .expect("should succeed after 5xx retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn send_exhausts_retries_on_persistent_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let notifier = test_notifier(&server, vec!["-100A".to_string()]);
+        let alert = sample_alert("hi", "body");
+        let err = notifier.send(&alert).await.unwrap_err();
+        assert!(matches!(err, NotifyError::SendFailed(_)));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn send_network_error_exhausts_retries() {
+        // Start then immediately drop the mock server so requests fail at the
+        // TCP level. Gives us coverage of the Err(reqwest::Error) branch in
+        // the retry loop.
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        drop(server);
+        let endpoint = format!("{}/botTESTTOKEN/sendMessage", uri);
+        let notifier = TelegramNotifier::new_for_tests(
+            "tg-test",
+            endpoint,
+            vec!["-100A".to_string()],
+            reqwest::Client::new(),
+        );
+        let alert = sample_alert("hi", "body");
+        let err = notifier.send(&alert).await.unwrap_err();
+        assert!(matches!(err, NotifyError::SendFailed(_)));
+    }
+
+    #[tokio::test]
     async fn send_body_under_limit_is_not_truncated() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

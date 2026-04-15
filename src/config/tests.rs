@@ -1847,3 +1847,80 @@ rules:
         "Invalid URL in webhook notifier should be rejected"
     );
 }
+
+#[test]
+fn telegram_notifier_with_empty_chat_ids_fails_validation() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  telegram-broken:
+    type: telegram
+    bot_token: "token"
+    chat_ids: []
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["telegram-broken"]
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config.validate().unwrap_err();
+    let has_chat_ids_error = errors.iter().any(|e| {
+        matches!(e, crate::error::ConfigError::ValidationError(msg)
+            if msg.contains("telegram-broken") && msg.contains("chat_ids must not be empty"))
+    });
+    assert!(
+        has_chat_ids_error,
+        "Expected chat_ids validation error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn telegram_notifier_with_populated_chat_ids_passes_validation() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  telegram-ok:
+    type: telegram
+    bot_token: "token"
+    chat_ids:
+      - "-100123"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  default:
+    title: "Test"
+    body: "Test body"
+rules:
+  - name: test_rule
+    query: "test"
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "default"
+      destinations: ["telegram-ok"]
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    assert!(
+        config.validate().is_ok(),
+        "Telegram notifier with non-empty chat_ids should validate"
+    );
+}
