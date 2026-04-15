@@ -42,7 +42,7 @@ templates:
       ```
       {{ _msg }}
       ```
-    body_html: |
+    email_body_html: |
       <div style="border-left: 4px solid #dc3545; padding-left: 16px; margin-bottom: 16px;">
         <h2 style="color: #dc3545; margin: 0 0 8px 0;">🚨 BPDU Guard Violation</h2>
         <p style="color: #6b7280; margin: 0;">A port has been disabled due to BPDU reception</p>

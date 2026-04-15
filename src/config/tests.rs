@@ -345,7 +345,7 @@ fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeCo
                 CompiledTemplate {
                     title: "{{ title }}".to_string(),
                     body: "{{ body }}".to_string(),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: None,
                 },
             );
@@ -451,7 +451,7 @@ fn validate_collects_all_errors() {
                 TemplateConfig {
                     title: "{{ title }}".to_string(),
                     body: "{{ body }}".to_string(),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: None,
                 },
             );
@@ -528,7 +528,7 @@ fn validate_throttle_key_template() {
                 TemplateConfig {
                     title: "{{ title }}".to_string(),
                     body: "{{ body }}".to_string(),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: None,
                 },
             );
@@ -591,7 +591,7 @@ fn validate_nonexistent_notify_template_fails() {
                 TemplateConfig {
                     title: "{{ title }}".to_string(),
                     body: "{{ body }}".to_string(),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: None,
                 },
             );
@@ -710,7 +710,7 @@ fn load_config_with_unknown_notifier_type_fails() {
 }
 
 #[test]
-fn validate_body_html_syntax_error_detected() {
+fn validate_email_body_html_syntax_error_detected() {
     let yaml = r#"
 victorialogs:
   url: http://localhost:9428
@@ -726,7 +726,7 @@ templates:
   test:
     title: "Test"
     body: "Test body"
-    body_html: "{% if unclosed"
+    email_body_html: "{% if unclosed"
 rules: []
 "#;
     let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -736,11 +736,52 @@ rules: []
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| {
         if let crate::error::ConfigError::InvalidTemplate { message, .. } = e {
-            message.contains("body_html")
+            message.contains("email_body_html")
         } else {
             false
         }
     }));
+}
+
+// Regression guard for the v1.2.0 rename of `body_html` → `email_body_html`.
+// The old field name must be rejected at parse time with an error message that
+// mentions both names, so users upgrading from 1.1.x get an actionable hint.
+#[test]
+fn parse_rejects_old_body_html_field_name() {
+    let yaml = r#"
+victorialogs:
+  url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "Test body"
+    body_html: "<p>legacy</p>"
+rules: []
+"#;
+    let result: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(
+        result.is_err(),
+        "YAML with legacy `body_html` field must be rejected at parse time"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("body_html"),
+        "Error should mention the legacy field name `body_html`, got: {}",
+        err_msg
+    );
+    assert!(
+        err_msg.contains("email_body_html"),
+        "Error should list the new field name `email_body_html` among expected fields, got: {}",
+        err_msg
+    );
 }
 
 #[test]
@@ -925,7 +966,7 @@ fn validate_rule_destinations_collects_all_errors() {
                 CompiledTemplate {
                     title: "{{ title }}".to_string(),
                     body: "{{ body }}".to_string(),
-                    body_html: None,
+                    email_body_html: None,
                     accent_color: None,
                 },
             );

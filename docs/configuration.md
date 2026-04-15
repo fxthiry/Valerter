@@ -188,7 +188,7 @@ templates:
   default_alert:
     title: "{{ title | default('Alert') }}"           # REQUIRED
     body: "{{ body }}"                                 # REQUIRED
-    body_html: "<p>{{ body }}</p>"                     # REQUIRED for email destinations
+    email_body_html: "<p>{{ body }}</p>"                     # REQUIRED for email destinations
     accent_color: "#ff0000"                            # Optional: hex color
 ```
 
@@ -211,9 +211,9 @@ Variables come from the parser output plus built-in fields:
 - Webhook `body_template`
 - Mattermost footer (automatically includes `log_timestamp_formatted`)
 
-### body_html Requirement
+### email_body_html Requirement
 
-**Important:** Templates used with email destinations MUST include `body_html`. Valerter validates this at startup and will fail if missing.
+**Important:** Templates used with email destinations MUST include `email_body_html`. Valerter validates this at startup and will fail if missing.
 
 ## Rules
 
@@ -350,7 +350,7 @@ This checks:
 - Template syntax
 - Notifier configuration
 - Rule destinations exist
-- Email templates have `body_html`
+- Email templates have `email_body_html`
 
 ## See Also
 

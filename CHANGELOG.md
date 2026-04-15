@@ -5,7 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - unreleased
+
+### Breaking changes
+- **Template field `body_html` renamed to `email_body_html`** to reflect that
+  only the email notifier consumes it (Telegram, Mattermost, and webhook always
+  ignored it). Migration: in every template, replace `body_html:` with
+  `email_body_html:`. This applies to templates defined inline in `config.yaml`
+  *and* to any split files under `templates.d/`. Configs using the old name are
+  rejected at load time with a clear error that lists `email_body_html` among
+  the expected fields, so `valerter --validate` will point out every template
+  that needs updating on the first run.
+
+### Fixed
+- **Dotted field access in templates** (issue #25) — fields like
+  `server.hostname` or `http.request.method` can now be referenced directly in
+  Jinja templates using dotted notation, matching the shape users see in log
+  payloads.
+- **Empty Telegram message guard** (issue #26) — Telegram no longer 400s when a
+  rendered body is empty. The notifier now substitutes a fallback string and
+  records the drop reason, and the template documentation explicitly calls out
+  that `body_html` (now `email_body_html`) is email-only so users do not
+  accidentally leave `body` empty.
 
 ## [1.1.0] - 2026-04-15
 

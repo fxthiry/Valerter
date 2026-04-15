@@ -640,7 +640,7 @@ mod tests {
                     CompiledTemplate {
                         title: "{{ title }}".to_string(),
                         body: "{{ body }}".to_string(),
-                        body_html: None,
+                        email_body_html: None,
                         accent_color: None,
                     },
                 );
@@ -839,7 +839,7 @@ mod tests {
             CompiledTemplate {
                 title: "Alert: {{ _msg }}".to_string(),
                 body: "Log: {{ _msg }}".to_string(),
-                body_html: None,
+                email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
             },
         );
