@@ -188,6 +188,7 @@ impl TailClient {
     pub async fn connect_and_receive(
         &mut self,
         rule_name: &str,
+        vl_source: &str,
     ) -> Result<Vec<String>, StreamError> {
         let url = self.build_url();
 
@@ -219,6 +220,7 @@ impl TailClient {
             if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk) {
                 warn!(
                     rule_name = %rule_name,
+                    vl_source = %vl_source,
                     size_bytes = size,
                     max_bytes = max,
                     "Discarding oversized log line, buffer cleared"
@@ -226,7 +228,8 @@ impl TailClient {
                 metrics::counter!(
                     "valerter_lines_discarded_total",
                     "rule_name" => rule_name.to_string(),
-                    "reason" => "oversized"
+                    "vl_source" => vl_source.to_string(),
+                    "reason" => "oversized",
                 )
                 .increment(1);
                 continue;
@@ -235,7 +238,12 @@ impl TailClient {
 
             for line in lines {
                 if !line.is_empty() {
-                    trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
+                    trace!(
+                        rule_name = %rule_name,
+                        vl_source = %vl_source,
+                        line_len = line.len(),
+                        "Received log line"
+                    );
                     all_lines.push(line);
                 }
             }
@@ -286,6 +294,7 @@ impl TailClient {
     /// // Stream with reconnection - runs until cancelled
     /// client.stream_with_reconnect(
     ///     "my_rule",
+    ///     "vlprod",
     ///     None,
     ///     |line| async move {
     ///         println!("Received: {}", line);
@@ -298,6 +307,7 @@ impl TailClient {
     pub async fn stream_with_reconnect<F, Fut>(
         &mut self,
         rule_name: &str,
+        vl_source: &str,
         on_reconnect: Option<&dyn ReconnectCallback>,
         mut line_handler: F,
     ) -> Result<(), StreamError>
@@ -310,7 +320,12 @@ impl TailClient {
 
         loop {
             let url = self.build_url();
-            debug!(rule_name = %rule_name, url = %url, "Connecting to VictoriaLogs tail endpoint");
+            debug!(
+                rule_name = %rule_name,
+                vl_source = %vl_source,
+                url = %url,
+                "Connecting to VictoriaLogs tail endpoint"
+            );
 
             // Start timing for query_duration metric
             let request_start = Instant::now();
@@ -318,19 +333,26 @@ impl TailClient {
 
             let response = match connect_result {
                 Ok(resp) if resp.status().is_success() => {
-                    info!(rule_name = %rule_name, status = %resp.status(), "Connected to VictoriaLogs");
-                    // Connection successful - mark VictoriaLogs as up
+                    info!(
+                        rule_name = %rule_name,
+                        vl_source = %vl_source,
+                        status = %resp.status(),
+                        "Connected to VictoriaLogs"
+                    );
+                    // Connection successful - mark this source as up
+                    // (per-source gauge replaces the v1.x per-rule
+                    // `valerter_victorialogs_up{rule_name}`).
                     metrics::gauge!(
-                        "valerter_victorialogs_up",
-                        "rule_name" => rule_name.to_string()
+                        "valerter_vl_source_up",
+                        "vl_source" => vl_source.to_string(),
                     )
                     .set(1.0);
 
                     if had_failure {
                         // We recovered from a failure
-                        log_reconnection_success(rule_name);
+                        log_reconnection_success(rule_name, vl_source);
                         if let Some(callback) = on_reconnect {
-                            callback.on_reconnect(rule_name);
+                            callback.on_reconnect(rule_name, vl_source);
                         }
                     }
                     attempt = 0;
@@ -338,39 +360,45 @@ impl TailClient {
                     resp
                 }
                 Ok(resp) => {
-                    // HTTP error (4xx, 5xx) - mark VictoriaLogs as down
+                    // HTTP error (4xx, 5xx) - mark this source as down.
                     metrics::gauge!(
-                        "valerter_victorialogs_up",
-                        "rule_name" => rule_name.to_string()
+                        "valerter_vl_source_up",
+                        "vl_source" => vl_source.to_string(),
                     )
                     .set(0.0);
 
                     had_failure = true;
-                    let delay = backoff_delay_default(attempt);
-                    log_reconnection_attempt(rule_name, attempt, delay);
+                    let delay = backoff_delay_with_jitter(attempt);
+                    log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
                     warn!(
                         rule_name = %rule_name,
+                        vl_source = %vl_source,
                         status = %resp.status(),
                         "HTTP error from VictoriaLogs"
                     );
                     continue;
                 }
                 Err(e) => {
-                    // Connection error - mark VictoriaLogs as down
+                    // Connection error - mark this source as down.
                     metrics::gauge!(
-                        "valerter_victorialogs_up",
-                        "rule_name" => rule_name.to_string()
+                        "valerter_vl_source_up",
+                        "vl_source" => vl_source.to_string(),
                     )
                     .set(0.0);
 
                     had_failure = true;
-                    let delay = backoff_delay_default(attempt);
-                    log_reconnection_attempt(rule_name, attempt, delay);
+                    let delay = backoff_delay_with_jitter(attempt);
+                    log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
-                    warn!(rule_name = %rule_name, error = %e, "Connection failed");
+                    warn!(
+                        rule_name = %rule_name,
+                        vl_source = %vl_source,
+                        error = %e,
+                        "Connection failed"
+                    );
                     continue;
                 }
             };
@@ -388,7 +416,8 @@ impl TailClient {
                             let duration = request_start.elapsed();
                             metrics::histogram!(
                                 "valerter_query_duration_seconds",
-                                "rule_name" => rule_name.to_string()
+                                "rule_name" => rule_name.to_string(),
+                                "vl_source" => vl_source.to_string(),
                             )
                             .record(duration.as_secs_f64());
                         }
@@ -400,7 +429,8 @@ impl TailClient {
                             .as_secs_f64();
                         metrics::gauge!(
                             "valerter_last_query_timestamp",
-                            "rule_name" => rule_name.to_string()
+                            "rule_name" => rule_name.to_string(),
+                            "vl_source" => vl_source.to_string(),
                         )
                         .set(now);
 
@@ -408,6 +438,7 @@ impl TailClient {
                         {
                             warn!(
                                 rule_name = %rule_name,
+                                vl_source = %vl_source,
                                 size_bytes = size,
                                 max_bytes = max,
                                 "Discarding oversized log line, buffer cleared"
@@ -415,7 +446,8 @@ impl TailClient {
                             metrics::counter!(
                                 "valerter_lines_discarded_total",
                                 "rule_name" => rule_name.to_string(),
-                                "reason" => "oversized"
+                                "vl_source" => vl_source.to_string(),
+                                "reason" => "oversized",
                             )
                             .increment(1);
                             continue;
@@ -424,25 +456,35 @@ impl TailClient {
 
                         for line in lines {
                             if !line.is_empty() {
-                                trace!(rule_name = %rule_name, line_len = line.len(), "Received log line");
+                                trace!(
+                                    rule_name = %rule_name,
+                                    vl_source = %vl_source,
+                                    line_len = line.len(),
+                                    "Received log line"
+                                );
                                 line_handler(line).await?;
                             }
                         }
                     }
                     Err(e) => {
-                        // Stream error - mark VictoriaLogs as down and reconnect
+                        // Stream error - mark this source as down and reconnect.
                         metrics::gauge!(
-                            "valerter_victorialogs_up",
-                            "rule_name" => rule_name.to_string()
+                            "valerter_vl_source_up",
+                            "vl_source" => vl_source.to_string(),
                         )
                         .set(0.0);
 
                         had_failure = true;
-                        let delay = backoff_delay_default(attempt);
-                        log_reconnection_attempt(rule_name, attempt, delay);
+                        let delay = backoff_delay_with_jitter(attempt);
+                        log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                         tokio::time::sleep(delay).await;
                         attempt = attempt.saturating_add(1);
-                        warn!(rule_name = %rule_name, error = %e, "Stream read error");
+                        warn!(
+                            rule_name = %rule_name,
+                            vl_source = %vl_source,
+                            error = %e,
+                            "Stream read error"
+                        );
                         break; // Break inner loop to reconnect
                     }
                 }
@@ -451,7 +493,11 @@ impl TailClient {
             // Stream ended (server closed connection) - reconnect
             if !had_failure {
                 // Normal stream end, not a failure - still need to reconnect
-                debug!(rule_name = %rule_name, "Stream ended, reconnecting");
+                debug!(
+                    rule_name = %rule_name,
+                    vl_source = %vl_source,
+                    "Stream ended, reconnecting"
+                );
             }
             had_failure = true;
         }
@@ -480,8 +526,46 @@ pub fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
 /// Calculate exponential backoff delay using default VictoriaLogs parameters.
 ///
 /// Uses BACKOFF_BASE (1s) and BACKOFF_MAX (60s) as per AD-07.
-pub fn backoff_delay_default(attempt: u32) -> Duration {
+///
+/// Exposed `pub(crate)` only: production callers must go through
+/// [`backoff_delay_with_jitter`] so the jitter clamp is always applied. Direct
+/// use bypasses that safety net.
+pub(crate) fn backoff_delay_default(attempt: u32) -> Duration {
     backoff_delay(attempt, BACKOFF_BASE, BACKOFF_MAX)
+}
+
+/// Minimum reconnect delay floor in milliseconds (post-jitter clamp).
+///
+/// The exponential backoff base is 1s = 1000ms, so a -10% jitter on attempt
+/// 0 produces 900ms which is well above this floor; the clamp is a defensive
+/// safety net for any future change that lowers `BACKOFF_BASE`.
+pub const MIN_RECONNECT_DELAY_MS: u64 = 100;
+
+/// Compute the backoff delay with `±10%` uniform jitter applied per call.
+///
+/// Multi-source observability (v2.0.0 part 2): when N sources behind a flapping
+/// load balancer all reconnect at the same exponential cadence they form a
+/// thundering herd. Per-task uniform jitter spreads attempts in a `[0.9·D,
+/// 1.1·D]` window so the herd dissolves over a few cycles without changing
+/// the overall reconnect rate.
+///
+/// The jitter is uniform over `[-0.10, +0.10]` (inclusive) and the resulting
+/// delay is clamped to [`MIN_RECONNECT_DELAY_MS`] so a negative jitter never
+/// produces a sub-100ms hot loop.
+pub fn backoff_delay_with_jitter(attempt: u32) -> Duration {
+    use rand::Rng;
+
+    let base = backoff_delay_default(attempt);
+    let jitter: f64 = rand::thread_rng().gen_range(-0.10..=0.10);
+    apply_jitter_floor(base.as_millis() as u64, jitter)
+}
+
+/// Apply a `(1 + jitter)` multiplier to a millisecond base and clamp the
+/// result to [`MIN_RECONNECT_DELAY_MS`]. Pure helper so the clamp branch is
+/// directly exercisable from unit tests with synthetic small bases.
+fn apply_jitter_floor(base_ms: u64, jitter: f64) -> Duration {
+    let effective_ms = ((base_ms as f64) * (1.0 + jitter)).max(MIN_RECONNECT_DELAY_MS as f64);
+    Duration::from_millis(effective_ms as u64)
 }
 
 /// Trait for reconnection callbacks.
@@ -490,7 +574,11 @@ pub fn backoff_delay_default(attempt: u32) -> Duration {
 /// This is used to reset throttle caches as per FR7.
 pub trait ReconnectCallback: Send + Sync {
     /// Called when connection is restored after failure.
-    fn on_reconnect(&self, rule_name: &str);
+    ///
+    /// Receives both the rule name AND the source name so implementors can
+    /// scope their reaction (e.g. throttle reset) per `(rule, source)` task
+    /// rather than fan-out across all sources of the same rule.
+    fn on_reconnect(&self, rule_name: &str, vl_source: &str);
 }
 
 /// Log the reconnection attempt with proper tracing.
@@ -498,19 +586,26 @@ pub trait ReconnectCallback: Send + Sync {
 /// # Arguments
 ///
 /// * `rule_name` - Name of the rule for the tracing span
+/// * `vl_source` - Name of the VictoriaLogs source for the tracing span
 /// * `attempt` - Current retry attempt number
 /// * `delay` - Delay before next retry
-pub fn log_reconnection_attempt(rule_name: &str, attempt: u32, delay: Duration) {
+pub fn log_reconnection_attempt(rule_name: &str, vl_source: &str, attempt: u32, delay: Duration) {
     warn!(
         rule_name = %rule_name,
+        vl_source = %vl_source,
         attempt = attempt,
         delay_secs = delay.as_secs(),
         "Connection failed, retrying"
     );
 
-    // Increment reconnection metric
-    metrics::counter!("valerter_reconnections_total", "rule_name" => rule_name.to_string())
-        .increment(1);
+    // Increment reconnection metric (now per-(rule, source) for multi-source
+    // observability — v2.0.0 part 2).
+    metrics::counter!(
+        "valerter_reconnections_total",
+        "rule_name" => rule_name.to_string(),
+        "vl_source" => vl_source.to_string(),
+    )
+    .increment(1);
 }
 
 /// Log successful reconnection after failure.
@@ -518,9 +613,11 @@ pub fn log_reconnection_attempt(rule_name: &str, attempt: u32, delay: Duration) 
 /// # Arguments
 ///
 /// * `rule_name` - Name of the rule for the tracing span
-pub fn log_reconnection_success(rule_name: &str) {
+/// * `vl_source` - Name of the VictoriaLogs source for the tracing span
+pub fn log_reconnection_success(rule_name: &str, vl_source: &str) {
     info!(
         rule_name = %rule_name,
+        vl_source = %vl_source,
         "Connection restored, throttle cache reset signal sent"
     );
 }
@@ -757,6 +854,81 @@ mod tests {
     fn test_constants_values() {
         assert_eq!(BACKOFF_BASE, Duration::from_secs(1));
         assert_eq!(BACKOFF_MAX, Duration::from_secs(60));
+    }
+
+    // ==========================================================================
+    // Multi-source observability v2.0.0: jitter on reconnect backoff.
+    // The intent is to break thundering-herd alignment on flapping load
+    // balancers; we cannot prove statistical independence in a unit test, but
+    // we can prove the bounds and the floor clamp.
+    // ==========================================================================
+
+    #[test]
+    fn jitter_stays_within_plus_minus_ten_percent_of_base_for_attempt_3() {
+        // Attempt 3 → base 8s = 8000ms. Jittered value must lie in [7200, 8800].
+        let base = backoff_delay_default(3);
+        assert_eq!(base, Duration::from_secs(8));
+        let lo = (base.as_millis() as f64 * 0.90).floor() as u128;
+        let hi = (base.as_millis() as f64 * 1.10).ceil() as u128;
+        for _ in 0..200 {
+            let d = backoff_delay_with_jitter(3);
+            let ms = d.as_millis();
+            assert!(
+                ms >= lo && ms <= hi,
+                "jittered delay {}ms outside [{}, {}]",
+                ms,
+                lo,
+                hi
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_caps_below_min_reconnect_delay_floor() {
+        // Directly exercise the floor branch via the pure helper. With
+        // base_ms=50 and jitter=-0.5, the natural product (25ms) is far
+        // below MIN_RECONNECT_DELAY_MS (100ms) and must be clamped up.
+        let clamped = apply_jitter_floor(50, -0.5);
+        assert_eq!(
+            clamped.as_millis() as u64,
+            MIN_RECONNECT_DELAY_MS,
+            "small base + heavy negative jitter must be clamped to the floor"
+        );
+
+        // Edge: jitter that would land exactly at the floor still pegs to it.
+        let exact = apply_jitter_floor(100, 0.0);
+        assert_eq!(exact.as_millis() as u64, MIN_RECONNECT_DELAY_MS);
+
+        // The default-base path remains unaffected (probabilistic check).
+        for _ in 0..50 {
+            let d = backoff_delay_with_jitter(0);
+            assert!(
+                d.as_millis() >= MIN_RECONNECT_DELAY_MS as u128,
+                "default-base jitter must not drop below floor: {}ms",
+                d.as_millis()
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_at_capped_attempt_stays_within_window_around_max() {
+        // Attempt 100 → backoff is capped to BACKOFF_MAX = 60s.
+        // Jitter window is computed from the cap, not from 2^100.
+        let base = backoff_delay_default(100);
+        assert_eq!(base, BACKOFF_MAX);
+        let lo = (base.as_millis() as f64 * 0.90).floor() as u128;
+        let hi = (base.as_millis() as f64 * 1.10).ceil() as u128;
+        for _ in 0..50 {
+            let d = backoff_delay_with_jitter(100);
+            let ms = d.as_millis();
+            assert!(
+                ms >= lo && ms <= hi,
+                "jittered capped delay {}ms outside [{}, {}]",
+                ms,
+                lo,
+                hi
+            );
+        }
     }
 
     #[test]

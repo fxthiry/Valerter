@@ -216,7 +216,24 @@ defaults:
     count: 5         # Max alerts per window
     window: 60s      # Time window (e.g., 60s, 5m, 1h)
   # timestamp_timezone: "Europe/Paris"  # Optional: timezone for formatted timestamps (default: UTC)
+  # max_streams: 50                     # Optional: hard cap on total VictoriaLogs streams (default: 50)
 ```
+
+### `max_streams` — fan-out guardrail
+
+Multi-source deployments spawn one stream per `(enabled rule, target source)`
+pair. With unscoped fan-out rules and many sources the total scales as
+`rules × sources`, which can DoS a backend by accident. `defaults.max_streams`
+caps that total at load time:
+
+```
+total = sum(if rule.vl_sources is empty then sources.len() else rule.vl_sources.len()
+            for rule in enabled_rules)
+```
+
+Disabled rules do not contribute. Breaching the cap fails `valerter --validate`
+with a message stating both the actual count and the cap so an operator knows
+whether to raise the cap or trim rules. Default: `50`.
 
 ### Timestamp Timezone
 

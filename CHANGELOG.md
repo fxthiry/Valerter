@@ -40,13 +40,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Notifier output formats extended with `vl_source`.** The Mattermost footer now reads `valerter | <rule> | <source> | <timestamp>` instead of `valerter | <rule> | <timestamp>`. The default webhook payload exposes `vl_source` as a top-level JSON field. Downstream parsers / dashboards that match exact strings in either output need to update.
 
+- **All per-rule Prometheus metrics now also carry a `vl_source` label.** Affected counters: `valerter_alerts_sent_total`, `valerter_alerts_throttled_total`, `valerter_alerts_passed_total`, `valerter_alerts_failed_total`, `valerter_email_recipient_errors_total`, `valerter_lines_discarded_total`, `valerter_logs_matched_total`, `valerter_notify_errors_total`, `valerter_parse_errors_total`, `valerter_reconnections_total`, `valerter_rule_panics_total`, `valerter_rule_errors_total`. Affected gauge/histogram: `valerter_last_query_timestamp`, `valerter_query_duration_seconds`. Dashboards and alerts that grouped by `rule_name` alone keep working but get an extra `vl_source` dimension; PromQL using `sum by (rule_name) (...)` still rolls up correctly. `valerter_queue_size` stays unlabeled (the queue is shared, not per-source).
+
+- **`valerter_victorialogs_up{rule_name}` removed and replaced by `valerter_vl_source_up{vl_source}`.** The new gauge is per-source (one value per configured source, regardless of how many rules tail it) since reachability is a property of the source, not the rule. Alerts and panels need to migrate from per-rule to per-source semantics. Examples:
+
+  ```promql
+  # v1.x (per-rule):     valerter_victorialogs_up{rule_name="nginx-5xx"} == 0
+  # v2.0.0 (per-source): valerter_vl_source_up{vl_source="prod"} == 0
+
+  # v1.x (any rule down): min(valerter_victorialogs_up) == 0
+  # v2.0.0 (any source):  min(valerter_vl_source_up) == 0
+  ```
+
+  The label key is now `vl_source` (not `rule_name`), and the cardinality drops from `|rules|` to `|sources|`.
+
+- **`defaults.max_streams` cap introduced (default 50).** Total VictoriaLogs streams = sum of `(rule, source)` pairs spawned for enabled rules. Breaching the cap fails the config at load with both the actual count and the cap value. Configurable via `defaults.max_streams: <usize>`. Disabled rules do not contribute. Prevents accidental fan-out from DoSing a backend.
+
 ### Added
 
 - **Multi-source VictoriaLogs support** (issue #34). The engine spawns one task per `(rule, source)` pair with per-source cancellation and reconnect isolation, so a single unhealthy source does not stop alerts on the others.
 - **`{{ vl_source }}` template variable** available everywhere `{{ rule_name }}` is: layer 1 templates (`title`, `body`, `email_body_html`), `throttle.key`, and notifier-level layer 2 contexts (`subject_template`, `body_template`). Always non-empty, owned `String`, equal to the source name currently processing the event. Synthetic value wins over any event field literally named `vl_source` (matches the `rule_name` collision policy).
 - **`AlertPayload.vl_source`** propagated end-to-end so notifiers can render the source name. See Breaking changes above for the related output format updates on Mattermost and webhook destinations.
+- **`valerter_vl_source_up{vl_source}` per-source reachability gauge.** Initialized to 0 for every configured source at startup; engine flips to 1 on tail connect success and back to 0 on permanent failure or stream error. Replaces the v1.x per-rule `valerter_victorialogs_up`.
+- **`±10%` uniform jitter on reconnect backoff** (per `(rule, source)` task). Sources behind a flapping load balancer no longer reconnect in lock-step, breaking the thundering-herd alignment over a few cycles. Hardcoded jitter range; not configurable in this release.
+- **`tests/metrics_snapshot.rs` integration test.** Spins up a 2-source 1-rule engine, scrapes `/metrics`, and asserts the set of metric names + label keys (not values) against an inline expected string. Catches accidental relabel/rename in future PRs.
 
-## [1.2.1] - unreleased
+## [1.2.1] - 2026-04-16
 
 ### Fixed
 - **`{{ rule_name }}` available in top-level templates and throttle key** (issue #31). `rule_name` is now injected into the render context of `templates.<name>.title`, `body`, and `email_body_html`, and also into the `throttle.key` template, not just the notifier-level `subject_template` / `body_template`. Configs that referenced `{{ rule_name }}` in a top-level template previously rendered an empty string; they now render the rule name. If an event field happens to be literally named `rule_name`, the synthetic rule name wins, matching the collision policy of the existing notifier-level contexts.

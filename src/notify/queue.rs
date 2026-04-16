@@ -190,7 +190,8 @@ impl NotificationWorker {
                             "valerter_notify_errors_total",
                             "notifier_name" => dest_name.to_string(),
                             "notifier_type" => "unknown",
-                            "rule_name" => payload.rule_name.clone()
+                            "rule_name" => payload.rule_name.clone(),
+                            "vl_source" => payload.vl_source.clone(),
                         )
                         .increment(1);
                         None

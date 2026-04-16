@@ -436,8 +436,9 @@ impl Notifier for TelegramNotifier {
                         metrics::counter!(
                             "valerter_alerts_sent_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }
@@ -450,15 +451,17 @@ impl Notifier for TelegramNotifier {
                         metrics::counter!(
                             "valerter_notify_errors_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                         metrics::counter!(
                             "valerter_alerts_failed_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }

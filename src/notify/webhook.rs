@@ -281,8 +281,9 @@ impl Notifier for WebhookNotifier {
                         metrics::counter!(
                             "valerter_alerts_sent_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "webhook"
+                            "notifier_type" => "webhook",
                         )
                         .increment(1);
                         return Ok(());
@@ -297,16 +298,18 @@ impl Notifier for WebhookNotifier {
                         metrics::counter!(
                             "valerter_notify_errors_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "webhook"
+                            "notifier_type" => "webhook",
                         )
                         .increment(1);
                         // Permanent failure - count as failed alert
                         metrics::counter!(
                             "valerter_alerts_failed_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "webhook"
+                            "notifier_type" => "webhook",
                         )
                         .increment(1);
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
@@ -345,16 +348,18 @@ impl Notifier for WebhookNotifier {
             metrics::counter!(
                 "valerter_notify_errors_total",
                 "rule_name" => alert.rule_name.clone(),
+                "vl_source" => alert.vl_source.clone(),
                 "notifier_name" => self.name.clone(),
-                "notifier_type" => "webhook"
+                "notifier_type" => "webhook",
             )
             .increment(1);
             // Permanent failure after retries exhausted
             metrics::counter!(
                 "valerter_alerts_failed_total",
                 "rule_name" => alert.rule_name.clone(),
+                "vl_source" => alert.vl_source.clone(),
                 "notifier_name" => self.name.clone(),
-                "notifier_type" => "webhook"
+                "notifier_type" => "webhook",
             )
             .increment(1);
             Err(NotifyError::MaxRetriesExceeded)

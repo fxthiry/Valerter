@@ -281,7 +281,8 @@ impl RuleEngine {
                             );
                             metrics::counter!(
                                 "valerter_rule_errors_total",
-                                "rule_name" => rule_name
+                                "rule_name" => rule_name,
+                                "vl_source" => vl_source,
                             ).increment(1);
                             handle_to_context.remove(&task_id);
                         }
@@ -297,7 +298,8 @@ impl RuleEngine {
 
                                 metrics::counter!(
                                     "valerter_rule_panics_total",
-                                    "rule_name" => rule_name.clone()
+                                    "rule_name" => rule_name.clone(),
+                                    "vl_source" => vl_source.clone(),
                                 ).increment(1);
 
                                 if !cancel.is_cancelled() {
@@ -324,7 +326,12 @@ impl RuleEngine {
                                     error = %join_error,
                                     "Rule task panicked but context not found - CRITICAL"
                                 );
-                                metrics::counter!("valerter_rule_panics_total", "rule_name" => "unknown").increment(1);
+                                metrics::counter!(
+                                    "valerter_rule_panics_total",
+                                    "rule_name" => "unknown",
+                                    "vl_source" => "unknown",
+                                )
+                                .increment(1);
                             }
                         }
                         Err(join_error) => {
@@ -382,7 +389,11 @@ impl ThrottleResetCallback {
 }
 
 impl ReconnectCallback for ThrottleResetCallback {
-    fn on_reconnect(&self, _rule_name: &str) {
+    fn on_reconnect(&self, _rule_name: &str, _vl_source: &str) {
+        // Each (rule, source) task owns its own Throttler instance, so a
+        // reset here is already scoped to the source that just recovered.
+        // The vl_source parameter is accepted for trait conformance and
+        // future use (e.g. selective reset across shared throttle stores).
         self.throttler.reset();
     }
 }
@@ -462,43 +473,48 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         let timestamp_timezone = Arc::new(ctx.timestamp_timezone.clone());
 
         let stream_result = tail_client
-            .stream_with_reconnect(&rule_name, Some(&reconnect_callback), |line| {
-                // Process each log line
-                let queue = queue.clone();
-                let parser = Arc::clone(&parser);
-                let throttler = Arc::clone(&throttler);
-                let template_engine = Arc::clone(&template_engine);
-                let template_name = Arc::clone(&template_name);
-                let rule_name = rule_name.clone();
-                let vl_source = Arc::clone(&vl_source);
-                let destinations = Arc::clone(&destinations);
-                let timestamp_timezone = Arc::clone(&timestamp_timezone);
+            .stream_with_reconnect(
+                &rule_name,
+                vl_source.as_str(),
+                Some(&reconnect_callback),
+                |line| {
+                    // Process each log line
+                    let queue = queue.clone();
+                    let parser = Arc::clone(&parser);
+                    let throttler = Arc::clone(&throttler);
+                    let template_engine = Arc::clone(&template_engine);
+                    let template_name = Arc::clone(&template_name);
+                    let rule_name = rule_name.clone();
+                    let vl_source = Arc::clone(&vl_source);
+                    let destinations = Arc::clone(&destinations);
+                    let timestamp_timezone = Arc::clone(&timestamp_timezone);
 
-                async move {
-                    if let Err(e) = process_log_line(
-                        &line,
-                        &parser,
-                        &throttler,
-                        &template_engine,
-                        &template_name,
-                        &rule_name,
-                        &vl_source,
-                        &destinations,
-                        &queue,
-                        &timestamp_timezone,
-                    )
-                    .await
-                    {
-                        debug!(
-                            rule_name = %rule_name,
-                            vl_source = %vl_source,
-                            error = %e,
-                            "Failed to process log line, continuing"
-                        );
+                    async move {
+                        if let Err(e) = process_log_line(
+                            &line,
+                            &parser,
+                            &throttler,
+                            &template_engine,
+                            &template_name,
+                            &rule_name,
+                            &vl_source,
+                            &destinations,
+                            &queue,
+                            &timestamp_timezone,
+                        )
+                        .await
+                        {
+                            debug!(
+                                rule_name = %rule_name,
+                                vl_source = %vl_source,
+                                error = %e,
+                                "Failed to process log line, continuing"
+                            );
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            })
+                },
+            )
             .await;
 
         if cancel.is_cancelled() {
@@ -543,13 +559,13 @@ async fn process_log_line(
             f
         }
         Err(e) => {
-            record_parse_error(rule_name, &e);
+            record_parse_error(rule_name, vl_source, &e);
             return Err(ProcessError::Parse);
         }
     };
 
     // Step 1.5: Record successful match (before throttle check)
-    record_log_matched(rule_name);
+    record_log_matched(rule_name, vl_source);
 
     // Step 2: Check throttle (renders key with both rule_name and vl_source)
     match throttler.check(&fields) {
@@ -681,6 +697,7 @@ mod tests {
                     window: Duration::from_secs(60),
                 },
                 timestamp_timezone: "UTC".to_string(),
+                max_streams: crate::config::DEFAULT_MAX_STREAMS,
             },
             templates: {
                 let mut t = HashMap::new();
@@ -1085,7 +1102,7 @@ mod tests {
         assert_eq!(throttler.check(&fields), ThrottleResult::Throttled);
 
         // Reset via callback
-        callback.on_reconnect("test_rule");
+        callback.on_reconnect("test_rule", "vlprod");
 
         // Should pass again after reset
         assert_eq!(throttler.check(&fields), ThrottleResult::Pass);

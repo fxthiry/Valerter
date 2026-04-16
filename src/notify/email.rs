@@ -583,7 +583,8 @@ impl Notifier for EmailNotifier {
                         metrics::counter!(
                             "valerter_email_recipient_errors_total",
                             "rule_name" => alert.rule_name.clone(),
-                            "notifier_name" => self.name.clone()
+                            "vl_source" => alert.vl_source.clone(),
+                            "notifier_name" => self.name.clone(),
                         )
                         .increment(1);
                     }
@@ -604,8 +605,9 @@ impl Notifier for EmailNotifier {
                 metrics::counter!(
                     "valerter_alerts_sent_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 Ok(())
@@ -620,16 +622,18 @@ impl Notifier for EmailNotifier {
                 metrics::counter!(
                     "valerter_notify_errors_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 // Permanent failure - all recipients failed
                 metrics::counter!(
                     "valerter_alerts_failed_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 Err(NotifyError::SendFailed(format!(
