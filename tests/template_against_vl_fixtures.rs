@@ -54,7 +54,7 @@ fn smoke_every_fixture_renders_msg_and_time_matching_event() {
             .unwrap_or_else(|| panic!("fixture {} missing string _time", name));
         let expected = format!("{} @ {}", msg, time);
         let rendered = engine
-            .render("t", &value, "smoke")
+            .render("t", &value, "smoke", "vlprod")
             .unwrap_or_else(|e| panic!("fixture {} failed to render: {}", name, e));
         assert_eq!(
             rendered.body, expected,
@@ -92,7 +92,7 @@ fn regression_gh25_dotted_keys_render_their_value() {
             continue;
         };
         let rendered = engine
-            .render("t", &value, "gh25")
+            .render("t", &value, "gh25", "vlprod")
             .unwrap_or_else(|e| panic!("fixture {} failed to render for #25: {}", name, e));
         assert_eq!(
             rendered.body, expected,
@@ -116,7 +116,7 @@ fn regression_empty_fields_render_as_empty_string() {
     let engine = engine_with("t", "[{{ request_id }}][{{ user_id }}][{{ error }}]");
     let event = load_fixture("edge_empty_fields.json");
     let rendered = engine
-        .render("t", &event, "empty_fields")
+        .render("t", &event, "empty_fields", "vlprod")
         .expect("render should succeed with lenient undefined");
     assert_eq!(rendered.body, "[][][]");
 }
@@ -135,7 +135,7 @@ fn raw_source_fixtures_render_missing_as_empty_under_lenient() {
     );
     for (name, value) in fixtures {
         let rendered = engine
-            .render("t", &value, "raw")
+            .render("t", &value, "raw", "vlprod")
             .unwrap_or_else(|e| panic!("fixture {} failed lenient render: {}", name, e));
         assert!(!rendered.title.is_empty(), "title empty for {}", name);
         assert!(
@@ -153,7 +153,7 @@ fn unicode_fixture_preserves_cjk_and_emoji() {
     let engine = engine_with("{{ _msg }}", "{{ _msg }}");
     let event = load_fixture("edge_unicode_msg.json");
     let rendered = engine
-        .render("t", &event, "unicode")
+        .render("t", &event, "unicode", "vlprod")
         .expect("render should succeed on unicode event");
     assert!(rendered.body.contains("支付失败"), "lost CJK codepoints");
     assert!(rendered.body.contains('\u{2705}'), "lost emoji codepoint");

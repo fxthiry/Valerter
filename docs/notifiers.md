@@ -66,6 +66,7 @@ If `body_template` is omitted, sends:
 {
   "alert_name": "<notifier_name>",
   "rule_name": "...",
+  "vl_source": "<source name from victorialogs map>",
   "title": "...",
   "body": "...",
   "timestamp": "<ISO8601>",
@@ -89,8 +90,13 @@ When using `body_template`, these variables are available:
 | `title` | Alert title |
 | `body` | Alert body |
 | `rule_name` | Name of the rule |
+| `vl_source` | Name of the VictoriaLogs source the event came from |
 | `log_timestamp` | Original log timestamp (ISO 8601) |
 | `log_timestamp_formatted` | Human-readable timestamp |
+
+`{{ vl_source }}` is available wherever `{{ rule_name }}` is, and follows the
+same collision policy: an event field literally named `vl_source` is masked
+by the synthetic source name.
 
 ### Examples
 

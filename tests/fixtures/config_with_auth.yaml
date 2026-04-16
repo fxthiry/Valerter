@@ -2,15 +2,16 @@
 # NOTE: This is a TEST FIXTURE only - credentials are intentionally hardcoded.
 # In production, always use environment variables: ${VL_USER}, ${VL_PASS}, etc.
 victorialogs:
-  url: "https://victorialogs.secure.local:9428"
-  basic_auth:
-    username: "testuser"
-    password: "testpassword"
-  headers:
-    X-API-Key: "secret-api-key-12345"
-    X-Custom-Header: "custom-value"
-  tls:
-    verify: false
+  default:
+    url: "https://victorialogs.secure.local:9428"
+    basic_auth:
+      username: "testuser"
+      password: "testpassword"
+    headers:
+      X-API-Key: "secret-api-key-12345"
+      X-Custom-Header: "custom-value"
+    tls:
+      verify: false
 
 notifiers:
   test-notifier:

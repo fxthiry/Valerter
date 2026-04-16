@@ -51,10 +51,9 @@ src/
 Valerter connects to VictoriaLogs' `/select/logsql/tail` endpoint via HTTP streaming. Unlike polling-based approaches:
 
 - **Real-time:** Logs arrive within seconds of being ingested
-- **Efficient:** Single long-lived connection per rule
+- **Efficient:** Single long-lived connection per `(rule, source)` pair
 - **Resilient:** Automatic reconnection with exponential backoff
-
-Each rule maintains its own streaming connection, providing isolation.
+- **Multi-source:** Each rule fans out to every configured `victorialogs.<name>` source (or to a named subset via `vl_sources:`), with one task per pair so an unhealthy source never blocks others.
 
 ### 2. Parse
 
@@ -103,18 +102,19 @@ main.rs
     └── RuleEngine::run()
             │
             └── JoinSet<()>
-                    ├── rule_task("rule-1") ──► tail → parse → throttle → template → queue
-                    ├── rule_task("rule-2") ──► tail → parse → throttle → template → queue
-                    └── rule_task("rule-N") ──► ...
+                    ├── rule_task("rule-1", "vlprod") ──► tail → parse → throttle → template → queue
+                    ├── rule_task("rule-1", "vldev")  ──► tail → parse → throttle → template → queue
+                    ├── rule_task("rule-2", "vlprod") ──► tail → parse → throttle → template → queue
+                    └── rule_task("rule-N", "<source>") ──► ...
 ```
 
 **Key properties:**
 
-- **1 task per rule:** Rules are fully isolated via `JoinSet`
-- **Error isolation:** One rule's failure doesn't affect others
-- **Panic recovery:** Panicked rules are respawned after 5s delay (`PANIC_RESTART_DELAY`)
-- **Graceful shutdown:** All tasks respect the `CancellationToken`
-- **Metric:** `valerter_rule_panics_total{rule_name}` tracks panics per rule
+- **1 task per `(rule, source)` pair:** rules and sources are both fully isolated via `JoinSet`. A rule with `vl_sources: [a, b]` against a config defining sources `{a, b, c}` spawns 2 tasks; a rule with no `vl_sources` spawns N (one per configured source).
+- **Error isolation:** one task's failure doesn't affect others — neither sibling sources of the same rule, nor sibling rules of the same source.
+- **Panic recovery:** panicked tasks are respawned after 5s delay (`PANIC_RESTART_DELAY`), keyed by `(rule, source)` so the right cancellation token and source config are restored.
+- **Graceful shutdown:** all tasks respect the `CancellationToken`
+- **Metric:** `valerter_rule_panics_total{rule_name}` tracks panics per rule. (Per-source label split is deferred to the v2.0.0 part 2 observability spec.)
 
 ## Reconnection Strategy
 

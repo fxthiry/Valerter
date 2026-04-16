@@ -36,6 +36,8 @@ pub struct DefaultWebhookPayload {
     pub alert_name: String,
     /// Name of the rule that triggered the alert.
     pub rule_name: String,
+    /// Name of the VictoriaLogs source that produced the matching event.
+    pub vl_source: String,
     /// Alert title (rendered).
     pub title: String,
     /// Alert body (rendered).
@@ -54,6 +56,7 @@ impl DefaultWebhookPayload {
         Self {
             alert_name: notifier_name.to_string(),
             rule_name: alert.rule_name.clone(),
+            vl_source: alert.vl_source.clone(),
             title: alert.message.title.clone(),
             body: alert.message.body.clone(),
             timestamp: Utc::now().to_rfc3339(),
@@ -119,6 +122,7 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
         title => &alert.message.title,
         body => &alert.message.body,
         rule_name => &alert.rule_name,
+        vl_source => &alert.vl_source,
         log_timestamp => &alert.log_timestamp,
         log_timestamp_formatted => &alert.log_timestamp_formatted,
     })
@@ -387,6 +391,7 @@ mod tests {
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
+            vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
@@ -657,6 +662,7 @@ mod tests {
                 accent_color: None,
             },
             rule_name: "simple_rule".to_string(),
+            vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-01-15T10:00:00Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
@@ -797,6 +803,7 @@ mod tests {
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: "test_rule".to_string(),
+            vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-01-15T10:00:00Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),

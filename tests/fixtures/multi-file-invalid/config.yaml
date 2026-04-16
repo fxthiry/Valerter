@@ -1,7 +1,8 @@
 # Valid config, but rules.d/ contains invalid YAML
 
 victorialogs:
-  url: http://victorialogs:9428
+  default:
+    url: http://victorialogs:9428
 
 defaults:
   throttle:

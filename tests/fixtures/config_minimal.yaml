@@ -1,6 +1,7 @@
 # Minimal valid config - matches README example
 victorialogs:
-  url: "http://localhost:9428"
+  default:
+    url: "http://localhost:9428"
 
 notifiers:
   mattermost-ops:

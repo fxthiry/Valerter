@@ -6,7 +6,7 @@ use super::validation::{validate_hex_color, validate_jinja_template, validate_ur
 use crate::error::ConfigError;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,11 +14,16 @@ use std::time::Duration;
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/valerter/config.yaml";
 
 /// Main configuration structure for valerter.
+///
+/// `victorialogs` is a map of named source configurations. A BTreeMap is used
+/// explicitly (never HashMap) so iteration over sources is deterministic —
+/// crucial for test assertions, diagnostic logs, and spawn order.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// VictoriaLogs connection settings.
-    pub victorialogs: VictoriaLogsConfig,
+    /// Named VictoriaLogs sources. At least one is required (enforced at validate()).
+    #[serde(deserialize_with = "deserialize_vl_sources")]
+    pub victorialogs: BTreeMap<String, VlSourceConfig>,
     /// Default values for throttle and notify.
     pub defaults: DefaultsConfig,
     /// Reusable message templates.
@@ -35,10 +40,13 @@ pub struct Config {
     pub notifiers: Option<NotifiersConfig>,
 }
 
-/// VictoriaLogs connection configuration.
+/// Configuration for a single named VictoriaLogs source.
+///
+/// Renamed from `VictoriaLogsConfig` in v2.0.0 (multi-source support). The
+/// field set is unchanged; only the containing map structure changed.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VictoriaLogsConfig {
+pub struct VlSourceConfig {
     /// URL of the VictoriaLogs instance.
     pub url: String,
     /// Optional Basic Auth credentials.
@@ -50,6 +58,62 @@ pub struct VictoriaLogsConfig {
     /// Optional TLS configuration.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+}
+
+/// Legacy single-URL `victorialogs` shape. Kept for detection only so we can
+/// emit a precise migration error when users upgrade from v1.x.
+///
+/// Intentionally does NOT set `deny_unknown_fields`: v1 users with a forked
+/// build or an extra field still land on the migration error rather than a
+/// cryptic v2 parse failure.
+#[derive(Debug, Deserialize)]
+struct LegacyVictoriaLogsConfig {
+    #[allow(dead_code)]
+    url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    basic_auth: Option<BasicAuthConfig>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    headers: Option<HashMap<String, SecretString>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    tls: Option<TlsConfig>,
+}
+
+/// Migration error text pointing users from the v1 single-URL shape to the
+/// v2 map shape. Exposed so tests can assert wording.
+pub(crate) const LEGACY_VL_MIGRATION_MESSAGE: &str = "`victorialogs` is now a map of named sources (breaking change in v2.0.0).\n\nMigrate from:\n  victorialogs:\n    url: \"http://...\"\n    basic_auth:\n      username: \"u\"\n      password: \"p\"\nTo:\n  victorialogs:\n    default:\n      url: \"http://...\"\n      basic_auth:\n        username: \"u\"\n        password: \"p\"\n\nThen optionally target sources per rule via `vl_sources: [default]` (or omit to fan out across all sources). See CHANGELOG v2.0.0 for the full migration note.";
+
+/// Deserialize `victorialogs` as `BTreeMap<String, VlSourceConfig>`, but
+/// emit a migration-oriented error when the legacy single-object shape
+/// (`url: ...` at the `victorialogs` level) is detected.
+fn deserialize_vl_sources<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, VlSourceConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_yaml::Value::deserialize(deserializer)?;
+
+    // Legacy-shape detection: a YAML mapping that parses cleanly as the v1
+    // struct is the old shape. The new shape's outer map has named keys whose
+    // values are objects — these fail the v1 struct parse due to
+    // `deny_unknown_fields`.
+    if serde_yaml::from_value::<LegacyVictoriaLogsConfig>(raw.clone()).is_ok() {
+        return Err(serde::de::Error::custom(LEGACY_VL_MIGRATION_MESSAGE));
+    }
+
+    serde_yaml::from_value::<BTreeMap<String, VlSourceConfig>>(raw)
+        .map_err(serde::de::Error::custom)
+}
+
+/// A VictoriaLogs source name is valid if it is non-empty and contains only
+/// alphanumeric ASCII characters or underscores. This restriction guarantees
+/// the default throttle key `{rule}-{source}:global` parses unambiguously and
+/// avoids collisions when rule and source names share the `-` separator.
+fn is_valid_source_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Basic Auth configuration for VictoriaLogs connection.
@@ -174,6 +238,12 @@ pub struct RuleConfig {
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
     pub notify: NotifyConfig,
+    /// Optional list of VictoriaLogs source names to target. An empty list (the
+    /// default) means "fan out across every configured source". All listed
+    /// names must exist in the top-level `victorialogs` map; unknown refs are
+    /// rejected at `Config::validate()` time.
+    #[serde(default)]
+    pub vl_sources: Vec<String>,
 }
 
 /// Rule configuration without the `name` field, for deserializing `.d/` files.
@@ -188,6 +258,8 @@ struct RuleConfigWithoutName {
     #[serde(default)]
     pub throttle: Option<ThrottleConfig>,
     pub notify: NotifyConfig,
+    #[serde(default)]
+    pub vl_sources: Vec<String>,
 }
 
 impl RuleConfigWithoutName {
@@ -200,6 +272,7 @@ impl RuleConfigWithoutName {
             parser: self.parser,
             throttle: self.throttle,
             notify: self.notify,
+            vl_sources: self.vl_sources,
         }
     }
 }
@@ -468,14 +541,54 @@ impl Config {
     pub fn validate(&self) -> Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
 
-        // ===== URL validations =====
+        // ===== VictoriaLogs source validations =====
 
-        // Validate victorialogs.url
-        if let Err(e) = validate_url(&self.victorialogs.url) {
-            errors.push(ConfigError::ValidationError(format!(
-                "victorialogs.url: {}",
-                e
-            )));
+        // At least one source is required (zero-source rejection).
+        if self.victorialogs.is_empty() {
+            errors.push(ConfigError::ValidationError(
+                "victorialogs: at least one source required (define e.g. `victorialogs: { default: { url: \"http://...\" } }`)"
+                    .to_string(),
+            ));
+        }
+
+        // Validate each source's URL and name format.
+        for (source_name, source) in &self.victorialogs {
+            if let Err(e) = validate_url(&source.url) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "victorialogs.{}.url: {}",
+                    source_name, e
+                )));
+            }
+            if !is_valid_source_name(source_name) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "victorialogs source name '{}' is invalid: must match `^[a-zA-Z0-9_]+$` (alphanumeric or underscore). \
+                     This avoids ambiguity in the default throttle key `{{rule}}-{{source}}:global`.",
+                    source_name
+                )));
+            }
+        }
+
+        // Validate that every rule.vl_sources entry references a declared source
+        // and that the rule's vl_sources list contains no duplicates.
+        let known_sources: Vec<&str> = self.victorialogs.keys().map(String::as_str).collect();
+        for rule in &self.rules {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for referenced in &rule.vl_sources {
+                if !self.victorialogs.contains_key(referenced) {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': vl_sources references unknown source '{}' (known sources: [{}])",
+                        rule.name,
+                        referenced,
+                        known_sources.join(", ")
+                    )));
+                }
+                if !seen.insert(referenced.as_str()) {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': vl_sources contains duplicate entry '{}' (each source may appear at most once)",
+                        rule.name, referenced
+                    )));
+                }
+            }
         }
 
         // Validate notifier URLs

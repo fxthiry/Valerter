@@ -65,6 +65,9 @@ pub struct Throttler {
     max_count: u32,
     /// Rule name for logging and metrics (Arc to avoid cloning).
     rule_name: Arc<str>,
+    /// VL source name bound to this throttler (per-task). Threaded into every
+    /// rendered key so the `(rule, source)` bucket is isolated by default.
+    vl_source: Arc<str>,
     /// Pre-created Jinja environment for template rendering (H1 fix).
     jinja_env: Environment<'static>,
 }
@@ -76,14 +79,11 @@ impl Throttler {
     ///
     /// * `config` - Optional throttle configuration. If None, creates a pass-through throttler.
     /// * `rule_name` - Name of the rule for logging and metrics.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let throttler = Throttler::new(Some(&compiled_throttle), "my_rule");
-    /// ```
-    pub fn new(config: Option<&CompiledThrottle>, rule_name: &str) -> Self {
-        Self::with_capacity(config, rule_name, DEFAULT_MAX_CAPACITY)
+    /// * `vl_source` - VL source name bound to the task (injected into render
+    ///   context so `{{ vl_source }}` works in `throttle.key` and the default
+    ///   key is per-source by construction).
+    pub fn new(config: Option<&CompiledThrottle>, rule_name: &str, vl_source: &str) -> Self {
+        Self::with_capacity(config, rule_name, vl_source, DEFAULT_MAX_CAPACITY)
     }
 
     /// Create a new Throttler with custom max capacity (for testing).
@@ -92,10 +92,12 @@ impl Throttler {
     ///
     /// * `config` - Optional throttle configuration.
     /// * `rule_name` - Name of the rule for logging and metrics.
+    /// * `vl_source` - VL source name bound to this task's throttler.
     /// * `max_capacity` - Maximum number of keys in the cache (FR25).
     pub fn with_capacity(
         config: Option<&CompiledThrottle>,
         rule_name: &str,
+        vl_source: &str,
         max_capacity: u64,
     ) -> Self {
         let (key_template, max_count, window) = match config {
@@ -108,12 +110,14 @@ impl Throttler {
             if t.count == 0 {
                 tracing::warn!(
                     rule_name = %rule_name,
+                    vl_source = %vl_source,
                     "Throttle count is 0, all alerts after first will be throttled"
                 );
             }
             if t.window.is_zero() {
                 tracing::warn!(
                     rule_name = %rule_name,
+                    vl_source = %vl_source,
                     "Throttle window is 0, entries will expire immediately"
                 );
             }
@@ -133,6 +137,7 @@ impl Throttler {
             key_template,
             max_count,
             rule_name: Arc::from(rule_name),
+            vl_source: Arc::from(vl_source),
             jinja_env,
         }
     }
@@ -196,26 +201,27 @@ impl Throttler {
 
     /// Render the throttle key from template and fields.
     ///
-    /// If no template is configured, returns a global key for the rule.
-    /// If template rendering fails, logs a warning and returns a fallback key.
+    /// If no template is configured, returns the per-source default key
+    /// `"{rule}-{source}:global"` so multi-source deployments see isolated
+    /// throttle buckets without any config. If rendering fails, logs a
+    /// warning and returns a fallback key.
     fn render_key(&self, fields: &Value) -> String {
         match &self.key_template {
             Some(template) => {
-                // Inject synthetic `rule_name` (issue #31) so users can write
-                // `{{ rule_name }}` in throttle.key. Synthetic wins over any
-                // event field with the same name, matching layer 1/2 template
+                // Inject synthetic `rule_name` (issue #31) and `vl_source`
+                // (multi-source v2.0.0). Synthetic values win over any event
+                // field with the same name, matching layer 1/2 template
                 // behavior.
-                let enriched_ctx = enrich_with_rule_name(fields, &self.rule_name);
-                // H1 fix: Use pre-created jinja_env instead of creating new one
+                let enriched_ctx = enrich_with_context(fields, &self.rule_name, &self.vl_source);
                 match self.jinja_env.render_str(template, &enriched_ctx) {
                     Ok(key) => {
                         tracing::trace!(rendered_key = %key, "Throttle key rendered");
                         key
                     }
                     Err(e) => {
-                        // Template error - log and use fallback
                         tracing::warn!(
                             rule_name = %self.rule_name,
+                            vl_source = %self.vl_source,
                             template = %template,
                             error = %e,
                             "Failed to render throttle key, using fallback"
@@ -225,8 +231,11 @@ impl Throttler {
                 }
             }
             None => {
-                // No template = global throttle for the rule
-                format!("{}:global", self.rule_name)
+                // Default key is per-(rule, source) so buckets are isolated
+                // per-source by construction. Equivalent to rendering
+                // `"{{ rule_name }}-{{ vl_source }}:global"` via Jinja, but
+                // inlined to avoid the render round-trip on every call.
+                format!("{}-{}:global", self.rule_name, self.vl_source)
             }
         }
     }
@@ -242,19 +251,24 @@ impl Throttler {
 }
 
 /// Unflatten dotted event keys (issue #25) then inject the synthetic
-/// `rule_name` key (issue #31). Matches the layer 1 template rendering path
-/// so users can reference both dotted event fields (`{{ nginx.http.status }}`)
-/// and `{{ rule_name }}` inside a `throttle.key` template consistently.
+/// `rule_name` (issue #31) and `vl_source` (v2.0.0 multi-source) keys.
+/// Matches the layer 1 template rendering path so users can reference both
+/// dotted event fields (`{{ nginx.http.status }}`) and the synthetic keys
+/// inside a `throttle.key` template consistently.
 ///
 /// Returns the original value unchanged if it is not a JSON object (should
-/// not happen in practice, VL events are always objects). The synthetic
-/// value wins over any event field literally named `rule_name`.
-fn enrich_with_rule_name(fields: &Value, rule_name: &str) -> Value {
+/// not happen in practice, VL events are always objects). Synthetic values
+/// win over any event field literally named `rule_name` or `vl_source`.
+fn enrich_with_context(fields: &Value, rule_name: &str, vl_source: &str) -> Value {
     let mut ctx = crate::parser::unflatten_dotted_keys(fields);
     if let Some(obj) = ctx.as_object_mut() {
         obj.insert(
             "rule_name".to_string(),
             Value::String(rule_name.to_string()),
+        );
+        obj.insert(
+            "vl_source".to_string(),
+            Value::String(vl_source.to_string()),
         );
     }
     ctx
@@ -291,7 +305,7 @@ mod tests {
     #[test]
     fn render_key_with_simple_template() {
         let config = make_config(Some("{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01", "port": "Gi0/1"});
         let key = throttler.render_key(&fields);
@@ -306,7 +320,7 @@ mod tests {
     #[test]
     fn render_key_with_composite_template() {
         let config = make_config(Some("{{ host }}-{{ port }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01", "port": "Gi0/1"});
         let key = throttler.render_key(&fields);
@@ -321,7 +335,7 @@ mod tests {
     #[test]
     fn render_key_with_missing_field_returns_empty_value() {
         let config = make_config(Some("{{ host }}-{{ missing }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
         let key = throttler.render_key(&fields);
@@ -337,7 +351,7 @@ mod tests {
     #[test]
     fn first_alert_passes() {
         let config = make_config(Some("{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
         let result = throttler.check(&fields);
@@ -352,7 +366,7 @@ mod tests {
     #[test]
     fn alerts_up_to_count_pass() {
         let config = make_config(Some("{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
 
@@ -369,7 +383,7 @@ mod tests {
     #[test]
     fn alert_after_count_is_throttled() {
         let config = make_config(Some("{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
 
@@ -395,7 +409,7 @@ mod tests {
             count: 2,
             window: Duration::from_millis(100), // Very short for testing
         };
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
 
@@ -424,7 +438,7 @@ mod tests {
         let config = make_config(Some("{{ key }}"), 2, 3600);
 
         // Use with_capacity to set a small max (5 keys)
-        let throttler = Throttler::with_capacity(Some(&config), "test_rule", 5);
+        let throttler = Throttler::with_capacity(Some(&config), "test_rule", "vlprod", 5);
 
         // Fill cache with 5 different keys, each gets 2 alerts (at max)
         for i in 0..5 {
@@ -469,27 +483,44 @@ mod tests {
     #[test]
     fn no_key_template_uses_global_key() {
         let config = make_config(None, 2, 60);
-        let throttler = Throttler::new(Some(&config), "my_rule");
+        let throttler = Throttler::new(Some(&config), "my_rule", "vlprod");
 
         let fields1 = json!({"host": "SW-01"});
         let fields2 = json!({"host": "SW-02"});
 
-        // Both should use the same global key "my_rule:global"
+        // Both should use the same per-source default key
+        // "my_rule-vlprod:global" - cross-host but not cross-source.
         assert_eq!(throttler.check(&fields1), ThrottleResult::Pass);
         assert_eq!(throttler.check(&fields2), ThrottleResult::Pass);
-        // Third from either should be throttled (same global key)
+        // Third from either should be throttled (same default key)
         assert_eq!(throttler.check(&fields1), ThrottleResult::Throttled);
     }
 
     #[test]
-    fn global_key_format() {
+    fn default_key_format_is_rule_dash_source_global() {
+        // Spec: default throttle key is `{rule}-{source}:global`.
+        // Used to be `{rule}:global` (pre-v2.0.0); breaking change for
+        // multi-source deployments and locks per-source bucket isolation.
         let config = make_config(None, 2, 60);
-        let throttler = Throttler::new(Some(&config), "my_rule");
+        let throttler = Throttler::new(Some(&config), "my_rule", "vlprod");
 
         let fields = json!({});
         let key = throttler.render_key(&fields);
 
-        assert_eq!(key, "my_rule:global");
+        assert_eq!(key, "my_rule-vlprod:global");
+    }
+
+    #[test]
+    fn default_key_isolates_buckets_per_source() {
+        // Two throttlers with the same rule but different sources must
+        // produce different default keys, so buckets are isolated per-source.
+        let config = make_config(None, 2, 60);
+        let throttler_a = Throttler::new(Some(&config), "VM_OFF", "vlprod");
+        let throttler_b = Throttler::new(Some(&config), "VM_OFF", "vldev");
+
+        let fields = json!({});
+        assert_eq!(throttler_a.render_key(&fields), "VM_OFF-vlprod:global");
+        assert_eq!(throttler_b.render_key(&fields), "VM_OFF-vldev:global");
     }
 
     // ===================================================================
@@ -499,7 +530,7 @@ mod tests {
     #[test]
     fn render_key_with_nested_fields() {
         let config = make_config(Some("{{ data.server.name }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({
             "data": {
@@ -520,7 +551,7 @@ mod tests {
     #[test]
     fn different_keys_are_throttled_independently() {
         let config = make_config(Some("{{ host }}"), 2, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let sw01 = json!({"host": "SW-01"});
         let sw02 = json!({"host": "SW-02"});
@@ -538,7 +569,7 @@ mod tests {
 
     #[test]
     fn no_config_passes_all() {
-        let throttler = Throttler::new(None, "test_rule");
+        let throttler = Throttler::new(None, "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
 
@@ -551,7 +582,7 @@ mod tests {
     #[test]
     fn reset_clears_all_entries() {
         let config = make_config(Some("{{ host }}"), 2, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
 
@@ -570,7 +601,7 @@ mod tests {
     #[test]
     fn debug_format_shows_useful_info() {
         let config = make_config(Some("{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let debug = format!("{:?}", throttler);
 
@@ -590,7 +621,7 @@ mod tests {
     #[test]
     fn render_key_includes_rule_name() {
         let config = make_config(Some("{{ rule_name }}-{{ host }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "VM_OFF");
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
 
         let fields = json!({"host": "SW-01"});
         let key = throttler.render_key(&fields);
@@ -604,7 +635,7 @@ mod tests {
         // tened the same way template rendering does, so `{{ nginx.http.status }}`
         // works here too (not just in `title`/`body`).
         let config = make_config(Some("{{ rule_name }}-{{ nginx.http.status_code }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "VM_OFF");
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
 
         let fields = json!({"nginx.http.status_code": "404"});
         let key = throttler.render_key(&fields);
@@ -617,7 +648,7 @@ mod tests {
         // Collision policy: synthetic rule_name wins over any event field
         // literally named "rule_name".
         let config = make_config(Some("{{ rule_name }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "VM_OFF");
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
 
         let fields = json!({"rule_name": "event-value", "host": "SW-01"});
         let key = throttler.render_key(&fields);
@@ -625,11 +656,50 @@ mod tests {
         assert_eq!(key, "VM_OFF");
     }
 
+    // ===================================================================
+    // v2.0.0: vl_source injected into throttle key render context
+    // ===================================================================
+
+    #[test]
+    fn render_key_includes_vl_source() {
+        let config = make_config(Some("{{ rule_name }}-{{ vl_source }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
+
+        let fields = json!({"host": "SW-01"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "VM_OFF-vlprod");
+    }
+
+    #[test]
+    fn render_key_vl_source_synthetic_overrides_event_field() {
+        // Collision policy: synthetic vl_source wins over any event field
+        // literally named "vl_source" (matches rule_name collision policy).
+        let config = make_config(Some("{{ vl_source }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
+
+        let fields = json!({"vl_source": "evil", "host": "SW-01"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "vlprod");
+    }
+
+    #[test]
+    fn render_key_custom_template_with_both_synthetics() {
+        let config = make_config(Some("{{ rule_name }}-{{ vl_source }}-{{ host }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "VM_OFF", "vlprod");
+
+        let fields = json!({"host": "SW-01"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "VM_OFF-vlprod-SW-01");
+    }
+
     #[test]
     fn template_error_uses_fallback_key() {
         // Invalid template syntax that minijinja can't render
         let config = make_config(Some("{{ nonexistent_filter | bad_filter }}"), 3, 60);
-        let throttler = Throttler::new(Some(&config), "test_rule");
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
         let fields = json!({"host": "SW-01"});
         let key = throttler.render_key(&fields);

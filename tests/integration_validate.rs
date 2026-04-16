@@ -57,8 +57,8 @@ fn validate_valid_config_exits_success() {
         stdout
     );
     assert!(
-        stdout.contains("VictoriaLogs URL"),
-        "Output should show VictoriaLogs URL: {}",
+        stdout.contains("VictoriaLogs sources"),
+        "Output should show VictoriaLogs sources summary: {}",
         stdout
     );
     assert!(

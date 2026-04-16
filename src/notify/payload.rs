@@ -14,6 +14,10 @@ pub struct AlertPayload {
     pub message: RenderedMessage,
     /// Rule name for tracing and metrics.
     pub rule_name: String,
+    /// Name of the VictoriaLogs source that produced the matching event.
+    /// Owned `String` (not `&str`) so it survives task lifetimes and can be
+    /// cloned into notifier render contexts safely.
+    pub vl_source: String,
     /// Notification destinations (notifier names).
     /// If empty, uses the default notifier.
     pub destinations: Vec<String>,

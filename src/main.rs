@@ -245,7 +245,16 @@ fn main() -> Result<()> {
     // Validate mode: display success and exit
     if cli.validate {
         println!("Configuration is valid: {}", cli.config.display());
-        println!("  VictoriaLogs URL: {}", config.victorialogs.url);
+        println!(
+            "  VictoriaLogs sources: {} [{}]",
+            config.victorialogs.len(),
+            config
+                .victorialogs
+                .iter()
+                .map(|(name, src)| format!("{}={}", name, src.url))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!(
             "  Rules: {} ({} enabled)",
             config.rules.len(),

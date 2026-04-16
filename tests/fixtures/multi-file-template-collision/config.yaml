@@ -1,5 +1,6 @@
 victorialogs:
-  url: http://victorialogs:9428
+  default:
+    url: http://victorialogs:9428
 
 notifiers:
   test:
