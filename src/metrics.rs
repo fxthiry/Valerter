@@ -80,8 +80,9 @@ pub fn register_metric_descriptions() {
         "Unix timestamp of last successful VictoriaLogs query chunk received"
     );
     describe_gauge!(
-        "valerter_victorialogs_up",
-        "VictoriaLogs connection status (1=connected, 0=disconnected or error)"
+        "valerter_vl_source_up",
+        "Per-source VictoriaLogs reachability (1=connected, 0=disconnected). \
+         Replaces the v1.x per-rule `valerter_victorialogs_up`."
     );
     describe_gauge!(
         "valerter_uptime_seconds",
@@ -198,9 +199,17 @@ pub fn is_recorder_installed() -> bool {
 ///
 /// # Arguments
 ///
-/// * `rule_names` - List of rule names to initialize per-rule counters
-/// * `notifier_names` - List of notifier names to initialize per-notifier counters
-pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
+/// * `rule_source_pairs` - List of `(rule_name, vl_source)` pairs to initialize
+///   per-(rule, source) counters. Same shape the engine spawns tasks for.
+/// * `source_names` - List of every configured `vl_source` (independent of
+///   which rules tail it). Used to seed the per-source `valerter_vl_source_up`
+///   gauge to 0 at startup.
+/// * `notifier_names` - List of notifier names to initialize per-notifier counters.
+pub fn initialize_metrics(
+    rule_source_pairs: &[(&str, &str)],
+    source_names: &[&str],
+    notifier_names: &[&str],
+) {
     use metrics::{counter, gauge};
 
     // Initialize gauges with their initial values
@@ -208,30 +217,92 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
     gauge!("valerter_uptime_seconds").set(0.0);
     gauge!("valerter_queue_size").set(0.0);
 
-    // Initialize per-rule gauges
-    for rule_name in rule_names {
-        gauge!("valerter_victorialogs_up", "rule_name" => rule_name.to_string()).set(0.0);
+    // Initialize per-source `vl_source_up` gauge to 0 for every configured
+    // source. The engine flips it to 1 on the first successful tail connect.
+    for source_name in source_names {
+        gauge!("valerter_vl_source_up", "vl_source" => source_name.to_string()).set(0.0);
     }
 
     // Initialize counters without labels (global counters)
-    counter!("valerter_reconnections_total").absolute(0);
-
-    // Initialize global counters (no labels)
     counter!("valerter_alerts_dropped_total").absolute(0);
 
-    // Initialize per-rule counters
-    for rule_name in rule_names {
-        counter!("valerter_logs_matched_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_alerts_sent_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_alerts_throttled_total", "rule_name" => rule_name.to_string())
-            .absolute(0);
-        counter!("valerter_alerts_passed_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_parse_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_rule_panics_total", "rule_name" => rule_name.to_string()).absolute(0);
-        counter!("valerter_rule_errors_total", "rule_name" => rule_name.to_string()).absolute(0);
+    // Initialize per-(rule, source) counters. Every per-rule metric also
+    // carries `vl_source` (v2.0.0 multi-source observability).
+    for (rule_name, vl_source) in rule_source_pairs {
+        counter!(
+            "valerter_logs_matched_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_alerts_sent_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_alerts_throttled_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_alerts_passed_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_parse_errors_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_rule_panics_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_rule_errors_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_reconnections_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .absolute(0);
+        counter!(
+            "valerter_lines_discarded_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+            "reason" => "oversized",
+        )
+        .absolute(0);
+        // Histograms can't be `absolute(0)` but referencing the handle here
+        // registers the series so it appears in /metrics from startup.
+        let _ = metrics::histogram!(
+            "valerter_query_duration_seconds",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        );
+        gauge!(
+            "valerter_last_query_timestamp",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+        )
+        .set(0.0);
     }
 
-    // Initialize per-notifier counters
+    // Initialize per-notifier counters. The actual emit sites carry
+    // (rule_name, vl_source) labels; this loop pre-registers a per-notifier
+    // sentinel series so dashboards listing notifiers see them at startup.
+    // The two label sets coexist legitimately (different aggregations).
     for notifier_name in notifier_names {
         counter!("valerter_alerts_failed_total", "notifier" => notifier_name.to_string())
             .absolute(0);
@@ -240,7 +311,8 @@ pub fn initialize_metrics(rule_names: &[&str], notifier_names: &[&str]) {
     }
 
     tracing::info!(
-        rule_count = rule_names.len(),
+        rule_source_pair_count = rule_source_pairs.len(),
+        source_count = source_names.len(),
         notifier_count = notifier_names.len(),
         "Metrics initialized to zero"
     );

@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "valerter"
-version = "1.2.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2350,6 +2350,7 @@ dependencies = [
  "minijinja",
  "moka",
  "portpicker",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "serde",

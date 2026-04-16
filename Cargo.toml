@@ -1,6 +1,6 @@
 [package]
 name = "valerter"
-version = "1.2.1"
+version = "2.0.0"
 edition = "2024"
 description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"
@@ -30,6 +30,9 @@ minijinja = { version = "2.12", features = ["builtins", "json"] }
 
 # Caching/Throttle
 moka = { version = "0.12", features = ["sync"] }
+
+# Random (jitter on reconnect backoff to break thundering-herd alignment).
+rand = "0.8"
 
 # Observability
 tracing = "0.1"

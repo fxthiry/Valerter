@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T11:05:12.333Z","_stream":"{group=\"app\",host=\"app-host-06\"}","_stream_id":"0000000000000000445566778899aabb","_msg":"GET /healthz -> 200","nginx.http.method":"GET","nginx.http.path":"/healthz","nginx.http.status":"200","nginx.http.request_id":"req-0f1e2d3c4b5a","nginx.http.remote_addr":"203.0.113.9","host":"app-host-06"}

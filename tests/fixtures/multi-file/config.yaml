@@ -1,7 +1,8 @@
 # Base config with inline rules/templates/notifiers for multi-file merge testing
 
 victorialogs:
-  url: http://victorialogs:9428
+  default:
+    url: http://victorialogs:9428
 
 defaults:
   throttle:

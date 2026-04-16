@@ -98,6 +98,7 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
         title => &alert.message.title,
         body => &alert.message.body,
         rule_name => &alert.rule_name,
+        vl_source => &alert.vl_source,
         log_timestamp => &alert.log_timestamp,
         log_timestamp_formatted => &alert.log_timestamp_formatted,
     })
@@ -435,8 +436,9 @@ impl Notifier for TelegramNotifier {
                         metrics::counter!(
                             "valerter_alerts_sent_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }
@@ -449,15 +451,17 @@ impl Notifier for TelegramNotifier {
                         metrics::counter!(
                             "valerter_notify_errors_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                         metrics::counter!(
                             "valerter_alerts_failed_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram"
+                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }
@@ -524,6 +528,7 @@ mod tests {
                 accent_color: None,
             },
             rule_name: "test_rule".to_string(),
+            vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-04-14T10:00:00Z".to_string(),
             log_timestamp_formatted: "14/04/2026 10:00:00 UTC".to_string(),

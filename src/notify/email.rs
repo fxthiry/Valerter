@@ -382,6 +382,7 @@ impl EmailNotifier {
             title => &alert.message.title,
             body => &alert.message.body,
             rule_name => &alert.rule_name,
+            vl_source => &alert.vl_source,
             accent_color => &alert.message.accent_color,
             log_timestamp => &alert.log_timestamp,
             log_timestamp_formatted => &alert.log_timestamp_formatted,
@@ -420,6 +421,7 @@ impl EmailNotifier {
             title => &alert.message.title,
             body => body_safe,
             rule_name => &alert.rule_name,
+            vl_source => &alert.vl_source,
             accent_color => &alert.message.accent_color,
             log_timestamp => &alert.log_timestamp,
             log_timestamp_formatted => &alert.log_timestamp_formatted,
@@ -581,7 +583,8 @@ impl Notifier for EmailNotifier {
                         metrics::counter!(
                             "valerter_email_recipient_errors_total",
                             "rule_name" => alert.rule_name.clone(),
-                            "notifier_name" => self.name.clone()
+                            "vl_source" => alert.vl_source.clone(),
+                            "notifier_name" => self.name.clone(),
                         )
                         .increment(1);
                     }
@@ -602,8 +605,9 @@ impl Notifier for EmailNotifier {
                 metrics::counter!(
                     "valerter_alerts_sent_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 Ok(())
@@ -618,16 +622,18 @@ impl Notifier for EmailNotifier {
                 metrics::counter!(
                     "valerter_notify_errors_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 // Permanent failure - all recipients failed
                 metrics::counter!(
                     "valerter_alerts_failed_total",
                     "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
                     "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email"
+                    "notifier_type" => "email",
                 )
                 .increment(1);
                 Err(NotifyError::SendFailed(format!(
@@ -799,6 +805,7 @@ mod tests {
                 accent_color: Some("#ff0000".to_string()),
             },
             rule_name: rule_name.to_string(),
+            vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),

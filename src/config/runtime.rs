@@ -2,18 +2,22 @@
 
 use super::notifiers::NotifiersConfig;
 use super::types::{
-    Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig, VictoriaLogsConfig,
+    Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig, VlSourceConfig,
 };
 use crate::error::ConfigError;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
 /// Runtime configuration with pre-compiled regex (FR15).
+///
+/// `victorialogs` is a BTreeMap of named sources. BTreeMap (not HashMap) is
+/// intentional: deterministic iteration order is required for spawn order,
+/// diagnostic logs, and test assertions.
 #[derive(Debug)]
 pub struct RuntimeConfig {
-    pub victorialogs: VictoriaLogsConfig,
+    pub victorialogs: BTreeMap<String, VlSourceConfig>,
     pub defaults: DefaultsConfig,
     pub templates: HashMap<String, CompiledTemplate>,
     pub rules: Vec<CompiledRule>,
@@ -31,6 +35,10 @@ pub struct CompiledRule {
     pub parser: CompiledParser,
     pub throttle: Option<CompiledThrottle>,
     pub notify: NotifyConfig,
+    /// VL sources this rule is bound to. Empty means "fan out across all
+    /// configured sources"; non-empty restricts to the named subset. All
+    /// names are validated against the top-level map at config load time.
+    pub vl_sources: Vec<String>,
 }
 
 /// Parser with pre-compiled regex pattern.
@@ -133,6 +141,7 @@ impl Config {
                             window: t.window,
                         }),
                         notify: rule.notify,
+                        vl_sources: rule.vl_sources,
                     }
                 })
                 .collect();

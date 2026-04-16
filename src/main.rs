@@ -245,7 +245,16 @@ fn main() -> Result<()> {
     // Validate mode: display success and exit
     if cli.validate {
         println!("Configuration is valid: {}", cli.config.display());
-        println!("  VictoriaLogs URL: {}", config.victorialogs.url);
+        println!(
+            "  VictoriaLogs sources: {} [{}]",
+            config.victorialogs.len(),
+            config
+                .victorialogs
+                .iter()
+                .map(|(name, src)| format!("{}={}", name, src.url))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!(
             "  Rules: {} ({} enabled)",
             config.rules.len(),
@@ -330,12 +339,38 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     // Create cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
-    // Collect rule and notifier names for metric initialization
-    let rule_names: Vec<&str> = runtime_config
+    // Collect rule-source pairs and source names for metric initialization.
+    //
+    // Multi-source observability (v2.0.0 part 2): every per-rule metric also
+    // carries `vl_source`, so initialization seeds one series per
+    // `(enabled rule, resolved source)` pair. The `vl_source_up` gauge is
+    // per-source only, so we also pass the flat list of declared sources.
+    let source_names: Vec<&str> = runtime_config
+        .victorialogs
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let rule_source_pairs: Vec<(&str, &str)> = runtime_config
         .rules
         .iter()
         .filter(|r| r.enabled)
-        .map(|r| r.name.as_str())
+        .flat_map(|r| {
+            // Same fan-out semantics the engine uses: empty `vl_sources` means
+            // "every configured source", non-empty restricts to the named
+            // subset (intersected with declared sources for safety).
+            if r.vl_sources.is_empty() {
+                source_names
+                    .iter()
+                    .map(move |s| (r.name.as_str(), *s))
+                    .collect::<Vec<_>>()
+            } else {
+                r.vl_sources
+                    .iter()
+                    .filter(|s| runtime_config.victorialogs.contains_key(s.as_str()))
+                    .map(move |s| (r.name.as_str(), s.as_str()))
+                    .collect::<Vec<_>>()
+            }
+        })
         .collect();
     let notifier_names: Vec<&str> = registry.names().collect();
 
@@ -364,7 +399,7 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
         }
 
         // Initialize all known metrics to zero now that recorder is ready
-        valerter::initialize_metrics(&rule_names, &notifier_names);
+        valerter::initialize_metrics(&rule_source_pairs, &source_names, &notifier_names);
 
         Some(handle)
     } else {

@@ -49,6 +49,7 @@ See [Cisco Switches example](examples/cisco-switches/) for a complete implementa
 
 ## Features
 
+- **One Valerter for every VictoriaLogs you run.** Tail prod, staging, per-region or per-tenant backends from a single instance; pin rules to a specific source or fan out across all of them, with isolated reconnects, per-source metrics, and a `vl_source` label everywhere
 - **Multi-channel notifications** — Webhook (PagerDuty, Slack, Discord), Email SMTP, Mattermost, Telegram
 - **Full log context** — Alerts include the actual log line and extracted fields
 - **Intelligent throttling** — Avoid alert spam with per-key rate limiting
@@ -93,12 +94,13 @@ Example configuration:
 
 ```yaml
 victorialogs:
-  url: "http://victorialogs:9428"
+  default:
+    url: "http://victorialogs:9428"   # replace with your VictoriaLogs host
 
 notifiers:
   mattermost-ops:
     type: mattermost
-    webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
+    webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"   # replace with your real webhook
 
 defaults:
   throttle:
@@ -113,7 +115,7 @@ templates:
 
 rules:
   - name: "error_logs"
-    query: '_msg:~"(error|failed|critical)"'
+    query: '_msg:~"(error|failed|critical)"'   # adjust to match the events you care about
     parser:
       regex: '(?P<message>.*)'
     notify:
@@ -121,6 +123,8 @@ rules:
       destinations:
         - "mattermost-ops"
 ```
+
+> **Upgrading from v1.x?** The config schema and Prometheus metrics changed in v2.0.0. See [MIGRATION.md](MIGRATION.md) for the full guide.
 
 ## Documentation
 
@@ -131,6 +135,7 @@ rules:
 - **[Performance](docs/performance.md)** — Benchmarks and capacity planning
 - **[Architecture](docs/architecture.md)** — How Valerter works
 - **[Examples](examples/)** — Real-world configurations
+- **[Multi-source example](examples/multi-source/)** — Tail several VictoriaLogs backends from one Valerter instance
 
 ## Contributing
 

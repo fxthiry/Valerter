@@ -1,0 +1,108 @@
+# Valerter Configuration - Multi-Source VictoriaLogs Example
+# ===========================================================
+#
+# Demonstrates the v2.0.0 multi-source feature: a single valerter instance
+# tails two VictoriaLogs backends (`prod` and `staging`) and routes alerts
+# per source.
+#
+# Three rules cover the routing matrix:
+#   1. `prod_critical_errors` — pinned to `prod` only.
+#   2. `staging_deploy_failures` — pinned to `staging` only.
+#   3. `auth_failures_all_envs` — fan-out across both sources (no `vl_sources`).
+#
+# Each `(rule, source)` pair runs as an isolated task. A flapping `staging`
+# source does not stop alerts on `prod`. Default throttle keys are now
+# `{rule}-{source}:global`, so per-source buckets are isolated automatically.
+#
+# Source names must match `^[a-zA-Z0-9_]+$` (no dashes, dots, or colons).
+#
+# Run locally with:
+#   valerter --validate -c examples/multi-source/config.yaml
+
+victorialogs:
+  prod:
+    url: "https://victorialogs.prod.example.com:9428"
+    basic_auth:
+      username: "${VL_PROD_USER}"
+      password: "${VL_PROD_PASS}"
+    tls:
+      verify: true
+
+  staging:
+    url: "http://victorialogs.staging.internal:9428"
+    # No auth on the internal staging backend.
+
+defaults:
+  throttle:
+    count: 10
+    window: 5m
+  timestamp_timezone: "UTC"
+  # max_streams caps total `(rule, source)` pairs spawned. Default is 50;
+  # tune up if you fan out many rules across many sources.
+  # max_streams: 100
+
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    # Replace with your real webhook. Environment variables (e.g.
+    # `webhook_url: "${WEBHOOK_URL}"`) work too, but `--validate` parses the
+    # raw string as a URL so it must be valid at validate time.
+    webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
+    username: "Valerter"
+
+templates:
+  default_alert:
+    title: "[{{ vl_source }}] {{ rule_name }}"
+    body: |
+      **Source:** `{{ vl_source }}` | **Rule:** `{{ rule_name }}`
+
+      ```
+      {{ _msg }}
+      ```
+    email_body_html: |
+      <p><strong>Source:</strong> <code>{{ vl_source }}</code></p>
+      <p><strong>Rule:</strong> <code>{{ rule_name }}</code></p>
+      <pre>{{ _msg }}</pre>
+    accent_color: "#3498db"
+
+rules:
+  # ── Rule 1: pinned to prod only ────────────────────────────────────────────
+  - name: prod_critical_errors
+    query: '_stream:{env="prod"} level:critical'
+    parser:
+      regex: '(?P<message>.*)'
+    vl_sources:
+      - prod
+    notify:
+      template: default_alert
+      destinations:
+        - mattermost-ops
+
+  # ── Rule 2: pinned to staging only ─────────────────────────────────────────
+  - name: staging_deploy_failures
+    query: '_stream:{env="staging"} _msg:"deploy failed"'
+    parser:
+      regex: '(?P<message>.*)'
+    vl_sources:
+      - staging
+    notify:
+      template: default_alert
+      destinations:
+        - mattermost-ops
+
+  # ── Rule 3: fan-out across all sources (no vl_sources) ────────────────────
+  # Spawns one task per source: (auth_failures_all_envs, prod) and
+  # (auth_failures_all_envs, staging). Each task carries its own throttle
+  # bucket via the default `{rule}-{source}:global` key.
+  - name: auth_failures_all_envs
+    query: '_msg:"authentication failed"'
+    parser:
+      regex: '(?P<message>.*)'
+    notify:
+      template: default_alert
+      destinations:
+        - mattermost-ops
+
+metrics:
+  enabled: true
+  port: 9090

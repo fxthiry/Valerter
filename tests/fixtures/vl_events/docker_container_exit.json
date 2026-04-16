@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T11:15:44.229Z","_stream":"{group=\"docker\",host=\"app-host-08\"}","_stream_id":"000000000000000066778899aabbccdd","_msg":"container sidecar-logger exited with code 1","container_id":"9f8e7d6c5b4a3e2f1d0c9b8a7654321fedcba","container_name":"sidecar-logger","image":"ghcr.io/example/sidecar-logger:1.2.3","exit_code":"1","host":"app-host-08"}

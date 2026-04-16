@@ -44,9 +44,11 @@ struct MattermostPayload {
 }
 
 /// Build Mattermost webhook payload from rendered message.
+#[allow(clippy::too_many_arguments)]
 fn build_mattermost_payload(
     message: &crate::template::RenderedMessage,
     rule_name: &str,
+    vl_source: &str,
     log_timestamp_formatted: &str,
     channel: Option<&str>,
     username: Option<&str>,
@@ -61,7 +63,10 @@ fn build_mattermost_payload(
             color: message.accent_color.clone(),
             title: message.title.clone(),
             text: message.body.clone(),
-            footer: format!("valerter | {} | {}", rule_name, log_timestamp_formatted),
+            footer: format!(
+                "valerter | {} | {} | {}",
+                rule_name, vl_source, log_timestamp_formatted
+            ),
         }],
     }
 }
@@ -170,6 +175,7 @@ impl Notifier for MattermostNotifier {
             let mattermost_payload = build_mattermost_payload(
                 &alert.message,
                 &alert.rule_name,
+                &alert.vl_source,
                 &alert.log_timestamp_formatted,
                 self.channel.as_deref(),
                 self.username.as_deref(),
@@ -196,8 +202,9 @@ impl Notifier for MattermostNotifier {
                         metrics::counter!(
                             "valerter_alerts_sent_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost"
+                            "notifier_type" => "mattermost",
                         )
                         .increment(1);
                         return Ok(());
@@ -212,16 +219,18 @@ impl Notifier for MattermostNotifier {
                         metrics::counter!(
                             "valerter_notify_errors_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost"
+                            "notifier_type" => "mattermost",
                         )
                         .increment(1);
                         // Permanent failure - count as failed alert
                         metrics::counter!(
                             "valerter_alerts_failed_total",
                             "rule_name" => alert.rule_name.clone(),
+                            "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost"
+                            "notifier_type" => "mattermost",
                         )
                         .increment(1);
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
@@ -261,16 +270,18 @@ impl Notifier for MattermostNotifier {
             metrics::counter!(
                 "valerter_notify_errors_total",
                 "rule_name" => alert.rule_name.clone(),
+                "vl_source" => alert.vl_source.clone(),
                 "notifier_name" => self.name.clone(),
-                "notifier_type" => "mattermost"
+                "notifier_type" => "mattermost",
             )
             .increment(1);
             // Permanent failure after retries exhausted
             metrics::counter!(
                 "valerter_alerts_failed_total",
                 "rule_name" => alert.rule_name.clone(),
+                "vl_source" => alert.vl_source.clone(),
                 "notifier_name" => self.name.clone(),
-                "notifier_type" => "mattermost"
+                "notifier_type" => "mattermost",
             )
             .increment(1);
             Err(NotifyError::MaxRetriesExceeded)
@@ -305,6 +316,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "test_rule",
+            "vlprod",
             "15/01/2026 10:49:35 UTC",
             None,
             None,
@@ -319,7 +331,7 @@ mod tests {
         assert_eq!(attachment.color, Some("#ff0000".to_string()));
         assert_eq!(
             attachment.footer,
-            "valerter | test_rule | 15/01/2026 10:49:35 UTC"
+            "valerter | test_rule | vlprod | 15/01/2026 10:49:35 UTC"
         );
         // Optional fields should be None
         assert!(payload.channel.is_none());
@@ -339,6 +351,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "simple_rule",
+            "vlprod",
             "09/01/2026 10:00:00 UTC",
             None,
             None,
@@ -361,6 +374,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "rule",
+            "vlprod",
             "09/01/2026 10:00:00 UTC",
             Some("infra-alerts"),
             Some("valerter-bot"),
@@ -387,6 +401,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "rule",
+            "vlprod",
             "09/01/2026 10:00:00 UTC",
             None,
             None,
@@ -399,7 +414,7 @@ mod tests {
         assert!(json.contains("\"title\":\"Test\""));
         assert!(json.contains("\"text\":\"Body\""));
         assert!(json.contains("\"color\":\"#00ff00\""));
-        assert!(json.contains("\"footer\":\"valerter | rule | 09/01/2026 10:00:00 UTC\""));
+        assert!(json.contains("\"footer\":\"valerter | rule | vlprod | 09/01/2026 10:00:00 UTC\""));
         // Optional fields should be omitted when None
         assert!(!json.contains("channel"));
         assert!(!json.contains("username"));
@@ -418,6 +433,7 @@ mod tests {
         let payload = build_mattermost_payload(
             &message,
             "rule",
+            "vlprod",
             "09/01/2026 10:00:00 UTC",
             Some("alerts"),
             Some("bot"),

@@ -102,25 +102,76 @@ templates:       # Message templates (REQUIRED)
 rules:           # Alert rules (REQUIRED, at least one)
 ```
 
-## VictoriaLogs Connection
+## VictoriaLogs Sources (multi-source)
+
+`victorialogs` is a map of named sources. A single valerter instance can tail
+multiple VL backends concurrently and route alerts per source. At least one
+source is required.
 
 ```yaml
 victorialogs:
-  url: "http://victorialogs:9428"    # REQUIRED
+  default:                            # Source name (used as `vl_source`)
+    url: "http://victorialogs:9428"   # REQUIRED
 
-  # Optional: Basic Authentication
-  basic_auth:
-    username: "${VL_USER}"
-    password: "${VL_PASS}"
+    # Optional: Basic Authentication (per-source)
+    basic_auth:
+      username: "${VL_USER}"
+      password: "${VL_PASS}"
 
-  # Optional: Custom headers (for tokens, API keys)
-  headers:
-    Authorization: "Bearer ${VL_TOKEN}"
+    # Optional: Custom headers (for tokens, API keys)
+    headers:
+      Authorization: "Bearer ${VL_TOKEN}"
 
-  # Optional: TLS configuration
-  tls:
-    verify: true    # Set to false for self-signed certs
+    # Optional: TLS configuration
+    tls:
+      verify: true    # Set to false for self-signed certs
 ```
+
+### Multi-source example
+
+```yaml
+victorialogs:
+  vlprod:
+    url: "https://victorialogs.prod.example.com:9428"
+    basic_auth:
+      username: "${VL_PROD_USER}"
+      password: "${VL_PROD_PASS}"
+  vldev:
+    url: "http://victorialogs.dev.internal:9428"
+```
+
+Rules can target a subset of sources via `vl_sources: [name, ...]`, or omit
+the field to fan out across every configured source. The current source name
+is exposed in templates as `{{ vl_source }}` (layer 1 templates,
+`throttle.key`, and notifier-level layer 2 contexts).
+
+### Migration from v1.x (breaking change)
+
+The v1.x single-URL shape (`victorialogs.url: ...` at the top level) is
+rejected at load with a clear error. Wrap your existing settings under a
+named key (we recommend `default` for single-source deployments):
+
+```yaml
+# Before (v1.x):
+victorialogs:
+  url: "http://victorialogs:9428"
+  basic_auth:
+    username: "u"
+    password: "p"
+
+# After (v2.0+):
+victorialogs:
+  default:
+    url: "http://victorialogs:9428"
+    basic_auth:
+      username: "u"
+      password: "p"
+```
+
+The default throttle key also changed from `{rule}:global` to
+`{rule}-{source}:global` so multi-source buckets are isolated by default. To
+preserve v1.x cross-source dedup, set `throttle.key: "{{ rule_name }}"`
+explicitly on the rules that need it.
 
 ### Reverse Proxy Configuration
 
@@ -165,7 +216,24 @@ defaults:
     count: 5         # Max alerts per window
     window: 60s      # Time window (e.g., 60s, 5m, 1h)
   # timestamp_timezone: "Europe/Paris"  # Optional: timezone for formatted timestamps (default: UTC)
+  # max_streams: 50                     # Optional: hard cap on total VictoriaLogs streams (default: 50)
 ```
+
+### `max_streams` — fan-out guardrail
+
+Multi-source deployments spawn one stream per `(enabled rule, target source)`
+pair. With unscoped fan-out rules and many sources the total scales as
+`rules × sources`, which can DoS a backend by accident. `defaults.max_streams`
+caps that total at load time:
+
+```
+total = sum(if rule.vl_sources is empty then sources.len() else rule.vl_sources.len()
+            for rule in enabled_rules)
+```
+
+Disabled rules do not contribute. Breaching the cap fails `valerter --validate`
+with a message stating both the actual count and the cap so an operator knows
+whether to raise the cap or trim rules. Default: `50`.
 
 ### Timestamp Timezone
 
@@ -199,6 +267,7 @@ Variables come from the parser output plus built-in fields:
 | Variable | Description |
 |----------|-------------|
 | `rule_name` | Name of the rule that triggered |
+| `vl_source` | Name of the VictoriaLogs source the event came from |
 | `_msg` | Original log message (from VictoriaLogs) |
 | `_time` | Log timestamp (raw from VictoriaLogs) |
 | `_stream` | Stream labels |
@@ -206,10 +275,11 @@ Variables come from the parser output plus built-in fields:
 | `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
 | Custom fields | Extracted by regex/JSON parser |
 
-**Note:** `rule_name` is available in all template contexts: the top-level
-template fields (`title`, `body`, `email_body_html`), the `throttle.key`, and
-the notifier-level templates (`subject_template`, `body_template`). If an
-event field happens to be named `rule_name`, the synthetic rule name wins.
+**Note:** `rule_name` and `vl_source` are available in all template contexts:
+the top-level template fields (`title`, `body`, `email_body_html`), the
+`throttle.key`, and the notifier-level templates (`subject_template`,
+`body_template`). If an event field happens to be named `rule_name` or
+`vl_source`, the synthetic value wins.
 
 **Note:** `log_timestamp` and `log_timestamp_formatted` are available in:
 - Email subject and body templates
@@ -242,6 +312,11 @@ rules:
       key: "{{ host }}"               # Group throttling by field
       count: 3
       window: 5m
+
+    vl_sources: [vlprod]              # Optional: target specific sources
+                                      # Empty/omitted = fan out across all
+                                      # sources defined in `victorialogs:`.
+                                      # Unknown names rejected at load.
 
     notify:                           # REQUIRED
       template: "custom_template"     # REQUIRED: template name

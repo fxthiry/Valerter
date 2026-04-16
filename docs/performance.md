@@ -1,5 +1,12 @@
 # Performance Test Report
 
+> **Note:** Numbers in this page were measured against v1.x (single-source).
+> v2.0.0 introduces per-`(rule, source)` concurrency: the engine spawns one task
+> per pair, capped by `defaults.max_streams` (default 50), with `±10%` jitter on
+> reconnect backoff. Throughput, memory, and reconnect behaviour for multi-source
+> deployments are pending re-measurement. The single-source figures below remain
+> a useful baseline.
+
 **Date:** 2026-01-19
 **Version tested:** valerter 1.0.0-rc.5
 **Load generator:** Rust (`tools/load-generator`)
@@ -208,7 +215,7 @@ Tests that valerter recovers from VictoriaLogs outages.
 
 **Results:**
 - Reconnection attempts: 5 (with exponential backoff)
-- Final state: `valerter_victorialogs_up = 1`
+- Final state: `valerter_victorialogs_up = 1` (v1.x; renamed to `valerter_vl_source_up{vl_source}` in v2.0.0)
 - Auto-reconnect successful
 
 **Verdict:** PASS
@@ -247,7 +254,7 @@ Memory is **always bounded** regardless of load.
 valerter_alerts_sent_total          # Notifications actually delivered
 valerter_alerts_throttled_total     # Logs matched but throttled (expected)
 valerter_alerts_dropped_total       # Queue overflow (should be 0 with throttle)
-valerter_victorialogs_up            # Connection health
+valerter_vl_source_up{vl_source}    # Connection health (per source; v1.x: valerter_victorialogs_up)
 ```
 
 ---
@@ -269,7 +276,7 @@ throttle:
 |--------|----------|-------------------|
 | `valerter_alerts_dropped_total` | 0 | Enable/tighten throttle |
 | `valerter_alerts_throttled_total` | > 0 | Normal, throttle working |
-| `valerter_victorialogs_up` | 1 | Check VL connection |
+| `valerter_vl_source_up` | 1 (per source) | Check VL connection (v1.x: `valerter_victorialogs_up`) |
 
 ### 3. Choose Appropriate Throttle Keys
 

@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T11:20:30.444Z","_stream":"{group=\"syslog\",host=\"app-host-09\"}","_stream_id":"00000000000000007788899aabbccdde","_msg":"<30>Apr 15 11:20:30 app-host-09 chronyd[812]: Selected source 203.0.113.123 (pool.example.test)","facility":"daemon","severity":"info","appname":"chronyd","host":"app-host-09"}

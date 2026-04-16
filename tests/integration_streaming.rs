@@ -53,7 +53,10 @@ async fn test_streaming_basic_single_line() {
     let config = create_config(&mock_server, "_stream:test");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("test log"));
@@ -80,7 +83,10 @@ async fn test_streaming_multiple_lines() {
     let config = create_config(&mock_server, "_stream:multi");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 3);
     assert!(lines[0].contains("log 1"));
@@ -101,7 +107,10 @@ async fn test_streaming_empty_response() {
     let config = create_config(&mock_server, "_stream:empty");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert!(lines.is_empty());
 }
@@ -123,7 +132,7 @@ async fn test_connection_error_http_500() {
     let config = create_config(&mock_server, "_stream:error");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     assert!(result.is_err());
     match result {
@@ -147,7 +156,7 @@ async fn test_connection_error_http_404() {
     let config = create_config(&mock_server, "_stream:notfound");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     assert!(result.is_err());
     match result {
@@ -171,7 +180,7 @@ async fn test_connection_error_http_503() {
     let config = create_config(&mock_server, "_stream:unavailable");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     assert!(result.is_err());
     match result {
@@ -196,7 +205,7 @@ async fn test_connection_error_server_down() {
 
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     assert!(result.is_err());
     match result {
@@ -231,7 +240,7 @@ async fn test_timeout_detection() {
     let mut client = TailClient::new(config).unwrap();
 
     // This won't actually timeout since delay is short, but tests the path
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     // Should succeed (data received before timeout)
     // The buffer will hold "incomplete" without newline
@@ -287,7 +296,7 @@ async fn test_url_construction_is_correct() {
     };
 
     let mut client = TailClient::new(config).unwrap();
-    let _ = client.connect_and_receive("test_rule").await;
+    let _ = client.connect_and_receive("test_rule", "default").await;
 
     // If we get here without panic, the URL matched
 }
@@ -315,7 +324,7 @@ async fn test_url_with_start_param() {
     };
 
     let mut client = TailClient::new(config).unwrap();
-    let _ = client.connect_and_receive("test_rule").await;
+    let _ = client.connect_and_receive("test_rule", "default").await;
 }
 
 // =============================================================================
@@ -338,7 +347,7 @@ async fn test_headers_are_set_correctly() {
     let config = create_config(&mock_server, "_stream:headers");
     let mut client = TailClient::new(config).unwrap();
 
-    let _ = client.connect_and_receive("test_rule").await;
+    let _ = client.connect_and_receive("test_rule", "default").await;
 }
 
 // =============================================================================
@@ -365,7 +374,10 @@ async fn test_streaming_with_utf8_content() {
     let config = create_config(&mock_server, "_stream:utf8");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("Café"));
@@ -395,7 +407,7 @@ impl TestReconnectCallback {
 }
 
 impl ReconnectCallback for TestReconnectCallback {
-    fn on_reconnect(&self, _rule_name: &str) {
+    fn on_reconnect(&self, _rule_name: &str, _vl_source: &str) {
         self.count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -423,7 +435,7 @@ async fn test_stream_with_reconnect_receives_lines() {
     // Use tokio::time::timeout to prevent infinite loop
     let result = tokio::time::timeout(Duration::from_millis(500), async {
         client
-            .stream_with_reconnect("test_rule", None, |line| {
+            .stream_with_reconnect("test_rule", "default", None, |line| {
                 let lines = Arc::clone(&lines_clone);
                 async move {
                     lines.lock().unwrap().push(line);
@@ -474,7 +486,7 @@ async fn test_stream_with_reconnect_retries_on_error() {
     // Use short timeout - should get at least one retry and one success
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         client
-            .stream_with_reconnect("test_rule", Some(&callback), |line| {
+            .stream_with_reconnect("test_rule", "default", Some(&callback), |line| {
                 let lines = Arc::clone(&lines_clone);
                 async move {
                     lines.lock().unwrap().push(line);
@@ -505,15 +517,15 @@ async fn test_stream_with_reconnect_retries_on_error() {
 #[test]
 fn test_log_reconnection_attempt_does_not_panic() {
     // Just verify the function can be called without panic
-    log_reconnection_attempt("test_rule", 0, Duration::from_secs(1));
-    log_reconnection_attempt("test_rule", 5, Duration::from_secs(32));
-    log_reconnection_attempt("test_rule", 10, Duration::from_secs(60));
+    log_reconnection_attempt("test_rule", "default", 0, Duration::from_secs(1));
+    log_reconnection_attempt("test_rule", "default", 5, Duration::from_secs(32));
+    log_reconnection_attempt("test_rule", "default", 10, Duration::from_secs(60));
 }
 
 #[test]
 fn test_log_reconnection_success_does_not_panic() {
     // Just verify the function can be called without panic
-    log_reconnection_success("test_rule");
+    log_reconnection_success("test_rule", "default");
 }
 
 #[test]
@@ -521,10 +533,10 @@ fn test_reconnect_callback_trait() {
     let callback = TestReconnectCallback::new();
     assert_eq!(callback.reconnect_count(), 0);
 
-    callback.on_reconnect("rule1");
+    callback.on_reconnect("rule1", "vlprod");
     assert_eq!(callback.reconnect_count(), 1);
 
-    callback.on_reconnect("rule2");
+    callback.on_reconnect("rule2", "vldev");
     assert_eq!(callback.reconnect_count(), 2);
 }
 
@@ -598,7 +610,10 @@ async fn test_basic_auth_header_is_sent() {
     let config = create_config_with_basic_auth(&mock_server, "testuser", "testpass");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("authenticated"));
@@ -633,7 +648,10 @@ async fn test_custom_headers_are_sent() {
     let config = create_config_with_headers(&mock_server, headers);
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("headers received"));
@@ -663,7 +681,10 @@ async fn test_bearer_token_in_header() {
     let config = create_config_with_headers(&mock_server, headers);
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("bearer auth ok"));
@@ -706,7 +727,10 @@ async fn test_basic_auth_with_custom_headers_combined() {
 
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("combined auth ok"));
@@ -734,7 +758,7 @@ async fn test_basic_auth_401_on_wrong_credentials() {
     let config = create_config_with_basic_auth(&mock_server, "wrong_user", "wrong_pass");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule").await;
+    let result = client.connect_and_receive("test_rule", "default").await;
 
     assert!(result.is_err());
     match result {
@@ -763,7 +787,10 @@ async fn test_without_auth_no_authorization_header() {
     let config = create_config(&mock_server, "_stream:noauth");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client.connect_and_receive("test_rule").await.unwrap();
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("no auth"));

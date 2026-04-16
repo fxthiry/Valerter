@@ -57,8 +57,8 @@ fn validate_valid_config_exits_success() {
         stdout
     );
     assert!(
-        stdout.contains("VictoriaLogs URL"),
-        "Output should show VictoriaLogs URL: {}",
+        stdout.contains("VictoriaLogs sources"),
+        "Output should show VictoriaLogs sources summary: {}",
         stdout
     );
     assert!(
@@ -274,6 +274,87 @@ fn validate_mattermost_env_var_ignored() {
         stderr.contains("no notifiers configured"),
         "Error should mention 'no notifiers configured', got: {}",
         stderr
+    );
+}
+
+// Test: shipped config/config.example.yaml passes --validate
+// Locks the canonical example against future schema drift.
+#[test]
+fn shipped_config_example_validates() {
+    ensure_binary_built();
+
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("config")
+        .join("config.example.yaml");
+
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(&config_path)
+        .output()
+        .expect("Failed to run valerter");
+
+    assert!(
+        output.status.success(),
+        "shipped config '{}' must pass --validate (exit 0)\nstdout: {}\nstderr: {}",
+        config_path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Test: every shipped examples/<name>/config.yaml passes --validate
+// Iterates so new example folders are picked up automatically.
+// Sets placeholder env vars so examples that reference ${...} secrets validate
+// without hitting the network (--validate does not actually call any backend).
+#[test]
+fn shipped_examples_pass_validate() {
+    ensure_binary_built();
+
+    let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples");
+
+    let entries = std::fs::read_dir(&examples_dir).expect("Failed to read examples/ directory");
+
+    let mut checked = 0usize;
+    for entry in entries {
+        let entry = entry.expect("Failed to read examples/ entry");
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let config_path = path.join("config.yaml");
+        if !config_path.exists() {
+            continue;
+        }
+
+        let output = Command::new(valerter_binary())
+            .args(["--validate", "-c"])
+            .arg(&config_path)
+            // Placeholders for examples that reference ${VAR} secrets.
+            // --validate does not perform any network call, so values can be dummies.
+            .env("WEBHOOK_URL", "https://mattermost.example.com/hooks/dummy")
+            .env("VL_PROD_USER", "dummy_user")
+            .env("VL_PROD_PASS", "dummy_pass")
+            .env("VL_PROD_TOKEN", "dummy_token")
+            .env("SMTP_USER", "dummy_smtp_user")
+            .env("SMTP_PASSWORD", "dummy_smtp_pass")
+            .env("TELEGRAM_BOT_TOKEN", "dummy_bot_token")
+            .output()
+            .expect("Failed to run valerter");
+
+        assert!(
+            output.status.success(),
+            "shipped example '{}' must pass --validate (exit 0)\nstdout: {}\nstderr: {}",
+            config_path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 1,
+        "expected at least one examples/<name>/config.yaml to validate, found 0 in {}",
+        examples_dir.display()
     );
 }
 
