@@ -345,12 +345,16 @@ mod tests {
 
         // Test critical severity
         let fields_critical = json!({"severity": "critical"});
-        let result = engine.render("alert", &fields_critical, "test_rule").unwrap();
+        let result = engine
+            .render("alert", &fields_critical, "test_rule")
+            .unwrap();
         assert_eq!(result.title, "🚨 CRITICAL");
 
         // Test non-critical severity
         let fields_warning = json!({"severity": "warning"});
-        let result = engine.render("alert", &fields_warning, "test_rule").unwrap();
+        let result = engine
+            .render("alert", &fields_warning, "test_rule")
+            .unwrap();
         assert_eq!(result.title, "⚠️ Warning");
     }
 
@@ -496,11 +500,15 @@ mod tests {
 
         // Render for "rule 1"
         let fields1 = json!({"host": "server-01", "message": "Error A"});
-        let result1 = engine.render("shared_template", &fields1, "rule_1").unwrap();
+        let result1 = engine
+            .render("shared_template", &fields1, "rule_1")
+            .unwrap();
 
         // Render for "rule 2" with different data
         let fields2 = json!({"host": "server-02", "message": "Error B"});
-        let result2 = engine.render("shared_template", &fields2, "rule_2").unwrap();
+        let result2 = engine
+            .render("shared_template", &fields2, "rule_2")
+            .unwrap();
 
         // Both should render correctly with their own data
         assert_eq!(result1.title, "Alert from server-01");
@@ -882,7 +890,9 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"host": "server-01"});
 
-        let result = engine.render("mattermost_alert", &fields, "test_rule").unwrap();
+        let result = engine
+            .render("mattermost_alert", &fields, "test_rule")
+            .unwrap();
 
         assert!(
             result.email_body_html.is_none(),

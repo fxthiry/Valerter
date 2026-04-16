@@ -603,11 +603,7 @@ mod tests {
         // Issue #25 + #31: the throttle key must see dotted event keys unflat-
         // tened the same way template rendering does, so `{{ nginx.http.status }}`
         // works here too (not just in `title`/`body`).
-        let config = make_config(
-            Some("{{ rule_name }}-{{ nginx.http.status_code }}"),
-            3,
-            60,
-        );
+        let config = make_config(Some("{{ rule_name }}-{{ nginx.http.status_code }}"), 3, 60);
         let throttler = Throttler::new(Some(&config), "VM_OFF");
 
         let fields = json!({"nginx.http.status_code": "404"});
