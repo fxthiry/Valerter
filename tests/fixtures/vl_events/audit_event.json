@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T11:10:08.770Z","_stream":"{group=\"audit\",host=\"app-host-07\"}","_stream_id":"00000000000000005566778899aabbcc","_msg":"USER_LOGIN pid=4422 uid=0 auid=1001 ses=3 msg='op=login id=1001 exe=\"/usr/sbin/sshd\" hostname=? addr=198.51.100.77 terminal=ssh res=success'","type":"USER_LOGIN","auid":"1001","uid":"0","res":"success","host":"app-host-07"}

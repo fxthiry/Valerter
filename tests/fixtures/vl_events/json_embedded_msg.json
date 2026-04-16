@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T10:50:55.818Z","_stream":"{group=\"app\",host=\"app-host-03\"}","_stream_id":"0000000000000000112233445566778a","_msg":"{\"level\":\"error\",\"event\":\"payment_declined\",\"user_id\":\"u-00012\",\"amount\":42.50,\"reason\":\"insufficient_funds\"}","host":"app-host-03","app":"billing"}
