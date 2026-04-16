@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.0] - unreleased
 
+### Security advisory
+
+- **Be cautious when piping raw `_msg` into `email_body_html`.** The example
+  config switched `body: "{{ _msg }}"` in v1.2.0 (#26 fix), and operators may
+  reasonably mirror that in `email_body_html`. The email notifier marks `body`
+  as `safe` (pre-escaped HTML) before injection into the email envelope, so a
+  log line containing raw HTML or `<script>` tags would render unescaped in
+  the recipient's mail client. This is pre-existing behaviour from v1.x, not a
+  regression introduced in v2.0.0, but the surface is wider now that the
+  example actively uses `_msg`. If your VictoriaLogs ingests untrusted
+  content (web request bodies, user-controlled fields), wrap the offending
+  field with `| escape` or render via plain `body` (not `email_body_html`)
+  for email destinations until the email path is hardened in a follow-up.
+
 ### Breaking changes
 
 - **`victorialogs` is now a map of named sources.** A single valerter instance can tail multiple VL backends and route alerts per source. The v1.x single-URL shape (`victorialogs.url: ...` at the top level) is rejected at load with an actionable migration error.
