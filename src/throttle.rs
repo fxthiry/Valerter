@@ -201,8 +201,13 @@ impl Throttler {
     fn render_key(&self, fields: &Value) -> String {
         match &self.key_template {
             Some(template) => {
+                // Inject synthetic `rule_name` (issue #31) so users can write
+                // `{{ rule_name }}` in throttle.key. Synthetic wins over any
+                // event field with the same name, matching layer 1/2 template
+                // behavior.
+                let enriched_ctx = enrich_with_rule_name(fields, &self.rule_name);
                 // H1 fix: Use pre-created jinja_env instead of creating new one
-                match self.jinja_env.render_str(template, fields) {
+                match self.jinja_env.render_str(template, &enriched_ctx) {
                     Ok(key) => {
                         tracing::trace!(rendered_key = %key, "Throttle key rendered");
                         key
@@ -234,6 +239,25 @@ impl Throttler {
         self.cache.invalidate_all();
         tracing::debug!(rule_name = %self.rule_name, entries_cleared = entry_count, "Throttle cache reset");
     }
+}
+
+/// Unflatten dotted event keys (issue #25) then inject the synthetic
+/// `rule_name` key (issue #31). Matches the layer 1 template rendering path
+/// so users can reference both dotted event fields (`{{ nginx.http.status }}`)
+/// and `{{ rule_name }}` inside a `throttle.key` template consistently.
+///
+/// Returns the original value unchanged if it is not a JSON object (should
+/// not happen in practice, VL events are always objects). The synthetic
+/// value wins over any event field literally named `rule_name`.
+fn enrich_with_rule_name(fields: &Value, rule_name: &str) -> Value {
+    let mut ctx = crate::parser::unflatten_dotted_keys(fields);
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.insert(
+            "rule_name".to_string(),
+            Value::String(rule_name.to_string()),
+        );
+    }
+    ctx
 }
 
 impl std::fmt::Debug for Throttler {
@@ -555,6 +579,54 @@ mod tests {
         assert!(debug.contains("{{ host }}"));
         assert!(debug.contains("max_count"));
         assert!(debug.contains("test_rule"));
+    }
+
+    // ===================================================================
+    // Issue #31: rule_name injected into throttle key render context so
+    // users can write `{{ rule_name }}` in throttle.key and get per-rule
+    // buckets even when sharing a key_template across multiple rules.
+    // ===================================================================
+
+    #[test]
+    fn render_key_includes_rule_name() {
+        let config = make_config(Some("{{ rule_name }}-{{ host }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "VM_OFF");
+
+        let fields = json!({"host": "SW-01"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "VM_OFF-SW-01");
+    }
+
+    #[test]
+    fn render_key_resolves_dotted_event_fields_via_unflatten() {
+        // Issue #25 + #31: the throttle key must see dotted event keys unflat-
+        // tened the same way template rendering does, so `{{ nginx.http.status }}`
+        // works here too (not just in `title`/`body`).
+        let config = make_config(
+            Some("{{ rule_name }}-{{ nginx.http.status_code }}"),
+            3,
+            60,
+        );
+        let throttler = Throttler::new(Some(&config), "VM_OFF");
+
+        let fields = json!({"nginx.http.status_code": "404"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "VM_OFF-404");
+    }
+
+    #[test]
+    fn render_key_rule_name_synthetic_overrides_event_field() {
+        // Collision policy: synthetic rule_name wins over any event field
+        // literally named "rule_name".
+        let config = make_config(Some("{{ rule_name }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "VM_OFF");
+
+        let fields = json!({"rule_name": "event-value", "host": "SW-01"});
+        let key = throttler.render_key(&fields);
+
+        assert_eq!(key, "VM_OFF");
     }
 
     #[test]

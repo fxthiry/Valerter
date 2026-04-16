@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0] - unreleased
+## [1.2.1] - unreleased
+
+### Fixed
+- **`{{ rule_name }}` available in top-level templates and throttle key** (issue #31). `rule_name` is now injected into the render context of `templates.<name>.title`, `body`, and `email_body_html`, and also into the `throttle.key` template, not just the notifier-level `subject_template` / `body_template`. Configs that referenced `{{ rule_name }}` in a top-level template previously rendered an empty string; they now render the rule name. If an event field happens to be literally named `rule_name`, the synthetic rule name wins, matching the collision policy of the existing notifier-level contexts.
+- **Dotted event fields resolve in `throttle.key`**. The unflatten step introduced in v1.2.0 for template rendering (issue #25) now also applies to the throttle key template, so `throttle.key: "{{ nginx.http.status_code }}-{{ hostname }}"` works consistently with `title` / `body`.
+
+## [1.2.0] - 2026-04-15
 
 ### Breaking changes
 - **Template field `body_html` renamed to `email_body_html`** to reflect that

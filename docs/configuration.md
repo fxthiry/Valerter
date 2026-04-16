@@ -206,10 +206,17 @@ Variables come from the parser output plus built-in fields:
 | `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
 | Custom fields | Extracted by regex/JSON parser |
 
+**Note:** `rule_name` is available in all template contexts: the top-level
+template fields (`title`, `body`, `email_body_html`), the `throttle.key`, and
+the notifier-level templates (`subject_template`, `body_template`). If an
+event field happens to be named `rule_name`, the synthetic rule name wins.
+
 **Note:** `log_timestamp` and `log_timestamp_formatted` are available in:
 - Email subject and body templates
 - Webhook `body_template`
 - Mattermost footer (automatically includes `log_timestamp_formatted`)
+
+These timestamps are computed **after** the top-level template renders, so they are only accessible in notifier-level templates. If you need a timestamp at the top-level, reference `{{ _time }}` (raw VictoriaLogs field) directly.
 
 ### email_body_html Requirement
 

@@ -106,8 +106,15 @@ defaults:
 #                                              streams configured server-side)
 #      <any parser-extracted field>           JSON field or named regex group
 #      rule_name                              name of the triggered rule
+#                                             (available in `title`, `body`,
+#                                              `email_body_html`, `throttle.key`,
+#                                              and in notifier-level
+#                                              `subject_template` /
+#                                              `body_template`)
 #      log_timestamp                          event timestamp (ISO8601)
+#                                             (notifier-level templates only)
 #      log_timestamp_formatted                human timestamp (defaults.timestamp_timezone)
+#                                             (notifier-level templates only)
 #
 # 2. Template OUTPUT KEYS that you define below (left-hand side). These are
 #    the slots valerter fills and hands off to notifiers:
