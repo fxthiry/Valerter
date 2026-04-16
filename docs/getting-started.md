@@ -78,7 +78,8 @@ Minimal configuration:
 
 ```yaml
 victorialogs:
-  url: "http://victorialogs:9428"
+  default:
+    url: "http://victorialogs:9428"
 
 notifiers:
   mattermost-ops:

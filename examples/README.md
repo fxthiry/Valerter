@@ -13,6 +13,7 @@ Each example demonstrates the same 4-step pattern:
 | Example | Description |
 |---------|-------------|
 | **[Cisco Switches](cisco-switches/)** | BPDU Guard alerts for Cisco IOS/IOS-XE switches |
+| **[Multi-Source](multi-source/)** | Tail several VictoriaLogs backends from one Valerter instance (v2.0.0) |
 
 ## Contributing Examples
 
