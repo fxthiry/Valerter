@@ -1,0 +1,107 @@
+# Manifest for VictoriaLogs event fixtures.
+#
+# Each entry documents one file under this directory. The entry key MUST match
+# the filename on disk exactly; the consistency test (`tests/vl_fixtures_consistency.rs`)
+# enforces the invariant that index.yaml and the filesystem are in sync.
+#
+# Schema per entry:
+#   description: free-form sentence describing what this event represents.
+#   source_system: one of nginx | cisco | k8s | windows | journald | otel | raw | docker | audit | syslog | edge_case
+#   tags: list of free-form strings. Consistent vocabulary:
+#     dotted_keys, flat_keys, regex_extract, pascal_case, multiline_msg,
+#     unicode, http, syslog, empty_fields, embedded_json, minimal, labels.
+#   prevents_regression_for: list of issue references (e.g. "#25"). Empty list is valid.
+#
+# All data is anonymised. Hostnames are fake (app-host-NN, switch-sw-01, k8s-node-01).
+# IPs use RFC 5737 ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
+# No real tokens, trace ids, or tenants.
+fixtures:
+  nginx_http_400.json:
+    description: "nginx reverse proxy 400 response with vector-forwarded flat-dotted keys"
+    source_system: nginx
+    tags: [dotted_keys, flat_keys, http]
+    prevents_regression_for: ["#25"]
+
+  nginx_http_500.json:
+    description: "nginx 500 upstream failure, same flat-dotted shape as 400 case"
+    source_system: nginx
+    tags: [dotted_keys, flat_keys, http]
+    prevents_regression_for: ["#25"]
+
+  cisco_sw_critical.json:
+    description: "Cisco IOS syslog link-down event with regex-extractable switch name in _msg"
+    source_system: cisco
+    tags: [regex_extract, syslog]
+    prevents_regression_for: []
+
+  k8s_pod_oom.json:
+    description: "Kubernetes container OOMKilled event with kubernetes.* labels as flat-dotted keys"
+    source_system: k8s
+    tags: [dotted_keys, flat_keys, labels]
+    prevents_regression_for: []
+
+  windows_security_logoff.json:
+    description: "Windows Security Event 4634 (account logoff) with PascalCase keys and escaped multiline _msg"
+    source_system: windows
+    tags: [pascal_case, multiline_msg]
+    prevents_regression_for: []
+
+  journald_cron.json:
+    description: "journald CRON execution with _SYSTEMD_* / _TRANSPORT fields"
+    source_system: journald
+    tags: [flat_keys, syslog]
+    prevents_regression_for: []
+
+  otel_span.json:
+    description: "OpenTelemetry server span with trace_id, span_id and dotted service.* / http.* attributes"
+    source_system: otel
+    tags: [dotted_keys, flat_keys]
+    prevents_regression_for: []
+
+  raw_message_only.json:
+    description: "Minimal event: only _time, _stream, _stream_id and _msg, no structured fields"
+    source_system: raw
+    tags: [minimal]
+    prevents_regression_for: []
+
+  json_embedded_msg.json:
+    description: "_msg contains an embedded JSON payload, verbatim (not pre-parsed by the ingester)"
+    source_system: raw
+    tags: [embedded_json]
+    prevents_regression_for: []
+
+  edge_unicode_msg.json:
+    description: "_msg containing CJK characters and an emoji to exercise UTF-8 handling"
+    source_system: edge_case
+    tags: [unicode]
+    prevents_regression_for: []
+
+  edge_empty_fields.json:
+    description: "Several structured fields present but empty string, to exercise empty-guard paths"
+    source_system: edge_case
+    tags: [empty_fields]
+    prevents_regression_for: ["#26"]
+
+  edge_dotted_keys_literal.json:
+    description: "Exact shape from #25 with literal dotted keys nginx.http.* preserved top-level"
+    source_system: edge_case
+    tags: [dotted_keys, flat_keys, http]
+    prevents_regression_for: ["#25"]
+
+  audit_event.json:
+    description: "Linux auditd USER_LOGIN record with embedded key=value payload inside _msg"
+    source_system: audit
+    tags: [regex_extract, flat_keys]
+    prevents_regression_for: []
+
+  docker_container_exit.json:
+    description: "Docker engine event for a sidecar container exiting with non-zero status"
+    source_system: docker
+    tags: [flat_keys]
+    prevents_regression_for: []
+
+  syslog_raw_daemon.json:
+    description: "Raw RFC3164 syslog line from chronyd forwarded via a syslog collector"
+    source_system: syslog
+    tags: [syslog, regex_extract]
+    prevents_regression_for: []

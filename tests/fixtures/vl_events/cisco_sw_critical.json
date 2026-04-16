@@ -1,0 +1,1 @@
+{"_time":"2026-04-15T10:20:17.000Z","_stream":"{group=\"network\",source=\"syslog\"}","_stream_id":"0000000000000000b2c3d4e5f6071122","_msg":"<187>Apr 15 10:20:17 switch-sw-01 %LINK-3-UPDOWN: Interface GigabitEthernet0/24, changed state to down","host":"switch-sw-01","facility":"local7","severity":"critical","appname":"cisco-ios"}
