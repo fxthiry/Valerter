@@ -166,14 +166,18 @@ impl Throttler {
             "Throttle count updated"
         );
 
-        // L1: Pre-convert rule_name to String once for metrics (required for 'static)
+        // L1: Pre-convert rule_name and vl_source to String once for metrics
+        // (required for 'static label storage).
         let rule_name_str = self.rule_name.to_string();
+        let vl_source_str = self.vl_source.to_string();
 
         if count <= self.max_count {
-            // M3: Increment metric for passed alerts
+            // M3: Increment metric for passed alerts (gains `vl_source` for
+            // multi-source observability — v2.0.0 part 2).
             metrics::counter!(
                 "valerter_alerts_passed_total",
-                "rule_name" => rule_name_str
+                "rule_name" => rule_name_str,
+                "vl_source" => vl_source_str,
             )
             .increment(1);
 
@@ -182,16 +186,19 @@ impl Throttler {
             // Log at DEBUG level (throttling is normal behavior)
             tracing::debug!(
                 rule_name = %self.rule_name,
+                vl_source = %self.vl_source,
                 throttle_key = %key,
                 count = count,
                 max_count = self.max_count,
                 "Alert throttled"
             );
 
-            // Increment metric (FR23, FR24)
+            // Increment metric (FR23, FR24); gains `vl_source` to disambiguate
+            // throttle hot-spots per source.
             metrics::counter!(
                 "valerter_alerts_throttled_total",
-                "rule_name" => rule_name_str
+                "rule_name" => rule_name_str,
+                "vl_source" => vl_source_str,
             )
             .increment(1);
 

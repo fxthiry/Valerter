@@ -115,6 +115,7 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: valerter::config::DEFAULT_MAX_STREAMS,
         },
         templates,
         rules,

@@ -358,6 +358,7 @@ fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeCo
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: super::DEFAULT_MAX_STREAMS,
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -472,6 +473,7 @@ fn validate_collects_all_errors() {
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: super::DEFAULT_MAX_STREAMS,
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -558,6 +560,7 @@ fn validate_throttle_key_template() {
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: super::DEFAULT_MAX_STREAMS,
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -629,6 +632,7 @@ fn validate_nonexistent_notify_template_fails() {
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: super::DEFAULT_MAX_STREAMS,
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -1033,6 +1037,7 @@ fn validate_rule_destinations_collects_all_errors() {
                 window: Duration::from_secs(60),
             },
             timestamp_timezone: "UTC".to_string(),
+            max_streams: super::DEFAULT_MAX_STREAMS,
         },
         templates: {
             let mut t = std::collections::HashMap::new();
@@ -2335,4 +2340,182 @@ rules:
         "expected migration YAML snippet in error, got: {}",
         err_str
     );
+}
+
+// ============================================================
+// v2.0.0 part 2: defaults.max_streams cap (multi-source guardrail).
+//
+// Total fan-out is `sum_over_enabled_rules(if vl_sources.is_empty() then
+// sources.len() else vl_sources.len())`. Disabled rules do not contribute.
+// Breach is rejected at load with both numbers in the error.
+// ============================================================
+
+/// YAML helper: build a config with `n_sources` declared sources, `n_rules`
+/// enabled rules each with empty `vl_sources` (full fan-out), and an explicit
+/// `defaults.max_streams: cap`.
+fn config_with_fan_out(n_sources: usize, n_rules: usize, cap: usize) -> String {
+    let mut yaml = String::from("victorialogs:\n");
+    for i in 0..n_sources {
+        yaml.push_str(&format!("  src{}:\n    url: http://h{}:9428\n", i, i));
+    }
+    yaml.push_str(&format!(
+        "defaults:\n  max_streams: {}\n  throttle:\n    count: 5\n    window: 1m\n",
+        cap
+    ));
+    yaml.push_str("templates:\n  t:\n    title: x\n    body: y\n");
+    yaml.push_str(
+        "notifiers:\n  n:\n    type: mattermost\n    webhook_url: https://example.com/hooks/x\n",
+    );
+    yaml.push_str("rules:\n");
+    for i in 0..n_rules {
+        yaml.push_str(&format!(
+            "  - name: r{}\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: t\n      destinations: [n]\n",
+            i
+        ));
+    }
+    yaml
+}
+
+#[test]
+fn validate_max_streams_under_cap_passes() {
+    // 3 sources × 4 fan-out rules = 12 streams ≤ 50.
+    let yaml = config_with_fan_out(3, 4, 50);
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    config
+        .validate()
+        .expect("12 streams under cap of 50 should validate");
+}
+
+#[test]
+fn validate_max_streams_at_exact_cap_passes() {
+    // 5 × 10 = 50, exactly the cap — boundary case allowed.
+    let yaml = config_with_fan_out(5, 10, 50);
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    config
+        .validate()
+        .expect("50 streams at cap of 50 should validate");
+}
+
+#[test]
+fn validate_max_streams_breach_fails_with_actual_and_cap() {
+    // 5 sources × 12 fan-out rules = 60 > 50.
+    let yaml = config_with_fan_out(5, 12, 50);
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    let errors = config.validate().expect_err("60 streams > cap should fail");
+    let has_max_streams_error = errors.iter().any(|e| match e {
+        crate::error::ConfigError::ValidationError(msg) => {
+            msg.contains("max_streams") && msg.contains("60") && msg.contains("50")
+        }
+        _ => false,
+    });
+    assert!(
+        has_max_streams_error,
+        "expected max_streams error mentioning actual=60 and cap=50, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_max_streams_default_value_is_fifty() {
+    // Omit `defaults.max_streams` entirely → DEFAULT_MAX_STREAMS (50). 51
+    // streams must fail; the default is what the cap reads as.
+    let mut yaml = String::from("victorialogs:\n");
+    for i in 0..51 {
+        yaml.push_str(&format!("  src{}:\n    url: http://h{}:9428\n", i, i));
+    }
+    yaml.push_str("defaults:\n  throttle:\n    count: 5\n    window: 1m\n");
+    yaml.push_str("templates:\n  t:\n    title: x\n    body: y\n");
+    yaml.push_str(
+        "notifiers:\n  n:\n    type: mattermost\n    webhook_url: https://example.com/hooks/x\n",
+    );
+    yaml.push_str("rules:\n  - name: r0\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: t\n      destinations: [n]\n");
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    let errors = config
+        .validate()
+        .expect_err("51 streams under default cap of 50 should fail");
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            crate::error::ConfigError::ValidationError(m) if m.contains("max_streams")
+        )),
+        "expected max_streams error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_max_streams_disabled_rules_do_not_contribute() {
+    // 5 sources × (1 enabled fan-out rule + 100 disabled fan-out rules) =
+    // 5 enabled streams. Even though raw `vl_sources.len()` would sum to
+    // hundreds if we counted disabled rules, the cap is on enabled only.
+    let mut yaml = String::from("victorialogs:\n");
+    for i in 0..5 {
+        yaml.push_str(&format!("  src{}:\n    url: http://h{}:9428\n", i, i));
+    }
+    yaml.push_str("defaults:\n  max_streams: 5\n  throttle:\n    count: 5\n    window: 1m\n");
+    yaml.push_str("templates:\n  t:\n    title: x\n    body: y\n");
+    yaml.push_str(
+        "notifiers:\n  n:\n    type: mattermost\n    webhook_url: https://example.com/hooks/x\n",
+    );
+    yaml.push_str("rules:\n");
+    yaml.push_str("  - name: enabled_rule\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: t\n      destinations: [n]\n");
+    for i in 0..100 {
+        yaml.push_str(&format!(
+            "  - name: disabled{}\n    enabled: false\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: t\n      destinations: [n]\n",
+            i
+        ));
+    }
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    config
+        .validate()
+        .expect("disabled rules should not contribute to fan-out total");
+}
+
+#[test]
+fn validate_max_streams_pinned_rule_counts_only_listed_sources() {
+    // 5 sources, 2 pinned rules each `vl_sources: [src0]`, 3 fan-out rules.
+    // total = 2*1 + 3*5 = 17, well under default cap.
+    let yaml = r#"
+victorialogs:
+  src0: { url: http://h0:9428 }
+  src1: { url: http://h1:9428 }
+  src2: { url: http://h2:9428 }
+  src3: { url: http://h3:9428 }
+  src4: { url: http://h4:9428 }
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  t: { title: x, body: y }
+notifiers:
+  n: { type: mattermost, webhook_url: https://example.com/hooks/x }
+rules:
+  - name: pinned1
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    vl_sources: [src0]
+    notify: { template: t, destinations: [n] }
+  - name: pinned2
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    vl_sources: [src0]
+    notify: { template: t, destinations: [n] }
+  - name: fan1
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: t, destinations: [n] }
+  - name: fan2
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: t, destinations: [n] }
+  - name: fan3
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: t, destinations: [n] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    config
+        .validate()
+        .expect("17 streams under default cap of 50 should validate");
 }

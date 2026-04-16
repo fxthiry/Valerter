@@ -31,6 +31,9 @@ minijinja = { version = "2.12", features = ["builtins", "json"] }
 # Caching/Throttle
 moka = { version = "0.12", features = ["sync"] }
 
+# Random (jitter on reconnect backoff to break thundering-herd alignment).
+rand = "0.8"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -197,6 +197,25 @@ pub struct DefaultsConfig {
     /// Timezone for formatted timestamps (e.g., "UTC", "Europe/Paris").
     #[serde(default = "default_timestamp_timezone")]
     pub timestamp_timezone: String,
+    /// Maximum total number of concurrent VictoriaLogs streams (sum of
+    /// `(rule, source)` task pairs for enabled rules). Hard cap enforced at
+    /// load time to prevent unintentional fan-out from DoSing a backend.
+    ///
+    /// Default: 50. Configurable via `defaults.max_streams: <usize>` in
+    /// `config.yaml`.
+    #[serde(default = "default_max_streams")]
+    pub max_streams: usize,
+}
+
+/// Default upper bound on the total number of concurrent VL streams.
+///
+/// Picked to comfortably accommodate small/mid-size deployments (~10 sources ×
+/// a handful of fan-out rules) while still failing fast on accidentally large
+/// fan-outs. Configurable per-deployment via `defaults.max_streams`.
+pub const DEFAULT_MAX_STREAMS: usize = 50;
+
+fn default_max_streams() -> usize {
+    DEFAULT_MAX_STREAMS
 }
 
 fn default_timestamp_timezone() -> String {
@@ -765,6 +784,40 @@ impl Config {
             errors.push(ConfigError::ValidationError(format!(
                 "defaults.timestamp_timezone '{}' is not a valid timezone",
                 self.defaults.timestamp_timezone
+            )));
+        }
+
+        // Validate `defaults.max_streams` cap against the actual fan-out.
+        // Total stream count = sum, over enabled rules, of:
+        //   - `sources.len()` if `rule.vl_sources` is empty (fan out across all)
+        //   - `rule.vl_sources.len()` otherwise.
+        // Disabled rules do not contribute. Enforced at load (not runtime) so
+        // a misconfigured fan-out fails fast at startup.
+        if self.defaults.max_streams == 0 {
+            errors.push(ConfigError::ValidationError(
+                "defaults.max_streams must be >= 1 (a value of 0 would reject every config). \
+                 Omit the field to use the default (50) or set an explicit positive value."
+                    .to_string(),
+            ));
+        }
+        let source_count = self.victorialogs.len();
+        let total_streams: usize = self
+            .rules
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| {
+                if r.vl_sources.is_empty() {
+                    source_count
+                } else {
+                    r.vl_sources.len()
+                }
+            })
+            .sum();
+        if total_streams > self.defaults.max_streams {
+            errors.push(ConfigError::ValidationError(format!(
+                "defaults.max_streams exceeded: {} stream(s) required by enabled rules > cap of {}. \
+                 Either raise `defaults.max_streams` or trim rules / `vl_sources` to reduce fan-out.",
+                total_streams, self.defaults.max_streams
             )));
         }
 

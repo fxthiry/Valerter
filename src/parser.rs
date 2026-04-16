@@ -26,30 +26,33 @@ use serde_json::{Map, Value};
 /// Record a successful log match with metrics.
 ///
 /// This function should be called by the pipeline code when parsing succeeds.
-/// It increments the `valerter_logs_matched_total` counter with proper labels.
-/// This metric counts successful matches BEFORE throttling is applied.
+/// It increments the `valerter_logs_matched_total` counter with `rule_name`
+/// and `vl_source` labels. This metric counts successful matches BEFORE
+/// throttling is applied.
 ///
 /// # Arguments
 ///
 /// * `rule_name` - The name of the rule that matched the log
+/// * `vl_source` - The name of the VictoriaLogs source the event came from
 ///
 /// # Example
 ///
 /// ```ignore
 /// match parser.parse(&line) {
 ///     Ok(fields) => {
-///         record_log_matched(&rule.name);
+///         record_log_matched(&rule.name, &vl_source);
 ///         // Continue processing...
 ///     }
 ///     Err(e) => {
-///         record_parse_error(&rule.name, &e);
+///         record_parse_error(&rule.name, &vl_source, &e);
 ///     }
 /// }
 /// ```
-pub fn record_log_matched(rule_name: &str) {
+pub fn record_log_matched(rule_name: &str, vl_source: &str) {
     metrics::counter!(
         "valerter_logs_matched_total",
-        "rule_name" => rule_name.to_string()
+        "rule_name" => rule_name.to_string(),
+        "vl_source" => vl_source.to_string(),
     )
     .increment(1);
 }
@@ -58,11 +61,13 @@ pub fn record_log_matched(rule_name: &str) {
 ///
 /// This function should be called by the pipeline code when parsing fails.
 /// It logs the error at the appropriate level and increments the
-/// `valerter_parse_errors_total` counter with proper labels.
+/// `valerter_parse_errors_total` counter with `rule_name`, `vl_source`, and
+/// `error_type` labels.
 ///
 /// # Arguments
 ///
 /// * `rule_name` - The name of the rule that encountered the error
+/// * `vl_source` - The name of the VictoriaLogs source the event came from
 /// * `error` - The parse error that occurred
 ///
 /// # Example
@@ -71,12 +76,12 @@ pub fn record_log_matched(rule_name: &str) {
 /// match parser.parse(&line) {
 ///     Ok(fields) => { /* process */ }
 ///     Err(e) => {
-///         record_parse_error(&rule.name, &e);
+///         record_parse_error(&rule.name, &vl_source, &e);
 ///         // Skip this log silently (FR20)
 ///     }
 /// }
 /// ```
-pub fn record_parse_error(rule_name: &str, error: &ParseError) {
+pub fn record_parse_error(rule_name: &str, vl_source: &str, error: &ParseError) {
     let error_type = match error {
         ParseError::NoMatch => "regex_no_match",
         ParseError::InvalidJson(_) => "invalid_json",
@@ -88,6 +93,7 @@ pub fn record_parse_error(rule_name: &str, error: &ParseError) {
             // NoMatch is normal behavior - log at DEBUG level
             tracing::debug!(
                 rule_name = %rule_name,
+                vl_source = %vl_source,
                 "Regex did not match, skipping log"
             );
         }
@@ -95,6 +101,7 @@ pub fn record_parse_error(rule_name: &str, error: &ParseError) {
             // Invalid JSON is unexpected - log at WARN level
             tracing::warn!(
                 rule_name = %rule_name,
+                vl_source = %vl_source,
                 error = %msg,
                 "Invalid JSON in log"
             );
@@ -105,7 +112,8 @@ pub fn record_parse_error(rule_name: &str, error: &ParseError) {
     metrics::counter!(
         "valerter_parse_errors_total",
         "rule_name" => rule_name.to_string(),
-        "error_type" => error_type
+        "vl_source" => vl_source.to_string(),
+        "error_type" => error_type,
     )
     .increment(1);
 }
@@ -754,7 +762,7 @@ mod tests {
     fn record_parse_error_no_match_does_not_panic() {
         let error = ParseError::NoMatch;
         // Should not panic
-        super::record_parse_error("test_rule", &error);
+        super::record_parse_error("test_rule", "vlprod", &error);
     }
 
     // Test: record_parse_error does not panic for InvalidJson
@@ -762,22 +770,22 @@ mod tests {
     fn record_parse_error_invalid_json_does_not_panic() {
         let error = ParseError::InvalidJson("unexpected token".to_string());
         // Should not panic
-        super::record_parse_error("test_rule", &error);
+        super::record_parse_error("test_rule", "vlprod", &error);
     }
 
     // Test: record_log_matched does not panic
     #[test]
     fn record_log_matched_does_not_panic() {
         // Should not panic
-        super::record_log_matched("test_rule");
+        super::record_log_matched("test_rule", "vlprod");
     }
 
     // Test: record_log_matched can be called multiple times
     #[test]
     fn record_log_matched_multiple_calls() {
         // Should not panic even with multiple calls
-        super::record_log_matched("rule_a");
-        super::record_log_matched("rule_b");
-        super::record_log_matched("rule_a");
+        super::record_log_matched("rule_a", "vlprod");
+        super::record_log_matched("rule_b", "vldev");
+        super::record_log_matched("rule_a", "vlprod");
     }
 }
