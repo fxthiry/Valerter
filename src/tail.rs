@@ -36,7 +36,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tracing::{debug, info, trace, warn};
 
-use crate::config::{BasicAuthConfig, SecretString, TlsConfig};
+use crate::config::{BasicAuthConfig, SecretString, TlsConfig, VlSourceConfig};
 use crate::error::StreamError;
 use crate::stream_buffer::StreamBuffer;
 
@@ -69,6 +69,23 @@ pub struct TailConfig {
     pub headers: Option<HashMap<String, SecretString>>,
     /// Optional TLS configuration.
     pub tls: Option<TlsConfig>,
+}
+
+impl TailConfig {
+    /// Build a `TailConfig` from a named VL source and a rule query.
+    ///
+    /// Credentials, TLS, and headers are all per-source. `start` is unset so
+    /// the tail endpoint follows live tail semantics.
+    pub fn from_source(source: &VlSourceConfig, query: String) -> Self {
+        Self {
+            base_url: source.url.clone(),
+            query,
+            start: None,
+            basic_auth: source.basic_auth.clone(),
+            headers: source.headers.clone(),
+            tls: source.tls.clone(),
+        }
+    }
 }
 
 /// Client for streaming logs from VictoriaLogs tail endpoint.

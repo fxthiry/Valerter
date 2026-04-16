@@ -19,8 +19,12 @@ fn fixture_path(name: &str) -> PathBuf {
 fn load_valid_config() {
     let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
 
-    // VictoriaLogs settings
-    assert_eq!(config.victorialogs.url, "http://victorialogs:9428");
+    // VictoriaLogs settings (multi-source map — single `default` source)
+    assert_eq!(config.victorialogs.len(), 1);
+    assert_eq!(
+        config.victorialogs.get("default").unwrap().url,
+        "http://victorialogs:9428"
+    );
 
     // Defaults
     assert_eq!(config.defaults.throttle.count, 5);
@@ -96,7 +100,10 @@ fn config_example_yaml_is_valid() {
         .join("config.example.yaml");
 
     let config = Config::load(&example_path).expect("config.example.yaml should be valid");
-    assert!(!config.victorialogs.url.is_empty());
+    assert!(!config.victorialogs.is_empty());
+    for source in config.victorialogs.values() {
+        assert!(!source.url.is_empty());
+    }
     assert!(!config.templates.is_empty());
     assert!(!config.rules.is_empty());
 }
@@ -148,7 +155,8 @@ fn validate_invalid_template_returns_error() {
 fn validate_no_rules_fails() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -244,7 +252,10 @@ fn compile_preserves_config_values() {
 
     let runtime = config.compile(&path).unwrap();
 
-    assert_eq!(runtime.victorialogs.url, "http://victorialogs:9428");
+    assert_eq!(
+        runtime.victorialogs.get("default").unwrap().url,
+        "http://victorialogs:9428"
+    );
     assert_eq!(runtime.defaults.throttle.count, 5);
     assert!(runtime.templates.contains_key("default_alert"));
 }
@@ -257,8 +268,9 @@ fn compile_preserves_config_values() {
 fn load_config_with_basic_auth() {
     let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
 
-    assert!(config.victorialogs.basic_auth.is_some());
-    let basic_auth = config.victorialogs.basic_auth.as_ref().unwrap();
+    let source = config.victorialogs.get("default").unwrap();
+    assert!(source.basic_auth.is_some());
+    let basic_auth = source.basic_auth.as_ref().unwrap();
     assert_eq!(basic_auth.username, "testuser");
     assert_eq!(basic_auth.password.expose(), "testpassword");
 }
@@ -267,8 +279,9 @@ fn load_config_with_basic_auth() {
 fn load_config_with_headers() {
     let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
 
-    assert!(config.victorialogs.headers.is_some());
-    let headers = config.victorialogs.headers.as_ref().unwrap();
+    let source = config.victorialogs.get("default").unwrap();
+    assert!(source.headers.is_some());
+    let headers = source.headers.as_ref().unwrap();
     assert_eq!(headers.len(), 2);
     assert_eq!(
         headers.get("X-API-Key").unwrap().expose(),
@@ -280,8 +293,9 @@ fn load_config_with_headers() {
 fn load_config_with_tls_verify_false() {
     let config = Config::load(&fixture_path("config_with_auth.yaml")).unwrap();
 
-    assert!(config.victorialogs.tls.is_some());
-    assert!(!config.victorialogs.tls.as_ref().unwrap().verify);
+    let source = config.victorialogs.get("default").unwrap();
+    assert!(source.tls.is_some());
+    assert!(!source.tls.as_ref().unwrap().verify);
 }
 
 #[test]
@@ -324,11 +338,18 @@ fn load_config_without_notifiers_section_loads_none() {
 
 fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeConfig {
     RuntimeConfig {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
+        victorialogs: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "default".to_string(),
+                VlSourceConfig {
+                    url: "http://localhost:9428".to_string(),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+            m
         },
         defaults: DefaultsConfig {
             throttle: ThrottleConfig {
@@ -365,6 +386,7 @@ fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeCo
                 mattermost_channel: None,
                 destinations,
             },
+            vl_sources: Vec::new(),
         }],
         metrics: MetricsConfig::default(),
         notifiers: Some(std::collections::HashMap::new()),
@@ -430,11 +452,18 @@ fn rules_use_defaults_when_not_specified() {
 #[test]
 fn validate_collects_all_errors() {
     let config = Config {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
+        victorialogs: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "default".to_string(),
+                VlSourceConfig {
+                    url: "http://localhost:9428".to_string(),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+            m
         },
         defaults: DefaultsConfig {
             throttle: ThrottleConfig {
@@ -472,6 +501,7 @@ fn validate_collects_all_errors() {
                     mattermost_channel: None,
                     destinations: vec!["test".to_string()],
                 },
+                vl_sources: Vec::new(),
             },
             RuleConfig {
                 name: "rule2_invalid".to_string(),
@@ -487,6 +517,7 @@ fn validate_collects_all_errors() {
                     mattermost_channel: None,
                     destinations: vec!["test".to_string()],
                 },
+                vl_sources: Vec::new(),
             },
         ],
         metrics: MetricsConfig::default(),
@@ -507,11 +538,18 @@ fn validate_collects_all_errors() {
 #[test]
 fn validate_throttle_key_template() {
     let config = Config {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
+        victorialogs: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "default".to_string(),
+                VlSourceConfig {
+                    url: "http://localhost:9428".to_string(),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+            m
         },
         defaults: DefaultsConfig {
             throttle: ThrottleConfig {
@@ -552,6 +590,7 @@ fn validate_throttle_key_template() {
                 mattermost_channel: None,
                 destinations: vec!["test".to_string()],
             },
+            vl_sources: Vec::new(),
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
@@ -570,11 +609,18 @@ fn validate_throttle_key_template() {
 #[test]
 fn validate_nonexistent_notify_template_fails() {
     let config = Config {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
+        victorialogs: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "default".to_string(),
+                VlSourceConfig {
+                    url: "http://localhost:9428".to_string(),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+            m
         },
         defaults: DefaultsConfig {
             throttle: ThrottleConfig {
@@ -611,6 +657,7 @@ fn validate_nonexistent_notify_template_fails() {
                 mattermost_channel: None,
                 destinations: vec!["test".to_string()],
             },
+            vl_sources: Vec::new(),
         }],
         metrics: MetricsConfig::default(),
         notifiers: None,
@@ -630,9 +677,23 @@ fn validate_nonexistent_notify_template_fails() {
 #[test]
 fn load_config_without_auth_options() {
     let config = Config::load(&fixture_path("config_valid.yaml")).unwrap();
-    assert!(config.victorialogs.basic_auth.is_none());
-    assert!(config.victorialogs.headers.is_none());
-    assert!(config.victorialogs.tls.is_none());
+    assert!(
+        config
+            .victorialogs
+            .get("default")
+            .unwrap()
+            .basic_auth
+            .is_none()
+    );
+    assert!(
+        config
+            .victorialogs
+            .get("default")
+            .unwrap()
+            .headers
+            .is_none()
+    );
+    assert!(config.victorialogs.get("default").unwrap().tls.is_none());
 }
 
 #[test]
@@ -713,7 +774,8 @@ fn load_config_with_unknown_notifier_type_fails() {
 fn validate_email_body_html_syntax_error_detected() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -750,7 +812,8 @@ rules: []
 fn parse_rejects_old_body_html_field_name() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -788,7 +851,8 @@ rules: []
 fn validate_config_with_invalid_accent_color_fails() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -818,7 +882,8 @@ rules: []
 fn validate_config_with_short_hex_fails() {
     let yaml = r##"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -848,7 +913,8 @@ rules: []
 fn validate_config_with_valid_accent_color_passes() {
     let yaml = r##"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -881,7 +947,8 @@ rules:
 fn validate_template_render_in_body_detects_unknown_filter() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -914,7 +981,8 @@ rules: []
 fn validate_valid_templates_pass() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -945,11 +1013,18 @@ rules:
 #[test]
 fn validate_rule_destinations_collects_all_errors() {
     let config = RuntimeConfig {
-        victorialogs: VictoriaLogsConfig {
-            url: "http://localhost:9428".to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
+        victorialogs: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "default".to_string(),
+                VlSourceConfig {
+                    url: "http://localhost:9428".to_string(),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+            m
         },
         defaults: DefaultsConfig {
             throttle: ThrottleConfig {
@@ -987,6 +1062,7 @@ fn validate_rule_destinations_collects_all_errors() {
                     mattermost_channel: None,
                     destinations: vec!["unknown-1".to_string()],
                 },
+                vl_sources: Vec::new(),
             },
             CompiledRule {
                 name: "rule_2".to_string(),
@@ -1002,6 +1078,7 @@ fn validate_rule_destinations_collects_all_errors() {
                     mattermost_channel: None,
                     destinations: vec!["unknown-2".to_string()],
                 },
+                vl_sources: Vec::new(),
             },
         ],
         metrics: MetricsConfig::default(),
@@ -1277,7 +1354,8 @@ fn load_with_notifier_collision_fails() {
 fn defaults_notify_is_rejected() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1317,7 +1395,8 @@ rules:
 fn unknown_field_rejected_in_config_root() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1358,8 +1437,9 @@ unknown_root_field: "should fail"
 fn unknown_field_rejected_in_victorialogs_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
-  unknown_vl_field: "should fail"
+  default:
+    url: http://localhost:9428
+    unknown_vl_field: "should fail"
 notifiers:
   test:
     type: mattermost
@@ -1399,7 +1479,8 @@ rules:
 fn unknown_field_rejected_in_metrics_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 metrics:
   enabled: true
   port: 9090
@@ -1443,7 +1524,8 @@ rules:
 fn unknown_field_rejected_in_throttle_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1484,7 +1566,8 @@ rules:
 fn unknown_field_rejected_in_template_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1525,7 +1608,8 @@ rules:
 fn unknown_field_rejected_in_rule_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1563,7 +1647,8 @@ rules:
 fn unknown_field_rejected_in_parser_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1602,7 +1687,8 @@ rules:
 fn unknown_field_rejected_in_json_parser_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1643,7 +1729,8 @@ rules:
 fn unknown_field_rejected_in_mattermost_notifier() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: mattermost
@@ -1684,7 +1771,8 @@ rules:
 fn unknown_field_rejected_in_webhook_notifier() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: webhook
@@ -1726,7 +1814,8 @@ rules:
 fn unknown_field_rejected_in_email_notifier() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: email
@@ -1772,7 +1861,8 @@ rules:
 fn unknown_field_rejected_in_smtp_config() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: email
@@ -1822,7 +1912,8 @@ rules:
 fn invalid_url_rejected_in_victorialogs() {
     let yaml = r#"
 victorialogs:
-  url: "not-a-valid-url"
+  default:
+    url: "not-a-valid-url"
 notifiers:
   test:
     type: mattermost
@@ -1857,7 +1948,8 @@ rules:
 fn invalid_url_rejected_in_webhook_notifier() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   test:
     type: webhook
@@ -1893,7 +1985,8 @@ rules:
 fn telegram_notifier_with_empty_chat_ids_fails_validation() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   telegram-broken:
     type: telegram
@@ -1934,7 +2027,8 @@ rules:
 fn telegram_notifier_with_populated_chat_ids_passes_validation() {
     let yaml = r#"
 victorialogs:
-  url: http://localhost:9428
+  default:
+    url: http://localhost:9428
 notifiers:
   telegram-ok:
     type: telegram
@@ -1963,5 +2057,282 @@ rules:
     assert!(
         config.validate().is_ok(),
         "Telegram notifier with non-empty chat_ids should validate"
+    );
+}
+
+// ============================================================
+// v2.0.0: multi-source config schema tests
+// ============================================================
+
+/// Shared YAML tail reused by the multi-source validation suite. Isolates
+/// source-shape changes from notifier / template / rule noise.
+const MULTI_SOURCE_TAIL: &str = r#"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: r
+    query: "*"
+    parser: { json: { fields: [x] } }
+    notify: { template: default, destinations: [mm] }
+"#;
+
+#[test]
+fn schema_parses_map_with_single_source() {
+    let yaml = format!(
+        r#"
+victorialogs:
+  default:
+    url: "http://localhost:9428"
+{}"#,
+        MULTI_SOURCE_TAIL
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(config.victorialogs.len(), 1);
+    assert!(config.victorialogs.contains_key("default"));
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn schema_parses_map_with_multiple_sources() {
+    let yaml = format!(
+        r#"
+victorialogs:
+  vlprod:
+    url: "https://vl.prod.example.com:9428"
+  vldev:
+    url: "http://vl.dev.internal:9428"
+{}"#,
+        MULTI_SOURCE_TAIL
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(config.victorialogs.len(), 2);
+    assert!(config.victorialogs.contains_key("vlprod"));
+    assert!(config.victorialogs.contains_key("vldev"));
+}
+
+#[test]
+fn schema_parses_rule_vl_sources_field() {
+    let yaml = r#"
+victorialogs:
+  vlprod:
+    url: "http://vlprod:9428"
+  vldev:
+    url: "http://vldev:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: prod_only
+    query: "*"
+    parser: { json: { fields: [x] } }
+    vl_sources: [vlprod]
+    notify: { template: default, destinations: [mm] }
+  - name: fan_out
+    query: "*"
+    parser: { json: { fields: [x] } }
+    notify: { template: default, destinations: [mm] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.rules.len(), 2);
+    assert_eq!(config.rules[0].vl_sources, vec!["vlprod".to_string()]);
+    assert!(config.rules[1].vl_sources.is_empty()); // default = fan-out
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_zero_sources() {
+    let yaml = format!(
+        r#"
+victorialogs: {{}}
+{}"#,
+        MULTI_SOURCE_TAIL
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    let errors = config.validate().expect_err("zero sources must reject");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.to_string().contains("at least one source required")),
+        "expected 'at least one source required' error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_rejects_unknown_vl_sources_ref() {
+    let yaml = r#"
+victorialogs:
+  vlprod:
+    url: "http://vlprod:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: bad_ref
+    query: "*"
+    parser: { json: { fields: [x] } }
+    vl_sources: [vlprod, missing_source]
+    notify: { template: default, destinations: [mm] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config
+        .validate()
+        .expect_err("unknown source ref must reject");
+    let msg = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains("unknown source 'missing_source'"),
+        "msg: {}",
+        msg
+    );
+    assert!(
+        msg.contains("vlprod"),
+        "error must list known sources; msg: {}",
+        msg
+    );
+}
+
+#[test]
+fn validate_rejects_invalid_source_name() {
+    // Source name with `-` would create ambiguity in the default throttle key
+    // `{rule}-{source}:global`. Restricted to `^[a-zA-Z0-9_]+$`.
+    let yaml = r#"
+victorialogs:
+  prod-eu:
+    url: "http://vl:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: r
+    query: "*"
+    parser: { json: { fields: [x] } }
+    notify: { template: default, destinations: [mm] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config
+        .validate()
+        .expect_err("source name with `-` must reject");
+    let msg = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains("source name 'prod-eu' is invalid"),
+        "msg: {}",
+        msg
+    );
+    assert!(
+        msg.contains("[a-zA-Z0-9_]"),
+        "msg must hint at allowed chars: {}",
+        msg
+    );
+}
+
+#[test]
+fn validate_rejects_duplicate_vl_sources_entry() {
+    let yaml = r#"
+victorialogs:
+  vlprod:
+    url: "http://vl:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: dupe
+    query: "*"
+    parser: { json: { fields: [x] } }
+    vl_sources: [vlprod, vlprod]
+    notify: { template: default, destinations: [mm] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config
+        .validate()
+        .expect_err("duplicate vl_sources must reject");
+    let msg = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains("duplicate entry 'vlprod'"),
+        "expected duplicate entry mention, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn load_rejects_legacy_single_url_shape_with_migration_message() {
+    let legacy_yaml = r#"
+victorialogs:
+  url: "http://victorialogs:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: { count: 5, window: 60s }
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+  - name: r
+    query: "*"
+    parser: { json: { fields: [x] } }
+    notify: { template: default, destinations: [mm] }
+"#;
+    let err = serde_yaml::from_str::<Config>(legacy_yaml)
+        .expect_err("legacy single-URL shape must fail to parse");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("map of named sources"),
+        "expected migration hint mentioning 'map of named sources', got: {}",
+        err_str
+    );
+    assert!(
+        err_str.contains("victorialogs:"),
+        "expected migration YAML snippet in error, got: {}",
+        err_str
     );
 }

@@ -23,7 +23,7 @@ pub use secret::SecretString;
 pub use types::{
     BasicAuthConfig, Config, DEFAULT_CONFIG_PATH, DefaultsConfig, JsonParserConfig, MetricsConfig,
     NotifyConfig, ParserConfig, RuleConfig, TemplateConfig, ThrottleConfig, TlsConfig,
-    VictoriaLogsConfig,
+    VlSourceConfig,
 };
 pub use validation::validate_template_render;
 

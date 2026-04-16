@@ -58,25 +58,41 @@
 
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
-# │ VICTORIALOGS CONNECTION                                          [REQUIRED]│
+# │ VICTORIALOGS SOURCES                                             [REQUIRED]│
 # └────────────────────────────────────────────────────────────────────────────┘
+# `victorialogs` is a map of named sources (breaking change in v2.0.0).
+# Each rule can target a subset via `vl_sources: [name, ...]`, or omit the
+# field to fan out across every configured source.
+#
+# See docs/configuration.md for the v1.x → v2.0 migration snippet.
 
 victorialogs:
-  url: "http://127.0.0.1:9428"
+  default:
+    url: "http://127.0.0.1:9428"
 
-  # ── Authentication (optional) ──────────────────────────────────────────────
-  #
-  # basic_auth:
-  #   username: "${VL_USER}"
-  #   password: "${VL_PASS}"
-  #
-  # headers:                               # For Bearer tokens or API keys
-  #   Authorization: "Bearer ${VL_TOKEN}"
+    # ── Authentication (optional, per source) ──────────────────────────────
+    #
+    # basic_auth:
+    #   username: "${VL_USER}"
+    #   password: "${VL_PASS}"
+    #
+    # headers:                             # For Bearer tokens or API keys
+    #   Authorization: "Bearer ${VL_TOKEN}"
 
-  # ── TLS (optional) ─────────────────────────────────────────────────────────
+    # ── TLS (optional, per source) ─────────────────────────────────────────
+    #
+    # tls:
+    #   verify: true                       # Set false for self-signed certs
+
+  # ── Example: multi-source (production + dev) ───────────────────────────────
   #
-  # tls:
-  #   verify: true                         # Set false for self-signed certs
+  # vlprod:
+  #   url: "https://victorialogs.prod.example.com:9428"
+  #   basic_auth:
+  #     username: "${VL_PROD_USER}"
+  #     password: "${VL_PROD_PASS}"
+  # vldev:
+  #   url: "http://victorialogs.dev.internal:9428"
 
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
@@ -285,6 +301,7 @@ notifiers:
 #   notify       - Notification settings (required)
 #   enabled      - Enable/disable rule (optional, default: true)
 #   throttle     - Override default throttle (optional)
+#   vl_sources   - List of VL source names to target (optional; default: all)
 #
 # Parser (at least one of regex or json should be configured):
 #   json.fields  - List of JSON fields to extract
@@ -306,6 +323,7 @@ rules:
       key: "{{ host }}"                    # Throttle independently per host
       count: 3
       window: 5m
+    # vl_sources: [default]                # Optional: restrict to specific sources
     notify:
       template: default_alert
       destinations:

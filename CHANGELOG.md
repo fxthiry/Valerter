@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - unreleased
+
+### Breaking changes
+
+- **`victorialogs` is now a map of named sources.** A single valerter instance can tail multiple VL backends and route alerts per source. The v1.x single-URL shape (`victorialogs.url: ...` at the top level) is rejected at load with an actionable migration error.
+
+  Migrate from:
+
+  ```yaml
+  victorialogs:
+    url: "http://victorialogs:9428"
+    basic_auth:
+      username: "u"
+      password: "p"
+  ```
+
+  To:
+
+  ```yaml
+  victorialogs:
+    default:
+      url: "http://victorialogs:9428"
+      basic_auth:
+        username: "u"
+        password: "p"
+  ```
+
+  Then optionally target sources per rule via `vl_sources: [name, ...]`, or omit the field to fan out across every configured source. Credentials, TLS, and headers are per-source, self-contained in each `VlSourceConfig`.
+
+- **Default throttle key is now `{rule}-{source}:global`** (was `{rule}:global` in v1.x). Multi-source deployments get isolated throttle buckets per source with no extra config. Users who want cross-source dedup must override `throttle.key` explicitly (e.g. `key: "{{ rule_name }}"`).
+
+- **Source names are restricted to `^[a-zA-Z0-9_]+$`.** No dashes, colons, dots, or spaces allowed. Validated at load. The constraint avoids ambiguity in the default throttle key format above.
+
+- **Notifier output formats extended with `vl_source`.** The Mattermost footer now reads `valerter | <rule> | <source> | <timestamp>` instead of `valerter | <rule> | <timestamp>`. The default webhook payload exposes `vl_source` as a top-level JSON field. Downstream parsers / dashboards that match exact strings in either output need to update.
+
+### Added
+
+- **Multi-source VictoriaLogs support** (issue #34). The engine spawns one task per `(rule, source)` pair with per-source cancellation and reconnect isolation, so a single unhealthy source does not stop alerts on the others.
+- **`{{ vl_source }}` template variable** available everywhere `{{ rule_name }}` is: layer 1 templates (`title`, `body`, `email_body_html`), `throttle.key`, and notifier-level layer 2 contexts (`subject_template`, `body_template`). Always non-empty, owned `String`, equal to the source name currently processing the event. Synthetic value wins over any event field literally named `vl_source` (matches the `rule_name` collision policy).
+- **`AlertPayload.vl_source`** propagated end-to-end so notifiers can render the source name. See Breaking changes above for the related output format updates on Mattermost and webhook destinations.
+
 ## [1.2.1] - unreleased
 
 ### Fixed

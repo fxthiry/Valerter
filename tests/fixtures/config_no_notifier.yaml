@@ -1,7 +1,8 @@
 # Invalid config - no notifiers configured
 # This should fail validation with "no notifiers configured" error
 victorialogs:
-  url: "http://localhost:9428"
+  default:
+    url: "http://localhost:9428"
 
 defaults:
   throttle:

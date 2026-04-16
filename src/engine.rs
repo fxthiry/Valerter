@@ -32,7 +32,7 @@
 //! engine.run(cancel).await?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,9 +40,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
-use crate::config::{
-    BasicAuthConfig, CompiledRule, CompiledThrottle, RuntimeConfig, SecretString, TlsConfig,
-};
+use crate::config::{CompiledRule, CompiledThrottle, RuntimeConfig, VlSourceConfig};
 use crate::error::RuleError;
 use crate::notify::{AlertPayload, NotificationQueue};
 use crate::parser::{RuleParser, record_log_matched, record_parse_error};
@@ -53,15 +51,39 @@ use crate::throttle::{ThrottleResult, Throttler};
 /// Delay before restarting a rule after panic (AD-07 inspired).
 const PANIC_RESTART_DELAY: Duration = Duration::from_secs(5);
 
-/// Context needed to spawn a rule task.
+/// Resolve the set of `(source_name, source_config)` pairs to spawn for a rule.
+///
+/// - Empty `rule.vl_sources`: fan out across every configured source.
+/// - Non-empty `rule.vl_sources`: restrict to the named subset, preserving
+///   BTreeMap iteration order so the spawn order is deterministic regardless
+///   of the order names appear in the rule's list.
+///
+/// Unknown source names must have been rejected at `Config::validate()` time;
+/// any mismatch here is silently ignored (treated as defensive filtering).
+pub(crate) fn resolve_sources(
+    rule: &CompiledRule,
+    sources: &BTreeMap<String, VlSourceConfig>,
+) -> Vec<(String, VlSourceConfig)> {
+    if rule.vl_sources.is_empty() {
+        return sources
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+    }
+    sources
+        .iter()
+        .filter(|(name, _)| rule.vl_sources.iter().any(|r| r == *name))
+        .map(|(name, cfg)| (name.clone(), cfg.clone()))
+        .collect()
+}
+
+/// Context needed to spawn a single `(rule, source)` task.
 /// Stored to allow respawning after panic.
 #[derive(Clone)]
 struct RuleSpawnContext {
     rule: CompiledRule,
-    vl_url: String,
-    vl_basic_auth: Option<BasicAuthConfig>,
-    vl_headers: Option<HashMap<String, SecretString>>,
-    vl_tls: Option<TlsConfig>,
+    vl_source_name: String,
+    vl_source_config: VlSourceConfig,
     queue: NotificationQueue,
     template_engine: Arc<TemplateEngine>,
     default_throttle: CompiledThrottle,
@@ -120,23 +142,24 @@ impl RuleEngine {
     ///
     /// Returns `Ok(())` when cancelled, or propagates fatal errors.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), RuleError> {
-        let mut tasks: JoinSet<(String, Result<(), RuleError>)> = JoinSet::new();
-        // Map AbortHandle ID to (rule_name, spawn_context) for respawn after panic
-        let mut handle_to_context: HashMap<tokio::task::Id, (String, RuleSpawnContext)> =
+        let mut tasks: JoinSet<(String, String, Result<(), RuleError>)> = JoinSet::new();
+        // Map AbortHandle ID to (rule_name, vl_source_name, spawn_context) for
+        // respawn after panic. Each `(rule, source)` pair is a distinct task.
+        let mut handle_to_context: HashMap<tokio::task::Id, (String, String, RuleSpawnContext)> =
             HashMap::new();
 
-        // Spawn a task per enabled rule
-        let enabled_count =
+        // Spawn a task per (enabled rule, resolved source) pair
+        let spawned_count =
             self.spawn_rule_tasks(&mut tasks, &mut handle_to_context, cancel.clone());
 
-        if enabled_count == 0 {
+        if spawned_count == 0 {
             warn!("No enabled rules found, engine will exit");
             return Ok(());
         }
 
         info!(
-            rule_count = enabled_count,
-            "Rule engine started, supervising rules"
+            task_count = spawned_count,
+            "Rule engine started, supervising rule-source tasks"
         );
 
         // Supervision loop
@@ -144,13 +167,13 @@ impl RuleEngine {
             .await
     }
 
-    /// Spawn tasks for all enabled rules.
+    /// Spawn tasks for all enabled `(rule, source)` pairs.
     ///
-    /// Returns the number of enabled rules spawned.
+    /// Returns the number of tasks spawned.
     fn spawn_rule_tasks(
         &self,
-        tasks: &mut JoinSet<(String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, RuleSpawnContext)>,
+        tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
+        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
         cancel: CancellationToken,
     ) -> usize {
         let mut count = 0;
@@ -171,72 +194,91 @@ impl RuleEngine {
                 continue;
             }
 
-            debug!(rule_name = %rule.name, "Spawning rule task");
+            let resolved = resolve_sources(rule, &self.runtime_config.victorialogs);
+            if resolved.is_empty() {
+                // Should not happen: validation rejects zero sources at load.
+                warn!(
+                    rule_name = %rule.name,
+                    "Rule resolved to zero sources, skipping"
+                );
+                continue;
+            }
 
-            let ctx = RuleSpawnContext {
-                rule: rule.clone(),
-                vl_url: self.runtime_config.victorialogs.url.clone(),
-                vl_basic_auth: self.runtime_config.victorialogs.basic_auth.clone(),
-                vl_headers: self.runtime_config.victorialogs.headers.clone(),
-                vl_tls: self.runtime_config.victorialogs.tls.clone(),
-                queue: self.queue.clone(),
-                template_engine: Arc::clone(&template_engine),
-                default_throttle: default_throttle.clone(),
-                timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
-            };
+            for (source_name, source_cfg) in resolved {
+                trace!(
+                    rule_name = %rule.name,
+                    vl_source = %source_name,
+                    "Spawning (rule, source) task"
+                );
 
-            let rule_name = rule.name.clone();
-            Self::spawn_single_rule(tasks, handle_to_context, &ctx, &rule_name, cancel.clone());
-            count += 1;
+                let ctx = RuleSpawnContext {
+                    rule: rule.clone(),
+                    vl_source_name: source_name.clone(),
+                    vl_source_config: source_cfg,
+                    queue: self.queue.clone(),
+                    template_engine: Arc::clone(&template_engine),
+                    default_throttle: default_throttle.clone(),
+                    timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
+                };
+
+                Self::spawn_single_rule(tasks, handle_to_context, &ctx, cancel.clone());
+                count += 1;
+            }
         }
 
         count
     }
 
-    /// Spawn a single rule task and track its handle.
+    /// Spawn a single `(rule, source)` task and track its handle.
     fn spawn_single_rule(
-        tasks: &mut JoinSet<(String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, RuleSpawnContext)>,
+        tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
+        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
         ctx: &RuleSpawnContext,
-        rule_name: &str,
         cancel: CancellationToken,
     ) {
-        let rule_name_owned = rule_name.to_string();
+        let rule_name_owned = ctx.rule.name.clone();
+        let vl_source_owned = ctx.vl_source_name.clone();
         let ctx_clone = ctx.clone();
 
         let abort_handle = tasks.spawn(async move {
+            let rule_name_for_return = ctx_clone.rule.name.clone();
+            let vl_source_for_return = ctx_clone.vl_source_name.clone();
             let result = run_rule(ctx_clone, cancel).await;
-            (rule_name_owned, result)
+            (rule_name_for_return, vl_source_for_return, result)
         });
 
         // Track context by task ID for respawn
-        handle_to_context.insert(abort_handle.id(), (rule_name.to_string(), ctx.clone()));
+        handle_to_context.insert(
+            abort_handle.id(),
+            (rule_name_owned, vl_source_owned, ctx.clone()),
+        );
     }
 
     /// Supervise running tasks and handle completion/errors/panics.
     async fn supervise_tasks(
         &self,
-        tasks: &mut JoinSet<(String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, RuleSpawnContext)>,
+        tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
+        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
         cancel: CancellationToken,
     ) -> Result<(), RuleError> {
         loop {
             tokio::select! {
                 Some(result) = tasks.join_next_with_id() => {
                     match result {
-                        Ok((task_id, (rule_name, Ok(_)))) => {
+                        Ok((task_id, (rule_name, vl_source, Ok(_)))) => {
                             // Task completed normally (shouldn't happen - rules run forever)
-                            info!(rule_name = %rule_name, "Rule task completed normally");
+                            info!(rule_name = %rule_name, vl_source = %vl_source, "Rule task completed normally");
                             handle_to_context.remove(&task_id);
                         }
-                        Ok((task_id, (rule_name, Err(e)))) => {
-                            // Fatal error from rule
+                        Ok((task_id, (rule_name, vl_source, Err(e)))) => {
+                            // Fatal error from rule — scoped to this (rule, source) pair only.
+                            // Other pairs keep running (per-source isolation).
                             error!(
                                 rule_name = %rule_name,
+                                vl_source = %vl_source,
                                 error = %e,
                                 "Rule task failed fatally"
                             );
-                            // Don't restart - fatal errors are not recoverable
                             metrics::counter!(
                                 "valerter_rule_errors_total",
                                 "rule_name" => rule_name
@@ -244,46 +286,40 @@ impl RuleEngine {
                             handle_to_context.remove(&task_id);
                         }
                         Err(join_error) if join_error.is_panic() => {
-                            // Get task ID from the JoinError
                             let task_id = join_error.id();
-                            // PANIC - extract rule info from our tracking map
-                            if let Some((rule_name, ctx)) = handle_to_context.remove(&task_id) {
-                                // Log CRITICAL with rule_name (Fix H3)
+                            if let Some((rule_name, vl_source, ctx)) = handle_to_context.remove(&task_id) {
                                 error!(
                                     rule_name = %rule_name,
+                                    vl_source = %vl_source,
                                     error = %join_error,
                                     "Rule task panicked - CRITICAL"
                                 );
 
-                                // Increment metric with rule_name label (Fix H2)
                                 metrics::counter!(
                                     "valerter_rule_panics_total",
                                     "rule_name" => rule_name.clone()
                                 ).increment(1);
 
-                                // Respawn after delay if not cancelled (Fix H1)
                                 if !cancel.is_cancelled() {
                                     info!(
                                         rule_name = %rule_name,
+                                        vl_source = %vl_source,
                                         delay_secs = PANIC_RESTART_DELAY.as_secs(),
-                                        "Respawning rule after panic delay"
+                                        "Respawning rule-source task after panic delay"
                                     );
                                     tokio::time::sleep(PANIC_RESTART_DELAY).await;
 
-                                    // Respawn the task
                                     if !cancel.is_cancelled() {
                                         Self::spawn_single_rule(
                                             tasks,
                                             handle_to_context,
                                             &ctx,
-                                            &rule_name,
                                             cancel.clone(),
                                         );
-                                        info!(rule_name = %rule_name, "Rule respawned after panic");
+                                        info!(rule_name = %rule_name, vl_source = %vl_source, "Rule-source task respawned after panic");
                                     }
                                 }
                             } else {
-                                // Should never happen, but log if it does
                                 error!(
                                     error = %join_error,
                                     "Rule task panicked but context not found - CRITICAL"
@@ -292,14 +328,12 @@ impl RuleEngine {
                             }
                         }
                         Err(join_error) => {
-                            // Task was cancelled - get ID and clean up
                             let task_id = join_error.id();
                             tracing::debug!(error = %join_error, "Rule task cancelled");
                             handle_to_context.remove(&task_id);
                         }
                     }
 
-                    // If no tasks remain and not cancelled, exit
                     if tasks.is_empty() && !cancel.is_cancelled() {
                         warn!("All rule tasks completed unexpectedly");
                         return Ok(());
@@ -309,7 +343,6 @@ impl RuleEngine {
                     info!("Shutdown signal received, aborting all rules");
                     tasks.abort_all();
 
-                    // Drain remaining tasks
                     while tasks.join_next().await.is_some() {}
 
                     info!("All rule tasks stopped");
@@ -366,10 +399,14 @@ impl ReconnectCallback for ThrottleResetCallback {
 /// The function runs until cancelled or a fatal error occurs.
 /// All recoverable errors are logged and the loop continues (Log+Continue pattern).
 async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<(), RuleError> {
-    let span = tracing::info_span!("run_rule", rule_name = %ctx.rule.name);
+    let span = tracing::info_span!(
+        "run_rule",
+        rule_name = %ctx.rule.name,
+        vl_source = %ctx.vl_source_name
+    );
 
     async move {
-        debug!("Rule task started");
+        debug!("Rule-source task started");
 
         // Create parser for this rule
         let parser = RuleParser::from_compiled(&ctx.rule.parser);
@@ -379,9 +416,16 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
             "Parser initialized"
         );
 
-        // Create throttler for this rule (uses rule's config or defaults)
+        // Create throttler for this (rule, source) pair. Each task owns its
+        // throttler: when no custom key_template is set, the default key path
+        // uses (rule_name, vl_source) so buckets are naturally isolated per
+        // source without cross-contamination.
         let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
-        let throttler = Arc::new(Throttler::new(Some(throttle_config), &ctx.rule.name));
+        let throttler = Arc::new(Throttler::new(
+            Some(throttle_config),
+            &ctx.rule.name,
+            &ctx.vl_source_name,
+        ));
         debug!(
             throttle_count = throttle_config.count,
             throttle_window_secs = throttle_config.window.as_secs(),
@@ -403,20 +447,14 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         // Create callback for throttle reset on reconnection
         let reconnect_callback = ThrottleResetCallback::new(Arc::clone(&throttler));
 
-        // Create TailClient for VictoriaLogs
-        let tail_config = TailConfig {
-            base_url: ctx.vl_url.clone(),
-            query: ctx.rule.query.clone(),
-            start: None,
-            basic_auth: ctx.vl_basic_auth.clone(),
-            headers: ctx.vl_headers.clone(),
-            tls: ctx.vl_tls.clone(),
-        };
+        // Create TailClient for this VictoriaLogs source
+        let tail_config = TailConfig::from_source(&ctx.vl_source_config, ctx.rule.query.clone());
 
         let mut tail_client = TailClient::new(tail_config).map_err(RuleError::Stream)?;
 
         // Stream with reconnection - runs until cancelled
         let rule_name = ctx.rule.name.clone();
+        let vl_source = Arc::new(ctx.vl_source_name.clone());
         let template_name = Arc::new(template_name);
         let destinations = Arc::new(destinations);
         let template_engine = ctx.template_engine;
@@ -426,18 +464,17 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         let stream_result = tail_client
             .stream_with_reconnect(&rule_name, Some(&reconnect_callback), |line| {
                 // Process each log line
-                // Clone Arcs for the async block (cheap reference counting)
                 let queue = queue.clone();
                 let parser = Arc::clone(&parser);
                 let throttler = Arc::clone(&throttler);
                 let template_engine = Arc::clone(&template_engine);
                 let template_name = Arc::clone(&template_name);
                 let rule_name = rule_name.clone();
+                let vl_source = Arc::clone(&vl_source);
                 let destinations = Arc::clone(&destinations);
                 let timestamp_timezone = Arc::clone(&timestamp_timezone);
 
                 async move {
-                    // Pattern Log+Continue: never propagate errors, just log and continue
                     if let Err(e) = process_log_line(
                         &line,
                         &parser,
@@ -445,15 +482,16 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
                         &template_engine,
                         &template_name,
                         &rule_name,
+                        &vl_source,
                         &destinations,
                         &queue,
                         &timestamp_timezone,
                     )
                     .await
                     {
-                        // Log at appropriate level based on error type
                         debug!(
                             rule_name = %rule_name,
+                            vl_source = %vl_source,
                             error = %e,
                             "Failed to process log line, continuing"
                         );
@@ -463,13 +501,11 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
             })
             .await;
 
-        // Check if we were cancelled or had an error
         if cancel.is_cancelled() {
-            info!("Rule task stopping due to cancellation");
+            info!("Rule-source task stopping due to cancellation");
             return Ok(());
         }
 
-        // If we get here, stream ended unexpectedly
         stream_result.map_err(RuleError::Stream)
     }
     .instrument(span)
@@ -490,6 +526,7 @@ async fn process_log_line(
     template_engine: &TemplateEngine,
     template_name: &str,
     rule_name: &str,
+    vl_source: &str,
     destinations: &[String],
     queue: &NotificationQueue,
     timestamp_timezone: &str,
@@ -514,17 +551,17 @@ async fn process_log_line(
     // Step 1.5: Record successful match (before throttle check)
     record_log_matched(rule_name);
 
-    // Step 2: Check throttle
+    // Step 2: Check throttle (renders key with both rule_name and vl_source)
     match throttler.check(&fields) {
         ThrottleResult::Pass => { /* continue */ }
         ThrottleResult::Throttled => {
-            // Throttled - not an error, just skip sending
             return Ok(());
         }
     }
 
-    // Step 3: Render template
-    let rendered = template_engine.render_with_fallback(template_name, &fields, rule_name);
+    // Step 3: Render template (layer 1 sees both rule_name and vl_source)
+    let rendered =
+        template_engine.render_with_fallback(template_name, &fields, rule_name, vl_source);
 
     // Step 4: Extract _time from parsed fields for log timestamp
     let log_timestamp = fields
@@ -532,7 +569,11 @@ async fn process_log_line(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            warn!(rule_name = %rule_name, "Missing _time field in log, using current time");
+            warn!(
+                rule_name = %rule_name,
+                vl_source = %vl_source,
+                "Missing _time field in log, using current time"
+            );
             chrono::Utc::now().to_rfc3339()
         });
 
@@ -543,6 +584,7 @@ async fn process_log_line(
     let payload = AlertPayload {
         message: rendered,
         rule_name: rule_name.to_string(),
+        vl_source: vl_source.to_string(),
         destinations: destinations.to_vec(),
         log_timestamp,
         log_timestamp_formatted,
@@ -551,6 +593,7 @@ async fn process_log_line(
     if let Err(e) = queue.send(payload) {
         warn!(
             rule_name = %rule_name,
+            vl_source = %vl_source,
             error = %e,
             "Failed to send to notification queue"
         );
@@ -584,9 +627,9 @@ mod tests {
     use super::*;
     use crate::config::{
         CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, MetricsConfig,
-        NotifyConfig, ThrottleConfig, VictoriaLogsConfig,
+        NotifyConfig, ThrottleConfig, VlSourceConfig,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn make_test_client() -> reqwest::Client {
         reqwest::Client::builder()
@@ -614,17 +657,23 @@ mod tests {
                 mattermost_channel: None,
                 destinations: vec!["mattermost-test".to_string()],
             },
+            vl_sources: Vec::new(),
         }
     }
 
     fn make_test_runtime_config(rules: Vec<CompiledRule>) -> RuntimeConfig {
-        RuntimeConfig {
-            victorialogs: VictoriaLogsConfig {
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "default".to_string(),
+            VlSourceConfig {
                 url: "http://localhost:9428".to_string(),
                 basic_auth: None,
                 headers: None,
                 tls: None,
             },
+        );
+        RuntimeConfig {
+            victorialogs: sources,
             defaults: DefaultsConfig {
                 throttle: ThrottleConfig {
                     key: None,
@@ -854,7 +903,7 @@ mod tests {
             count: 10,
             window: Duration::from_secs(60),
         };
-        let throttler = Throttler::new(Some(&throttle_config), "test_rule");
+        let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
         let queue = NotificationQueue::new(10);
         let _rx = queue.subscribe();
@@ -870,6 +919,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
+            "vlprod",
             &destinations,
             &queue,
             "UTC",
@@ -889,7 +939,7 @@ mod tests {
             count: 10,
             window: Duration::from_secs(60),
         };
-        let throttler = Throttler::new(Some(&throttle_config), "test_rule");
+        let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
         let queue = NotificationQueue::new(10);
         let _rx = queue.subscribe();
@@ -903,6 +953,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
+            "vlprod",
             &[], // Empty destinations = use default
             &queue,
             "UTC",
@@ -923,7 +974,7 @@ mod tests {
             count: 1, // Only allow 1 alert
             window: Duration::from_secs(60),
         };
-        let throttler = Throttler::new(Some(&throttle_config), "test_rule");
+        let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
         let queue = NotificationQueue::new(10);
         let _rx = queue.subscribe();
@@ -938,6 +989,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
+            "vlprod",
             &[], // Empty destinations = use default
             &queue,
             "UTC",
@@ -954,6 +1006,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
+            "vlprod",
             &[],
             &queue,
             "UTC",
@@ -972,7 +1025,7 @@ mod tests {
             count: 10,
             window: Duration::from_secs(60),
         };
-        let throttler = Throttler::new(Some(&throttle_config), "test_rule");
+        let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
         let queue = NotificationQueue::new(10);
         let mut rx = queue.subscribe();
@@ -988,6 +1041,7 @@ mod tests {
             &template_engine,
             "default",
             "test_rule",
+            "vlprod",
             &destinations,
             &queue,
             "UTC",
@@ -997,13 +1051,14 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(queue.len(), 1);
 
-        // Verify the payload has the destinations and timestamps
+        // Verify the payload has the destinations, timestamps, and vl_source
         let payload = rx.recv().await.unwrap();
         assert_eq!(payload.destinations.len(), 2);
         assert_eq!(payload.destinations[0], "mattermost-infra");
         assert_eq!(payload.destinations[1], "mattermost-ops");
         assert_eq!(payload.log_timestamp, "2026-01-09T10:00:00Z");
         assert_eq!(payload.log_timestamp_formatted, "09/01/2026 10:00:00 UTC");
+        assert_eq!(payload.vl_source, "vlprod");
     }
 
     // ===================================================================
@@ -1017,7 +1072,11 @@ mod tests {
             count: 1,
             window: Duration::from_secs(60),
         };
-        let throttler = Arc::new(Throttler::new(Some(&throttle_config), "test_rule"));
+        let throttler = Arc::new(Throttler::new(
+            Some(&throttle_config),
+            "test_rule",
+            "vlprod",
+        ));
         let callback = ThrottleResetCallback::new(Arc::clone(&throttler));
 
         // Use up the throttle limit
@@ -1036,5 +1095,63 @@ mod tests {
     fn process_error_display() {
         assert_eq!(ProcessError::Parse.to_string(), "parse error");
         assert_eq!(ProcessError::Queue.to_string(), "queue error");
+    }
+
+    // ===================================================================
+    // v2.0.0: resolve_sources multi-source fan-out semantics
+    // ===================================================================
+
+    fn sources_map(names: &[&str]) -> BTreeMap<String, VlSourceConfig> {
+        let mut m = BTreeMap::new();
+        for name in names {
+            m.insert(
+                (*name).to_string(),
+                VlSourceConfig {
+                    url: format!("http://{}:9428", name),
+                    basic_auth: None,
+                    headers: None,
+                    tls: None,
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn resolve_sources_empty_rule_fans_out_to_all_sources() {
+        let sources = sources_map(&["vldev", "vlprod"]);
+        let rule = make_test_rule("r", true); // vl_sources is empty
+
+        let resolved = resolve_sources(&rule, &sources);
+
+        let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
+        // BTreeMap ordering → deterministic [vldev, vlprod]
+        assert_eq!(names, vec!["vldev", "vlprod"]);
+    }
+
+    #[test]
+    fn resolve_sources_with_subset_restricts_to_named_sources() {
+        let sources = sources_map(&["vldev", "vlprod", "vlstaging"]);
+        let mut rule = make_test_rule("r", true);
+        rule.vl_sources = vec!["vlprod".to_string()];
+
+        let resolved = resolve_sources(&rule, &sources);
+
+        let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["vlprod"]);
+    }
+
+    #[test]
+    fn resolve_sources_preserves_btreemap_order_regardless_of_rule_list_order() {
+        // Rule lists sources in reverse alphabetical order; resolver must
+        // still emit them in BTreeMap (deterministic) order.
+        let sources = sources_map(&["vldev", "vlprod", "vlstaging"]);
+        let mut rule = make_test_rule("r", true);
+        rule.vl_sources = vec!["vlstaging".to_string(), "vldev".to_string()];
+
+        let resolved = resolve_sources(&rule, &sources);
+
+        let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["vldev", "vlstaging"]);
     }
 }
