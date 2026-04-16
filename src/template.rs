@@ -19,7 +19,7 @@
 //! let engine = TemplateEngine::new(templates);
 //! let fields = json!({"host": "server-01", "severity": "critical"});
 //!
-//! match engine.render("alert_template", &fields) {
+//! match engine.render("alert_template", &fields, "my_rule") {
 //!     Ok(msg) => println!("Title: {}", msg.title),
 //!     Err(e) => eprintln!("Render failed: {}", e),
 //! }
@@ -105,6 +105,10 @@ impl TemplateEngine {
     ///
     /// * `template_name` - Name of the template to render.
     /// * `fields` - Extracted log fields as JSON value.
+    /// * `rule_name` - Name of the rule that triggered this render. Injected
+    ///   into the render context as `rule_name` so templates can reference
+    ///   `{{ rule_name }}` (issue #31). Overrides any event field with the
+    ///   same name.
     ///
     /// # Returns
     ///
@@ -116,12 +120,13 @@ impl TemplateEngine {
     ///
     /// ```ignore
     /// let fields = json!({"host": "server-01", "message": "Alert!"});
-    /// let msg = engine.render("alert", &fields)?;
+    /// let msg = engine.render("alert", &fields, "my_rule")?;
     /// ```
     pub fn render(
         &self,
         template_name: &str,
         fields: &Value,
+        rule_name: &str,
     ) -> Result<RenderedMessage, TemplateError> {
         tracing::trace!(template_name = %template_name, "Starting template render");
 
@@ -133,13 +138,15 @@ impl TemplateEngine {
                     name: template_name.to_string(),
                 })?;
 
-        // Render each field
-        let title = self.render_string(&template.title, fields)?;
-        let body = self.render_string(&template.body, fields)?;
+        // Render each field. rule_name is injected in the render helpers so
+        // it is available at layer 1 (title, body, email_body_html), matching
+        // the existing layer 2 notifier-level contexts (issue #31).
+        let title = self.render_string(&template.title, fields, rule_name)?;
+        let body = self.render_string(&template.body, fields, rule_name)?;
 
         // Render email_body_html with HTML auto-escape if present
         let email_body_html = if let Some(email_body_html_template) = &template.email_body_html {
-            Some(self.render_string_html_escaped(email_body_html_template, fields)?)
+            Some(self.render_string_html_escaped(email_body_html_template, fields, rule_name)?)
         } else {
             None
         };
@@ -161,8 +168,14 @@ impl TemplateEngine {
     }
 
     /// Render a single template string with fields (no auto-escape).
-    fn render_string(&self, template_str: &str, fields: &Value) -> Result<String, TemplateError> {
-        let ctx = crate::parser::unflatten_dotted_keys(fields);
+    fn render_string(
+        &self,
+        template_str: &str,
+        fields: &Value,
+        rule_name: &str,
+    ) -> Result<String, TemplateError> {
+        let mut ctx = crate::parser::unflatten_dotted_keys(fields);
+        inject_rule_name(&mut ctx, rule_name);
         self.env
             .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
@@ -176,8 +189,10 @@ impl TemplateEngine {
         &self,
         template_str: &str,
         fields: &Value,
+        rule_name: &str,
     ) -> Result<String, TemplateError> {
-        let ctx = crate::parser::unflatten_dotted_keys(fields);
+        let mut ctx = crate::parser::unflatten_dotted_keys(fields);
+        inject_rule_name(&mut ctx, rule_name);
         self.html_env
             .render_str(template_str, &ctx)
             .map_err(|e| TemplateError::RenderFailed {
@@ -206,7 +221,7 @@ impl TemplateEngine {
         fields: &Value,
         rule_name: &str,
     ) -> RenderedMessage {
-        match self.render(template_name, fields) {
+        match self.render(template_name, fields, rule_name) {
             Ok(msg) => {
                 tracing::trace!(rule_name = %rule_name, "Template render successful");
                 msg
@@ -230,6 +245,21 @@ impl TemplateEngine {
                 }
             }
         }
+    }
+}
+
+/// Inject the synthetic `rule_name` key into a render context (issue #31).
+///
+/// The synthetic value wins over any event field literally named `rule_name`
+/// so operators can rely on `{{ rule_name }}` consistently across layer 1
+/// and layer 2 templates. If `ctx` is not a JSON object (should not happen
+/// in practice — VL events are always objects), injection is skipped.
+fn inject_rule_name(ctx: &mut Value, rule_name: &str) {
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.insert(
+            "rule_name".to_string(),
+            Value::String(rule_name.to_string()),
+        );
     }
 }
 
@@ -290,7 +320,7 @@ mod tests {
             "message": "CPU usage high"
         });
 
-        let result = engine.render("alert", &fields).unwrap();
+        let result = engine.render("alert", &fields, "test_rule").unwrap();
 
         assert_eq!(result.title, "Alert: server-01");
         assert_eq!(result.body, "Host server-01 reported: CPU usage high");
@@ -315,12 +345,12 @@ mod tests {
 
         // Test critical severity
         let fields_critical = json!({"severity": "critical"});
-        let result = engine.render("alert", &fields_critical).unwrap();
+        let result = engine.render("alert", &fields_critical, "test_rule").unwrap();
         assert_eq!(result.title, "🚨 CRITICAL");
 
         // Test non-critical severity
         let fields_warning = json!({"severity": "warning"});
-        let result = engine.render("alert", &fields_warning).unwrap();
+        let result = engine.render("alert", &fields_warning, "test_rule").unwrap();
         assert_eq!(result.title, "⚠️ Warning");
     }
 
@@ -350,7 +380,7 @@ mod tests {
             }
         });
 
-        let result = engine.render("alert", &fields).unwrap();
+        let result = engine.render("alert", &fields, "test_rule").unwrap();
 
         assert_eq!(result.title, "Server: prod-server-01");
         assert_eq!(result.body, "Region: us-east-1, Status: alert");
@@ -372,7 +402,7 @@ mod tests {
         let fields = json!({"host": "server-01"});
 
         // Should NOT return an error, missing field renders as empty string
-        let result = engine.render("alert", &fields).unwrap();
+        let result = engine.render("alert", &fields, "test_rule").unwrap();
 
         assert_eq!(result.title, "Host: server-01");
         assert_eq!(result.body, "Missing: "); // Empty string for missing field
@@ -396,7 +426,7 @@ mod tests {
             "body": "Something went wrong"
         });
 
-        let result = engine.render("full_alert", &fields).unwrap();
+        let result = engine.render("full_alert", &fields, "test_rule").unwrap();
 
         assert_eq!(result.title, "Critical Alert");
         assert_eq!(result.body, "Something went wrong");
@@ -413,7 +443,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
 
         let fields = json!({"host": "server-01"});
-        let result = engine.render("nonexistent", &fields);
+        let result = engine.render("nonexistent", &fields, "test_rule");
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -437,7 +467,7 @@ mod tests {
         let fields = json!({"host": "server-01"});
 
         // render() should return error
-        let result = engine.render("bad_template", &fields);
+        let result = engine.render("bad_template", &fields, "test_rule");
         assert!(result.is_err());
 
         // render_with_fallback() should return fallback message
@@ -466,11 +496,11 @@ mod tests {
 
         // Render for "rule 1"
         let fields1 = json!({"host": "server-01", "message": "Error A"});
-        let result1 = engine.render("shared_template", &fields1).unwrap();
+        let result1 = engine.render("shared_template", &fields1, "rule_1").unwrap();
 
         // Render for "rule 2" with different data
         let fields2 = json!({"host": "server-02", "message": "Error B"});
-        let result2 = engine.render("shared_template", &fields2).unwrap();
+        let result2 = engine.render("shared_template", &fields2, "rule_2").unwrap();
 
         // Both should render correctly with their own data
         assert_eq!(result1.title, "Alert from server-01");
@@ -495,7 +525,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({});
 
-        let result = engine.render("alert", &fields).unwrap();
+        let result = engine.render("alert", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "Static Title");
         assert_eq!(result.body, "Static Body");
     }
@@ -583,7 +613,7 @@ mod tests {
             "items": ["apple", "banana", "cherry"]
         });
 
-        let result = engine.render("list", &fields).unwrap();
+        let result = engine.render("list", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "Items (3)");
         assert!(result.body.contains("- apple"));
         assert!(result.body.contains("- banana"));
@@ -599,7 +629,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"host": "server-01"});
 
-        let result = engine.render("empty", &fields).unwrap();
+        let result = engine.render("empty", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "");
         assert_eq!(result.body, "");
     }
@@ -625,7 +655,7 @@ mod tests {
             }
         });
 
-        let result = engine.render("deep", &fields).unwrap();
+        let result = engine.render("deep", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "deep_value");
     }
 
@@ -661,7 +691,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"host": "server-01"});
 
-        let result = engine.render("email_alert", &fields).unwrap();
+        let result = engine.render("email_alert", &fields, "test_rule").unwrap();
 
         assert_eq!(result.title, "Alert: server-01");
         assert_eq!(result.body, "Host server-01 down");
@@ -684,7 +714,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"hostname": "<script>alert(1)</script>"});
 
-        let result = engine.render("email_alert", &fields).unwrap();
+        let result = engine.render("email_alert", &fields, "test_rule").unwrap();
 
         let email_body_html = result.email_body_html.unwrap();
         // HTML should be escaped
@@ -718,7 +748,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"nginx.http.request_id": "abc"});
 
-        let result = engine.render("alert", &fields).unwrap();
+        let result = engine.render("alert", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "abc");
         assert_eq!(result.body, "id=abc");
     }
@@ -746,7 +776,7 @@ mod tests {
             "nginx.http.status_code": "400"
         });
 
-        let result = engine.render("my_template", &fields).unwrap();
+        let result = engine.render("my_template", &fields, "test_rule").unwrap();
         assert_eq!(result.title, "T");
         assert_eq!(result.body, "B");
         let email_body_html = result.email_body_html.unwrap();
@@ -757,6 +787,88 @@ mod tests {
             "expected all dotted fields rendered, got: {}",
             email_body_html
         );
+    }
+
+    // ===================================================================
+    // Issue #31: rule_name available in layer 1 templates (title, body,
+    // email_body_html) and in the throttle key, not only in layer 2
+    // notifier-level subject_template / body_template contexts.
+    // ===================================================================
+
+    #[test]
+    fn render_injects_rule_name_in_title() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "alert".to_string(),
+            make_template("Alert {{ rule_name }}", "body"),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"host": "server-01"});
+
+        let result = engine.render("alert", &fields, "VM_OFF").unwrap();
+        assert_eq!(result.title, "Alert VM_OFF");
+    }
+
+    #[test]
+    fn render_injects_rule_name_in_body() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "alert".to_string(),
+            make_template(
+                "title",
+                "rule={{ rule_name }}\nhost={{ host }}\nrule_again={{ rule_name }}",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"host": "server-01"});
+
+        let result = engine.render("alert", &fields, "VM_OFF").unwrap();
+        assert_eq!(
+            result.body,
+            "rule=VM_OFF\nhost=server-01\nrule_again=VM_OFF"
+        );
+    }
+
+    #[test]
+    fn render_injects_rule_name_in_email_body_html() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "email_alert".to_string(),
+            make_template_with_email_body_html(
+                "t",
+                "b",
+                "<p>Rule: {{ rule_name }} on {{ host }}</p>",
+            ),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"host": "server-01"});
+
+        let result = engine.render("email_alert", &fields, "VM_OFF").unwrap();
+        assert_eq!(
+            result.email_body_html.unwrap(),
+            "<p>Rule: VM_OFF on server-01</p>"
+        );
+    }
+
+    #[test]
+    fn render_rule_name_synthetic_overrides_event_field() {
+        // Collision policy: synthetic rule_name wins over any event field
+        // literally named "rule_name".
+        let mut templates = HashMap::new();
+        templates.insert(
+            "alert".to_string(),
+            make_template("{{ rule_name }}", "{{ rule_name }}"),
+        );
+
+        let engine = TemplateEngine::new(templates);
+        let fields = json!({"rule_name": "event-value", "host": "server-01"});
+
+        let result = engine.render("alert", &fields, "VM_OFF").unwrap();
+        assert_eq!(result.title, "VM_OFF");
+        assert_eq!(result.body, "VM_OFF");
     }
 
     #[test]
@@ -770,7 +882,7 @@ mod tests {
         let engine = TemplateEngine::new(templates);
         let fields = json!({"host": "server-01"});
 
-        let result = engine.render("mattermost_alert", &fields).unwrap();
+        let result = engine.render("mattermost_alert", &fields, "test_rule").unwrap();
 
         assert!(
             result.email_body_html.is_none(),
