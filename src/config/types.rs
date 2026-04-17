@@ -83,7 +83,7 @@ struct LegacyVictoriaLogsConfig {
 
 /// Migration error text pointing users from the v1 single-URL shape to the
 /// v2 map shape. Exposed so tests can assert wording.
-pub(crate) const LEGACY_VL_MIGRATION_MESSAGE: &str = "`victorialogs` is now a map of named sources (breaking change in v2.0.0).\n\nMigrate from:\n  victorialogs:\n    url: \"http://...\"\n    basic_auth:\n      username: \"u\"\n      password: \"p\"\nTo:\n  victorialogs:\n    default:\n      url: \"http://...\"\n      basic_auth:\n        username: \"u\"\n        password: \"p\"\n\nThen optionally target sources per rule via `vl_sources: [default]` (or omit to fan out across all sources). See CHANGELOG v2.0.0 for the full migration note.";
+pub(crate) const LEGACY_VL_MIGRATION_MESSAGE: &str = "\nConfiguration incompatible with valerter v2.0.0.\n\nYour config uses the v1.x single-URL shape (`victorialogs.url`), replaced by a map of named sources in v2.\n\nMigrate from:\n  victorialogs:\n    url: \"http://...\"\n    basic_auth:\n      username: \"u\"\n      password: \"p\"\nTo:\n  victorialogs:\n    default:\n      url: \"http://...\"\n      basic_auth:\n        username: \"u\"\n        password: \"p\"\n\nThen optionally target sources per rule via `vl_sources: [default]` (or omit to fan out across all sources).\n\nFull migration guide: https://github.com/fxthiry/valerter/blob/main/MIGRATION.md\nRollback: install the last v1.x release from https://github.com/fxthiry/valerter/releases";
 
 /// Deserialize `victorialogs` as `BTreeMap<String, VlSourceConfig>`, but
 /// emit a migration-oriented error when the legacy single-object shape
@@ -615,7 +615,7 @@ impl Config {
             for (name, notifier) in notifiers {
                 match notifier {
                     super::notifiers::NotifierConfig::Mattermost(cfg) => {
-                        if let Err(e) = validate_url(&cfg.webhook_url) {
+                        if let Err(e) = validate_url(cfg.webhook_url.expose()) {
                             errors.push(ConfigError::ValidationError(format!(
                                 "notifier '{}': webhook_url: {}",
                                 name, e
@@ -623,7 +623,7 @@ impl Config {
                         }
                     }
                     super::notifiers::NotifierConfig::Webhook(cfg) => {
-                        if let Err(e) = validate_url(&cfg.url) {
+                        if let Err(e) = validate_url(cfg.url.expose()) {
                             errors.push(ConfigError::ValidationError(format!(
                                 "notifier '{}': url: {}",
                                 name, e

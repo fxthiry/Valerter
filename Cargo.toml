@@ -1,6 +1,6 @@
 [package]
 name = "valerter"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"

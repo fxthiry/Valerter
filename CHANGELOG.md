@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-04-17
+
+Hardening patch after the v2.0.0 release. No new features, no breaking changes. Three fixes bundled into one coherent "post-v2.0.0 durability" release.
+
+### Security
+
+- **Notifier config secrets wrapped in `SecretString`**. `TelegramNotifierConfig.bot_token`, `MattermostNotifierConfig.webhook_url`, `WebhookNotifierConfig.url`, `WebhookNotifierConfig.headers` values, and `SmtpConfig.password` are now `SecretString` rather than raw `String`. A `format!("{:?}", config)` or a tracing context that captures the parsed config renders `[REDACTED]` instead of the actual value. Prior to this, the token lived as a plain `String` until notifier construction time, so any debug-log or error context that carried the config body would leak the secret. A regression-guard unit test (`notifier_config_debug_never_leaks_secrets`) runs canary values through each notifier config's `Debug` output and asserts none appear.
+
+### Fixed
+
+- **Migration error on v1.x configs now points to MIGRATION.md and covers rollback** (D-doc-1). Loading a v1.x `victorialogs.url`-shape config against v2.x used to emit a serde-flavoured error that referenced the CHANGELOG only. The new message leads with a human-readable "Configuration incompatible with valerter v2.0.0", includes the before/after YAML diff, a direct link to `MIGRATION.md`, and a rollback hint pointing at the GitHub releases page.
+
+- **`valerter_vl_source_up` gauge debounced to 3 consecutive failures** (D-vl-obs-1). The gauge used to flip to `0` on any single HTTP 5xx, connection error, or mid-stream EOF, which made sources behind a flaky load balancer flap their reachability state and page operators on transient events. The flip is now gated by `VL_SOURCE_UP_FAILURE_THRESHOLD = 3` (fixed, not configurable): three consecutive failures before `0`, any single success resets the counter back to `1` and re-arms the debounce. Contract unchanged for persistently-down sources.
+
 ## [2.0.0] - 2026-04-16
 
 ### Security advisory

@@ -160,7 +160,7 @@ impl EmailNotifier {
             .smtp
             .password
             .as_ref()
-            .map(|p| resolve_env_vars(p))
+            .map(|p| resolve_env_vars(p.expose()))
             .transpose()
             .map_err(|e| ConfigError::InvalidNotifier {
                 name: name.to_string(),
@@ -661,7 +661,7 @@ impl std::fmt::Debug for EmailNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EmailNotifierConfig, SmtpConfig, TlsMode};
+    use crate::config::{EmailNotifierConfig, SecretString, SmtpConfig, TlsMode};
     use crate::template::RenderedMessage;
     use serial_test::serial;
     use std::sync::Mutex;
@@ -938,7 +938,7 @@ mod tests {
     fn from_config_fails_with_password_without_username() {
         let mut config = make_test_config();
         config.smtp.username = None;
-        config.smtp.password = Some("pass".to_string());
+        config.smtp.password = Some(SecretString::new("pass".to_string()));
 
         let result = EmailNotifier::from_config("no-username", &config, &test_config_dir());
 
@@ -964,7 +964,7 @@ mod tests {
             || {
                 let mut config = make_test_config();
                 config.smtp.username = Some("${TEST_SMTP_USER}".to_string());
-                config.smtp.password = Some("${TEST_SMTP_PASS}".to_string());
+                config.smtp.password = Some(SecretString::new("${TEST_SMTP_PASS}".to_string()));
 
                 let result = EmailNotifier::from_config("env-creds", &config, &test_config_dir());
 
@@ -985,7 +985,7 @@ mod tests {
         temp_env::with_var("UNDEFINED_SMTP_VAR", None::<&str>, || {
             let mut config = make_test_config();
             config.smtp.username = Some("${UNDEFINED_SMTP_VAR}".to_string());
-            config.smtp.password = Some("somepass".to_string());
+            config.smtp.password = Some(SecretString::new("somepass".to_string()));
 
             let result = EmailNotifier::from_config("bad-env", &config, &test_config_dir());
 
@@ -1168,7 +1168,7 @@ mod tests {
             || {
                 let mut config = make_test_config();
                 config.smtp.username = Some("${TEST_DBG_USER}".to_string());
-                config.smtp.password = Some("${TEST_DBG_PASS}".to_string());
+                config.smtp.password = Some(SecretString::new("${TEST_DBG_PASS}".to_string()));
 
                 let notifier =
                     EmailNotifier::from_config("cred-email", &config, &test_config_dir()).unwrap();

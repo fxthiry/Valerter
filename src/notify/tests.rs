@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::config::{
-    EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SmtpConfig,
+    EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SecretString, SmtpConfig,
     TelegramNotifierConfig, TlsMode, WebhookNotifierConfig,
 };
 use crate::error::NotifyError;
@@ -234,7 +234,7 @@ fn registry_from_config_creates_mattermost_notifiers() {
             notifiers_config.insert(
                 "mattermost-infra".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${TEST_MM_WEBHOOK}".to_string(),
+                    webhook_url: SecretString::new("${TEST_MM_WEBHOOK}".to_string()),
                     channel: Some("infra-alerts".to_string()),
                     username: Some("valerter".to_string()),
                     icon_url: None,
@@ -243,7 +243,9 @@ fn registry_from_config_creates_mattermost_notifiers() {
             notifiers_config.insert(
                 "mattermost-ops".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "https://static.example.com/hooks/static".to_string(),
+                    webhook_url: SecretString::new(
+                        "https://static.example.com/hooks/static".to_string(),
+                    ),
                     channel: None,
                     username: None,
                     icon_url: None,
@@ -282,7 +284,7 @@ fn registry_from_config_fails_on_undefined_env_var() {
         notifiers_config.insert(
             "bad-notifier".to_string(),
             NotifierConfig::Mattermost(MattermostNotifierConfig {
-                webhook_url: "${UNDEFINED_WEBHOOK_VAR}".to_string(),
+                webhook_url: SecretString::new("${UNDEFINED_WEBHOOK_VAR}".to_string()),
                 channel: None,
                 username: None,
                 icon_url: None,
@@ -324,7 +326,7 @@ fn registry_from_config_collects_all_errors() {
             notifiers_config.insert(
                 "bad-notifier-1".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${UNDEFINED_VAR_1}".to_string(),
+                    webhook_url: SecretString::new("${UNDEFINED_VAR_1}".to_string()),
                     channel: None,
                     username: None,
                     icon_url: None,
@@ -333,7 +335,7 @@ fn registry_from_config_collects_all_errors() {
             notifiers_config.insert(
                 "bad-notifier-2".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${UNDEFINED_VAR_2}".to_string(),
+                    webhook_url: SecretString::new("${UNDEFINED_VAR_2}".to_string()),
                     channel: None,
                     username: None,
                     icon_url: None,
@@ -374,15 +376,18 @@ fn registry_from_config_creates_webhook_notifiers() {
         notifiers_config.insert(
             "webhook-alerts".to_string(),
             NotifierConfig::Webhook(WebhookNotifierConfig {
-                url: "https://api.example.com/alerts".to_string(),
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
                 method: "POST".to_string(),
                 headers: {
                     let mut h = std::collections::HashMap::new();
                     h.insert(
                         "Authorization".to_string(),
-                        "Bearer ${TEST_WEBHOOK_TOKEN}".to_string(),
+                        SecretString::new("Bearer ${TEST_WEBHOOK_TOKEN}".to_string()),
                     );
-                    h.insert("Content-Type".to_string(), "application/json".to_string());
+                    h.insert(
+                        "Content-Type".to_string(),
+                        SecretString::new("application/json".to_string()),
+                    );
                     h
                 },
                 body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
@@ -414,7 +419,7 @@ fn registry_from_config_webhook_with_defaults() {
     notifiers_config.insert(
         "simple-webhook".to_string(),
         NotifierConfig::Webhook(WebhookNotifierConfig {
-            url: "https://api.example.com/hook".to_string(),
+            url: SecretString::new("https://api.example.com/hook".to_string()),
             method: "POST".to_string(),
             headers: std::collections::HashMap::new(),
             body_template: None,
@@ -441,13 +446,13 @@ fn registry_from_config_webhook_fails_on_undefined_env_var() {
         notifiers_config.insert(
             "bad-webhook".to_string(),
             NotifierConfig::Webhook(WebhookNotifierConfig {
-                url: "https://api.example.com/alerts".to_string(),
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
                 method: "POST".to_string(),
                 headers: {
                     let mut h = std::collections::HashMap::new();
                     h.insert(
                         "Authorization".to_string(),
-                        "Bearer ${UNDEFINED_WEBHOOK_TOKEN}".to_string(),
+                        SecretString::new("Bearer ${UNDEFINED_WEBHOOK_TOKEN}".to_string()),
                     );
                     h
                 },
@@ -489,7 +494,7 @@ fn registry_from_config_mixed_notifiers() {
             notifiers_config.insert(
                 "mattermost-1".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${TEST_MM_WEBHOOK_MIXED}".to_string(),
+                    webhook_url: SecretString::new("${TEST_MM_WEBHOOK_MIXED}".to_string()),
                     channel: None,
                     username: None,
                     icon_url: None,
@@ -498,13 +503,13 @@ fn registry_from_config_mixed_notifiers() {
             notifiers_config.insert(
                 "webhook-1".to_string(),
                 NotifierConfig::Webhook(WebhookNotifierConfig {
-                    url: "https://api.example.com/alerts".to_string(),
+                    url: SecretString::new("https://api.example.com/alerts".to_string()),
                     method: "POST".to_string(),
                     headers: {
                         let mut h = std::collections::HashMap::new();
                         h.insert(
                             "X-API-Key".to_string(),
-                            "${TEST_WH_TOKEN_MIXED}".to_string(),
+                            SecretString::new("${TEST_WH_TOKEN_MIXED}".to_string()),
                         );
                         h
                     },
@@ -767,7 +772,7 @@ fn registry_from_config_email_with_auth() {
                         host: "smtp.example.com".to_string(),
                         port: 587,
                         username: Some("${TEST_SMTP_USER_REG}".to_string()),
-                        password: Some("${TEST_SMTP_PASS_REG}".to_string()),
+                        password: Some(SecretString::new("${TEST_SMTP_PASS_REG}".to_string())),
                         tls: TlsMode::Starttls,
                         tls_verify: true,
                     },
@@ -806,7 +811,7 @@ fn registry_from_config_email_fails_on_undefined_env_var() {
                     host: "smtp.example.com".to_string(),
                     port: 587,
                     username: Some("${UNDEFINED_SMTP_VAR_REG}".to_string()),
-                    password: Some("somepass".to_string()),
+                    password: Some(SecretString::new("somepass".to_string())),
                     tls: TlsMode::Starttls,
                     tls_verify: true,
                 },
@@ -886,7 +891,7 @@ fn registry_from_config_all_three_notifier_types() {
             notifiers_config.insert(
                 "mattermost".to_string(),
                 NotifierConfig::Mattermost(MattermostNotifierConfig {
-                    webhook_url: "${TEST_MM_ALL_TYPES}".to_string(),
+                    webhook_url: SecretString::new("${TEST_MM_ALL_TYPES}".to_string()),
                     channel: None,
                     username: None,
                     icon_url: None,
@@ -897,7 +902,7 @@ fn registry_from_config_all_three_notifier_types() {
             notifiers_config.insert(
                 "webhook".to_string(),
                 NotifierConfig::Webhook(WebhookNotifierConfig {
-                    url: "https://api.example.com/alerts".to_string(),
+                    url: SecretString::new("https://api.example.com/alerts".to_string()),
                     method: "POST".to_string(),
                     headers: std::collections::HashMap::new(),
                     body_template: None,
@@ -953,7 +958,7 @@ fn registry_from_config_creates_telegram_notifier() {
     notifiers_config.insert(
         "telegram-infra".to_string(),
         NotifierConfig::Telegram(TelegramNotifierConfig {
-            bot_token: "fake-token-123".to_string(),
+            bot_token: SecretString::new("fake-token-123".to_string()),
             chat_ids: vec!["-100123".to_string(), "-100456".to_string()],
             parse_mode: Some("HTML".to_string()),
             disable_notification: None,
@@ -987,7 +992,7 @@ fn registry_from_config_propagates_telegram_validation_errors() {
     notifiers_config.insert(
         "telegram-broken".to_string(),
         NotifierConfig::Telegram(TelegramNotifierConfig {
-            bot_token: "fake-token".to_string(),
+            bot_token: SecretString::new("fake-token".to_string()),
             chat_ids: vec![],
             parse_mode: None,
             disable_notification: None,
