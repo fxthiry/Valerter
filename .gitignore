@@ -28,3 +28,4 @@ _bmad-output/
 # Claude Code settings
 .claude/
 .agent/
+CLAUDE.md

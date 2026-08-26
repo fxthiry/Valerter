@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Templates referencing fields with `/` in their name now get an actionable validation error** (#41). `{{ ocp.annotations.authentication.openshift.io/username }}` fails in Jinja because `/` is the division operator. `valerter --validate` now appends a hint with the working bracket-notation rewrite (`{{ ocp.annotations.authentication.openshift["io/username"] }}`). Documented in `docs/configuration.md#fields-with-special-characters`.
+
+- **Queries using pipes unsupported by `/tail` are rejected at validation time** (#42). `stats`, `sort`, `top`, `uniq`, `limit`, `offset`, `first`, `last`, `facets`, `join`, `field_names`, `field_values`, `block_stats`, `blocks_count` and `union` need the full result set and are refused by the VictoriaLogs `/tail` endpoint with HTTP 400, which previously showed up as an endless opaque reconnect loop. The rule now fails `--validate` with an explicit message. Documented in `docs/configuration.md#logsql-query-restrictions`.
+
+- **Non-2xx VictoriaLogs responses now log the response body** (truncated to 512 chars) alongside the status code, so the actual server-side error message is visible in `journalctl` instead of a bare `status=400 Bad Request`.
+
 ## [2.0.1] - 2026-04-17
 
 Hardening patch after the v2.0.0 release. No new features, no breaking changes. Three fixes bundled into one coherent "post-v2.0.0 durability" release.

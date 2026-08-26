@@ -87,6 +87,26 @@ pub struct TailConfig {
     pub tls: Option<TlsConfig>,
 }
 
+/// Maximum number of characters of an error response body kept in logs.
+const ERROR_BODY_MAX_CHARS: usize = 512;
+
+/// Reads the body of a non-2xx VictoriaLogs response so the actual error
+/// (e.g. `unsupported pipe "stats" in /tail`) surfaces in logs instead of a
+/// bare status code (issue #42). Truncated and collapsed to a single line.
+async fn response_error_body(resp: reqwest::Response) -> String {
+    let text = resp.text().await.unwrap_or_default();
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "<empty body>".to_string();
+    }
+    if one_line.chars().count() > ERROR_BODY_MAX_CHARS {
+        let cut: String = one_line.chars().take(ERROR_BODY_MAX_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        one_line
+    }
+}
+
 impl TailConfig {
     /// Build a `TailConfig` from a named VL source and a rule query.
     ///
@@ -215,9 +235,10 @@ impl TailClient {
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response_error_body(response).await;
             return Err(StreamError::ConnectionFailed(format!(
-                "HTTP {}",
-                response.status()
+                "HTTP {status}: {body}"
             )));
         }
 
@@ -396,10 +417,13 @@ impl TailClient {
                     log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
+                    let status = resp.status();
+                    let body = response_error_body(resp).await;
                     warn!(
                         rule_name = %rule_name,
                         vl_source = %vl_source,
-                        status = %resp.status(),
+                        status = %status,
+                        response = %body,
                         "HTTP error from VictoriaLogs"
                     );
                     continue;
