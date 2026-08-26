@@ -148,10 +148,23 @@ pub(crate) fn validate_tail_query(query: &str) -> Result<(), String> {
 }
 
 /// Validates a URL string.
+///
+/// The URL is deliberately NOT echoed in the error: webhook URLs carry
+/// secrets and this message ends up in logs.
+///
+/// Values containing an unresolved `${VAR}` placeholder are accepted here;
+/// they are resolved (and re-checked) when the notifier is built.
 pub(crate) fn validate_url(url: &str) -> Result<(), String> {
-    reqwest::Url::parse(url)
-        .map(|_| ())
-        .map_err(|e| format!("invalid URL '{}': {}", url, e))
+    if url.contains("${") {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(format!(
+            "invalid URL: unsupported scheme '{other}' (expected http or https)"
+        )),
+    }
 }
 
 /// Validates a hex color string in format #rrggbb.
@@ -337,5 +350,20 @@ mod tests {
         assert!(validate_tail_query(r#"_stream:{host="s1"} | json | cpu > 90"#).is_ok());
         assert!(validate_tail_query("error | extract \"<a> <b>\" | filter a:x").is_ok());
         assert!(validate_tail_query("_msg:~\"stats by\"").is_ok());
+    }
+
+    #[test]
+    fn validate_url_does_not_echo_secret_and_rejects_bad_schemes() {
+        let err = validate_url("htps://mm.example.com/hooks/SECRET").unwrap_err();
+        assert!(!err.contains("SECRET"), "{err}");
+        let err = validate_url("ftp://example.com/x").unwrap_err();
+        assert!(err.contains("unsupported scheme"), "{err}");
+        assert!(validate_url("https://example.com/hooks/x").is_ok());
+    }
+
+    #[test]
+    fn validate_url_accepts_unresolved_env_placeholder() {
+        assert!(validate_url("${MATTERMOST_WEBHOOK}").is_ok());
+        assert!(validate_url("https://h/hooks/${TOKEN}").is_ok());
     }
 }

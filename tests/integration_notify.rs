@@ -696,6 +696,57 @@ async fn test_webhook_retry_on_500_then_success() {
 }
 
 #[tokio::test]
+async fn test_webhook_retry_on_429_then_success() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let mock_server = MockServer::start().await;
+    let request_count = Arc::new(AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                ResponseTemplate::new(429) // rate limited: must be retried
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let webhook_url = format!("{}/api/alerts", mock_server.uri());
+
+    let queue = NotificationQueue::new(10);
+    let registry = make_webhook_registry(
+        "retry-429-webhook",
+        &webhook_url,
+        "POST",
+        HashMap::new(),
+        None,
+    );
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let payload =
+        make_payload_with_destinations("retry_rule", vec!["retry-429-webhook".to_string()]);
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    mock_server.verify().await;
+}
+
+#[tokio::test]
 async fn test_webhook_no_retry_on_400() {
     let mock_server = MockServer::start().await;
 

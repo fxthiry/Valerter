@@ -209,7 +209,10 @@ impl Notifier for MattermostNotifier {
                         .increment(1);
                         return Ok(());
                     }
-                    Ok(response) if response.status().is_client_error() => {
+                    Ok(response)
+                        if response.status().is_client_error()
+                            && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                    {
                         // 4xx errors: don't retry (invalid payload, bad webhook)
                         let status = response.status();
                         tracing::error!(
@@ -236,7 +239,7 @@ impl Notifier for MattermostNotifier {
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
                     }
                     Ok(response) => {
-                        // 5xx errors: retry
+                        // 5xx and 429 errors: retry
                         tracing::warn!(
                             attempt = attempt,
                             status = %response.status(),
@@ -247,7 +250,7 @@ impl Notifier for MattermostNotifier {
                         // Network errors: retry
                         tracing::warn!(
                             attempt = attempt,
-                            error = %e,
+                            error = %e.without_url(),
                             "Failed to send to Mattermost, retrying"
                         );
                     }

@@ -288,7 +288,10 @@ impl Notifier for WebhookNotifier {
                         .increment(1);
                         return Ok(());
                     }
-                    Ok(response) if response.status().is_client_error() => {
+                    Ok(response)
+                        if response.status().is_client_error()
+                            && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                    {
                         // 4xx errors: don't retry (AC5)
                         let status = response.status();
                         tracing::error!(
@@ -315,7 +318,7 @@ impl Notifier for WebhookNotifier {
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
                     }
                     Ok(response) => {
-                        // 5xx errors: retry (AC5)
+                        // 5xx and 429 errors: retry (AC5)
                         tracing::warn!(
                             attempt = attempt,
                             status = %response.status(),
@@ -326,7 +329,7 @@ impl Notifier for WebhookNotifier {
                         // Network errors: retry (AC5)
                         tracing::warn!(
                             attempt = attempt,
-                            error = %e,
+                            error = %e.without_url(),
                             "Failed to send webhook, retrying"
                         );
                     }

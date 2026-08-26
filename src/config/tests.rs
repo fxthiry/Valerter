@@ -2519,3 +2519,156 @@ rules:
         .validate()
         .expect("17 streams under default cap of 50 should validate");
 }
+
+fn v203_yaml(rules: &str) -> String {
+    format!(
+        r#"
+victorialogs:
+  vlprod:
+    url: "http://vl:9428"
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+defaults:
+  throttle: {{ count: 5, window: 60s }}
+templates:
+  default:
+    title: "t"
+    body: "b"
+rules:
+{rules}
+"#
+    )
+}
+
+fn v203_errors(yaml: &str) -> String {
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    match config.validate() {
+        Ok(()) => String::new(),
+        Err(errors) => errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+#[test]
+fn validate_rejects_duplicate_inline_rule_names() {
+    let yaml = v203_yaml(
+        r#"
+  - name: dupe
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+  - name: dupe
+    query: "error"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(msg.contains("duplicate rule name 'dupe'"), "{msg}");
+}
+
+#[test]
+fn validate_rejects_zero_throttle_count_and_window() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    throttle: { count: 0, window: 0s }
+    notify: { template: default, destinations: [mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(msg.contains("throttle.count must be >= 1"), "{msg}");
+    assert!(msg.contains("throttle.window must be > 0"), "{msg}");
+}
+
+#[test]
+fn validate_accepts_env_placeholder_webhook_url() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+"#,
+    )
+    .replace(
+        r#"webhook_url: "https://mattermost.example.com/hooks/test""#,
+        r#"webhook_url: "${MATTERMOST_WEBHOOK}""#,
+    );
+    assert_eq!(v203_errors(&yaml), "");
+}
+
+#[test]
+fn load_resolves_env_vars_in_victorialogs_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        v203_yaml(
+            r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+"#,
+        )
+        .replace(
+            r#"url: "http://vl:9428""#,
+            r#"url: "${V203_VL_URL}"
+    basic_auth: { username: "${V203_VL_USER}", password: "${V203_VL_PASS}" }
+    headers: { Authorization: "Bearer ${V203_VL_TOKEN}" }"#,
+        ),
+    )
+    .unwrap();
+    // SAFETY: test-local variables with unique names; tests in this module do not read them concurrently.
+    unsafe {
+        std::env::set_var("V203_VL_URL", "http://resolved:9428");
+        std::env::set_var("V203_VL_USER", "alice");
+        std::env::set_var("V203_VL_PASS", "s3cret");
+        std::env::set_var("V203_VL_TOKEN", "tok");
+    }
+    let config = Config::load(&path).expect("load");
+    let src = &config.victorialogs["vlprod"];
+    assert_eq!(src.url, "http://resolved:9428");
+    let auth = src.basic_auth.as_ref().unwrap();
+    assert_eq!(auth.username, "alice");
+    assert_eq!(auth.password.expose(), "s3cret");
+    assert_eq!(
+        src.headers.as_ref().unwrap()["Authorization"].expose(),
+        "Bearer tok"
+    );
+}
+
+#[test]
+fn load_fails_on_undefined_env_var_in_victorialogs_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        v203_yaml(
+            r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+"#,
+        )
+        .replace(
+            r#"url: "http://vl:9428""#,
+            r#"url: "${V203_DEFINITELY_UNSET}""#,
+        ),
+    )
+    .unwrap();
+    let err = Config::load(&path).expect_err("must fail").to_string();
+    assert!(
+        err.contains("vlprod") && err.contains("V203_DEFINITELY_UNSET"),
+        "{err}"
+    );
+}

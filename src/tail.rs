@@ -87,8 +87,38 @@ pub struct TailConfig {
     pub tls: Option<TlsConfig>,
 }
 
+/// TCP connect timeout. Without it a blackholed host blocks each attempt for
+/// the OS SYN timeout (~2 min on Linux) on top of the backoff.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum number of characters of an error response body kept in logs.
 const ERROR_BODY_MAX_CHARS: usize = 512;
+
+/// Drain complete lines from the buffer. Invalid UTF-8 is logged, counted and
+/// dropped instead of propagated: it used to bubble up as a fatal
+/// `StreamError::Utf8Error` that killed the (rule, source) task for good.
+fn drain_lines_lenient(buffer: &mut StreamBuffer, rule_name: &str, vl_source: &str) -> Vec<String> {
+    match buffer.drain_complete_lines() {
+        Ok(lines) => lines,
+        Err(e) => {
+            warn!(
+                rule_name = %rule_name,
+                vl_source = %vl_source,
+                error = %e,
+                "Discarding log data with invalid UTF-8"
+            );
+            metrics::counter!(
+                "valerter_lines_discarded_total",
+                "rule_name" => rule_name.to_string(),
+                "vl_source" => vl_source.to_string(),
+                "reason" => "invalid_utf8",
+            )
+            .increment(1);
+            buffer.clear();
+            Vec::new()
+        }
+    }
+}
 
 /// Reads the body of a non-2xx VictoriaLogs response so the actual error
 /// (e.g. `unsupported pipe "stats" in /tail`) surfaces in logs instead of a
@@ -152,6 +182,7 @@ impl TailClient {
 
         let client = builder
             .tcp_keepalive(TCP_KEEPALIVE)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
@@ -271,7 +302,7 @@ impl TailClient {
                 .increment(1);
                 continue;
             }
-            let lines = self.buffer.drain_complete_lines()?;
+            let lines = drain_lines_lenient(&mut self.buffer, rule_name, vl_source);
 
             for line in lines {
                 if !line.is_empty() {
@@ -355,8 +386,14 @@ impl TailClient {
         let mut attempt: u32 = 0;
         let mut had_failure = false;
         let mut consecutive_failures: u32 = 0;
+        // Consecutive clean EOFs with no data received (server closing the
+        // tail right away): backed off separately from real failures.
+        let mut empty_eof_streak: u32 = 0;
 
         loop {
+            // Never glue a partial line from the previous connection to the
+            // first bytes of the new one.
+            self.buffer.clear();
             let url = self.build_url();
             debug!(
                 rule_name = %rule_name,
@@ -413,10 +450,6 @@ impl TailClient {
                     }
 
                     had_failure = true;
-                    let delay = backoff_delay_with_jitter(attempt);
-                    log_reconnection_attempt(rule_name, vl_source, attempt, delay);
-                    tokio::time::sleep(delay).await;
-                    attempt = attempt.saturating_add(1);
                     let status = resp.status();
                     let body = response_error_body(resp).await;
                     warn!(
@@ -426,6 +459,10 @@ impl TailClient {
                         response = %body,
                         "HTTP error from VictoriaLogs"
                     );
+                    let delay = backoff_delay_with_jitter(attempt);
+                    log_reconnection_attempt(rule_name, vl_source, attempt, delay);
+                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(e) => {
@@ -504,7 +541,7 @@ impl TailClient {
                             .increment(1);
                             continue;
                         }
-                        let lines = self.buffer.drain_complete_lines()?;
+                        let lines = drain_lines_lenient(&mut self.buffer, rule_name, vl_source);
 
                         for line in lines {
                             if !line.is_empty() {
@@ -546,16 +583,35 @@ impl TailClient {
                 }
             }
 
-            // Stream ended (server closed connection) - reconnect
-            if !had_failure {
-                // Normal stream end, not a failure - still need to reconnect
-                debug!(
-                    rule_name = %rule_name,
-                    vl_source = %vl_source,
-                    "Stream ended, reconnecting"
-                );
+            // Stream ended cleanly (server closed the connection with no
+            // error). This is not a failure: `had_failure` stays false so the
+            // throttle cache is NOT reset on the next connect (a benign
+            // disconnect used to let duplicate alert bursts through). It is
+            // still rate-limited: a proxy or VL closing tails immediately
+            // would otherwise spin in a tight connect/EOF loop.
+            if had_failure {
+                continue; // mid-stream error path already slept
             }
-            had_failure = true;
+            if first_chunk_received {
+                empty_eof_streak = 0;
+            } else {
+                empty_eof_streak = empty_eof_streak.saturating_add(1);
+            }
+            let delay = backoff_delay_with_jitter(empty_eof_streak);
+            debug!(
+                rule_name = %rule_name,
+                vl_source = %vl_source,
+                empty_eof_streak = empty_eof_streak,
+                delay_ms = delay.as_millis(),
+                "Stream ended, reconnecting"
+            );
+            metrics::counter!(
+                "valerter_reconnections_total",
+                "rule_name" => rule_name.to_string(),
+                "vl_source" => vl_source.to_string(),
+            )
+            .increment(1);
+            tokio::time::sleep(delay).await;
         }
     }
 }
