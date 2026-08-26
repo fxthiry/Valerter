@@ -415,6 +415,11 @@ sudo chown valerter:valerter /etc/valerter/config.yaml
 
 ### Alternative: Environment Variables
 
+`${VAR_NAME}` placeholders are resolved at startup in notifier secrets
+(`webhook_url`, `url`, `headers`, `bot_token`, SMTP `username`/`password`) and
+in VictoriaLogs sources (`url`, `basic_auth.username`/`password`, `headers`).
+An undefined variable is a load error.
+
 For Kubernetes or orchestrators, use `${VAR_NAME}` syntax:
 
 ```yaml

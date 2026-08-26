@@ -72,6 +72,12 @@ impl StreamBuffer {
         Ok(lines)
     }
 
+    /// Discard any buffered partial line (used when a connection is replaced,
+    /// so a fragment from the old stream is never glued to the new one).
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
     /// Get current buffer size in bytes.
     pub fn len(&self) -> usize {
         self.buffer.len()

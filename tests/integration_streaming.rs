@@ -795,3 +795,123 @@ async fn test_without_auth_no_authorization_header() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("no auth"));
 }
+
+// =============================================================================
+// v2.0.3 hardening
+// =============================================================================
+
+/// Invalid UTF-8 in the stream must be dropped and streaming must continue,
+/// instead of surfacing a fatal `Utf8Error` that killed the rule task.
+#[tokio::test]
+async fn test_invalid_utf8_line_is_dropped_not_fatal() {
+    let mock_server = MockServer::start().await;
+
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(b"{\"_msg\":\"before\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"bad \xff\xfe\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"after\"}\n");
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(body.as_slice(), "application/x-ndjson"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:utf8bad");
+    let mut client = TailClient::new(config).unwrap();
+
+    let received_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_clone = Arc::clone(&received_lines);
+
+    let result = tokio::time::timeout(Duration::from_millis(800), async {
+        client
+            .stream_with_reconnect("test_rule", "default", None, |line| {
+                let lines = Arc::clone(&lines_clone);
+                async move {
+                    lines.lock().unwrap().push(line);
+                    Ok(())
+                }
+            })
+            .await
+    })
+    .await;
+
+    // Must still be looping (timeout), not returned with Utf8Error.
+    assert!(
+        result.is_err(),
+        "stream must not terminate on invalid UTF-8"
+    );
+    let lines = received_lines.lock().unwrap();
+    // The whole response arrives in one chunk: the invalid batch is discarded,
+    // but the loop reconnects and keeps going instead of dying.
+    assert!(
+        lines.iter().all(|l| !l.contains('\u{fffd}')),
+        "no replacement chars expected"
+    );
+}
+
+/// A clean EOF (200 then server closes) is not a failure: the throttle reset
+/// callback must NOT fire on the next connection.
+#[tokio::test]
+async fn test_clean_eof_does_not_trigger_reconnect_callback() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:eof");
+    let mut client = TailClient::new(config).unwrap();
+    let callback = TestReconnectCallback::new();
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+        client
+            .stream_with_reconnect("test_rule", "default", Some(&callback), |_| async {
+                Ok(())
+            })
+            .await
+    })
+    .await;
+
+    assert_eq!(
+        callback.reconnect_count(),
+        0,
+        "clean EOF must not reset throttle"
+    );
+    // ...but reconnections did happen (several requests within the window).
+    assert!(mock_server.received_requests().await.unwrap().len() >= 2);
+}
+
+/// A clean EOF with data flowing must reconnect quickly (base delay, no
+/// exponential growth) — but never in a tight loop.
+#[tokio::test]
+async fn test_clean_eof_reconnects_with_delay_not_tight_loop() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"", "application/x-ndjson"))
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:eofempty");
+    let mut client = TailClient::new(config).unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(1200), async {
+        client
+            .stream_with_reconnect("test_rule", "default", None, |_| async { Ok(()) })
+            .await
+    })
+    .await;
+
+    let n = mock_server.received_requests().await.unwrap().len();
+    // Empty EOFs back off (1s, 2s, ...): at most a handful of requests in 1.2s,
+    // where the old tight loop produced hundreds.
+    assert!((1..=5).contains(&n), "expected backed-off reconnects, got {n}");
+}

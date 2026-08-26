@@ -549,7 +549,34 @@ impl Config {
             config.notifiers = merge_notifiers(config.notifiers, notifiers_from_dir, path)?;
         }
 
+        config.resolve_source_env_vars()?;
+
         Ok(config)
+    }
+
+    /// Resolve `${VAR}` placeholders in every VictoriaLogs source (`url`,
+    /// `basic_auth`, `headers`). Notifier secrets are resolved when the
+    /// registry is built; sources were never resolved at all, so a documented
+    /// `password: "${VL_PASS}"` was sent verbatim to VictoriaLogs.
+    fn resolve_source_env_vars(&mut self) -> Result<(), ConfigError> {
+        use super::env::resolve_env_vars;
+        for (name, source) in self.victorialogs.iter_mut() {
+            let ctx = |e: ConfigError| {
+                ConfigError::ValidationError(format!("victorialogs source '{name}': {e}"))
+            };
+            source.url = resolve_env_vars(&source.url).map_err(ctx)?;
+            if let Some(auth) = source.basic_auth.as_mut() {
+                auth.username = resolve_env_vars(&auth.username).map_err(ctx)?;
+                auth.password =
+                    SecretString::new(resolve_env_vars(auth.password.expose()).map_err(ctx)?);
+            }
+            if let Some(headers) = source.headers.as_mut() {
+                for value in headers.values_mut() {
+                    *value = SecretString::new(resolve_env_vars(value.expose()).map_err(ctx)?);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate all rules (even disabled ones) - AD-11.
@@ -674,7 +701,30 @@ impl Config {
         }
 
         // ===== Rule validations =====
+        let mut seen_rule_names = std::collections::HashSet::new();
         for rule in &self.rules {
+            if !seen_rule_names.insert(rule.name.as_str()) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "duplicate rule name '{}': rule names must be unique (they key throttling and metrics)",
+                    rule.name
+                )));
+            }
+
+            if let Some(ref throttle) = rule.throttle {
+                if throttle.count == 0 {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': throttle.count must be >= 1 (0 would suppress every alert)",
+                        rule.name
+                    )));
+                }
+                if throttle.window.is_zero() {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': throttle.window must be > 0 (0s disables throttling)",
+                        rule.name
+                    )));
+                }
+            }
+
             if let Err(e) = super::validation::validate_tail_query(&rule.query) {
                 errors.push(ConfigError::ValidationError(format!(
                     "rule '{}': invalid query: {}",

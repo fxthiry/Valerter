@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Hardening release driven by a full code review. No new features, no breaking changes.
+
+### Security
+
+- **Webhook and Mattermost URLs no longer leak into logs on network errors.** Both notifiers logged the raw `reqwest::Error`, whose `Display` includes the request URL (i.e. the webhook secret). They now log `error.without_url()` like the Telegram notifier already did.
+- **`validate_url` no longer echoes the URL in its error message.** A malformed `webhook_url` used to print the full value (token included) at startup. It also now restricts schemes to `http`/`https`; other schemes were accepted at validation and failed on the first alert.
+
+### Fixed
+
+- **`${ENV_VAR}` placeholders are now resolved in VictoriaLogs sources** (`url`, `basic_auth.username`/`password`, `headers`). This was documented and shown in `examples/multi-source` but never implemented: the literal `${VL_PASS}` was sent to VictoriaLogs, producing a 401 retry loop. An undefined variable is now a load error naming the source.
+- **`webhook_url: "${MATTERMOST_WEBHOOK}"` (the documented form) no longer fails validation.** `validate_url` ran before env resolution and rejected the placeholder as an invalid URL. Values containing `${` are skipped at validation and checked after resolution.
+- **Invalid UTF-8 in the tail stream no longer kills the rule permanently.** A single bad byte sequence raised `StreamError::Utf8Error`, which the supervisor treated as fatal without respawn: the (rule, source) pair silently stopped alerting until restart. The offending batch is now dropped, logged, and counted in `valerter_lines_discarded_total{reason="invalid_utf8"}`; streaming continues.
+- **Clean stream end (HTTP 200 then EOF) no longer resets the throttle cache nor spins.** It was flagged as a failure, so the next connect fired `on_reconnect` → `Throttler::reset()` and let duplicate bursts through; it also reconnected with no delay. A benign EOF now reconnects after the base backoff (growing only while the server keeps closing immediately with no data), keeps throttle state, and increments `valerter_reconnections_total`.
+- **Stream buffer is cleared on every (re)connection**, so a partial line from a dead connection is never glued to the first bytes of the new one.
+- **HTTP error response body is now read and logged before the backoff sleep**, not after (the v2.0.2 change could log `<empty body>` once the server had closed the connection).
+- **HTTP 429 from Mattermost/webhook endpoints is now retried** with backoff instead of being treated as a permanent client error and dropping the alert.
+- **`connect_timeout` (10s) added to the tail HTTP client.** A blackholed host previously blocked each attempt for the OS SYN timeout (~2 min).
+- **Validation now rejects** duplicate rule names within `config.yaml` (they silently shared throttle keys and metrics), `throttle.count: 0` and `throttle.window: 0s`.
+
 ## [2.0.2] - 2026-08-26
 
 Patch release: actionable validation errors for two user-reported configuration pitfalls, plus dependency bumps clearing all open Dependabot alerts. No new features, no breaking changes.
