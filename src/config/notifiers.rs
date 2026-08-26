@@ -1,5 +1,6 @@
 //! Notifier configurations (Mattermost, Webhook, Email).
 
+use super::secret::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -26,7 +27,7 @@ pub enum NotifierConfig {
 #[serde(deny_unknown_fields)]
 pub struct MattermostNotifierConfig {
     /// Webhook URL (supports `${ENV_VAR}` substitution).
-    pub webhook_url: String,
+    pub webhook_url: SecretString,
     #[serde(default)]
     pub channel: Option<String>,
     #[serde(default)]
@@ -40,11 +41,11 @@ pub struct MattermostNotifierConfig {
 #[serde(deny_unknown_fields)]
 pub struct WebhookNotifierConfig {
     /// Target URL (supports `${ENV_VAR}` substitution).
-    pub url: String,
+    pub url: SecretString,
     #[serde(default = "default_post")]
     pub method: String,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, SecretString>,
     #[serde(default)]
     pub body_template: Option<String>,
 }
@@ -68,7 +69,7 @@ pub struct EmailNotifierConfig {
 #[serde(deny_unknown_fields)]
 pub struct TelegramNotifierConfig {
     /// Bot API token (supports `${ENV_VAR}` substitution).
-    pub bot_token: String,
+    pub bot_token: SecretString,
     /// One or more Telegram chat IDs to send messages to. Must be non-empty.
     pub chat_ids: Vec<String>,
     /// Telegram parse mode for the message text. Defaults to `HTML`.
@@ -94,7 +95,7 @@ pub struct SmtpConfig {
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
     #[serde(default)]
     pub tls: TlsMode,
     #[serde(default = "default_true")]
@@ -133,7 +134,7 @@ mod tests {
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
             NotifierConfig::Mattermost(cfg) => {
-                assert_eq!(cfg.webhook_url, "https://example.com/hooks/test");
+                assert_eq!(cfg.webhook_url.expose(), "https://example.com/hooks/test");
                 assert!(cfg.channel.is_none());
             }
             _ => panic!("Expected Mattermost variant"),
@@ -194,7 +195,7 @@ mod tests {
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
             NotifierConfig::Telegram(cfg) => {
-                assert_eq!(cfg.bot_token, "${TELEGRAM_BOT_TOKEN}");
+                assert_eq!(cfg.bot_token.expose(), "${TELEGRAM_BOT_TOKEN}");
                 assert_eq!(cfg.chat_ids.len(), 2);
                 assert_eq!(cfg.parse_mode.as_deref(), Some("HTML"));
                 assert_eq!(cfg.disable_notification, Some(false));
@@ -215,7 +216,7 @@ mod tests {
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
             NotifierConfig::Telegram(cfg) => {
-                assert_eq!(cfg.bot_token, "token123");
+                assert_eq!(cfg.bot_token.expose(), "token123");
                 assert_eq!(cfg.chat_ids, vec!["-100".to_string()]);
                 assert!(cfg.parse_mode.is_none());
                 assert!(cfg.disable_notification.is_none());
@@ -305,7 +306,7 @@ mod tests {
         let config: NotifierConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
             NotifierConfig::Webhook(cfg) => {
-                assert_eq!(cfg.url, "https://api.example.com/alerts");
+                assert_eq!(cfg.url.expose(), "https://api.example.com/alerts");
                 assert_eq!(cfg.method, "PUT");
                 assert_eq!(cfg.headers.len(), 2);
                 assert!(cfg.body_template.is_some());
@@ -555,5 +556,61 @@ mod tests {
 
         assert_eq!(config.destinations.len(), 1);
         assert_eq!(config.destinations[0], "mattermost-infra");
+    }
+
+    /// Regression guard: notifier configs must never leak secrets through
+    /// `Debug` (which is what `tracing::debug!`, `anyhow::Error` contexts,
+    /// and support-ticket config dumps all end up calling).
+    #[test]
+    fn notifier_config_debug_never_leaks_secrets() {
+        const CANARY_TOKEN: &str = "CANARY_BOT_TOKEN_abc123xyz";
+        const CANARY_URL: &str = "https://canary.example.com/hooks/SECRET-hooks-path";
+        const CANARY_HEADER: &str = "CANARY_BEARER_SECRET_xyz789";
+        const CANARY_PASSWORD: &str = "CANARY_SMTP_PASSWORD_qwerty";
+
+        let telegram_yaml = format!(
+            "type: telegram\nbot_token: \"{}\"\nchat_ids: [\"-100\"]\n",
+            CANARY_TOKEN
+        );
+        let mattermost_yaml = format!("type: mattermost\nwebhook_url: \"{}\"\n", CANARY_URL);
+        let webhook_yaml = format!(
+            "type: webhook\nurl: \"{}\"\nheaders:\n  Authorization: \"Bearer {}\"\n",
+            CANARY_URL, CANARY_HEADER
+        );
+        let email_yaml = format!(
+            "type: email\nsmtp:\n  host: smtp.example.com\n  port: 587\n  username: u\n  password: \"{}\"\nfrom: f@example.com\nto: [t@example.com]\nsubject_template: s\n",
+            CANARY_PASSWORD
+        );
+
+        let configs: Vec<(&str, NotifierConfig)> = vec![
+            ("telegram", serde_yaml::from_str(&telegram_yaml).unwrap()),
+            (
+                "mattermost",
+                serde_yaml::from_str(&mattermost_yaml).unwrap(),
+            ),
+            ("webhook", serde_yaml::from_str(&webhook_yaml).unwrap()),
+            ("email", serde_yaml::from_str(&email_yaml).unwrap()),
+        ];
+
+        let canaries = [CANARY_TOKEN, CANARY_URL, CANARY_HEADER, CANARY_PASSWORD];
+
+        for (kind, cfg) in &configs {
+            let dbg = format!("{:?}", cfg);
+            for canary in &canaries {
+                assert!(
+                    !dbg.contains(canary),
+                    "{} Debug leaked secret canary '{}': {}",
+                    kind,
+                    canary,
+                    dbg
+                );
+            }
+            assert!(
+                dbg.contains("REDACTED"),
+                "{} Debug should render secrets as [REDACTED]: {}",
+                kind,
+                dbg
+            );
+        }
     }
 }

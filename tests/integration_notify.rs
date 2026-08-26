@@ -479,9 +479,12 @@ fn make_webhook_notifier(
     body_template: Option<String>,
 ) -> WebhookNotifier {
     let config = WebhookNotifierConfig {
-        url: url.to_string(),
+        url: SecretString::new(url.to_string()),
         method: method_str.to_string(),
-        headers,
+        headers: headers
+            .into_iter()
+            .map(|(k, v)| (k, SecretString::new(v)))
+            .collect(),
         body_template,
     };
     let client = make_client();

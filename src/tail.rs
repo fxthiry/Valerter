@@ -54,6 +54,22 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// TCP keepalive interval to detect dead connections through firewalls/NAT.
 pub const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
+/// Number of consecutive connection / stream failures a task must observe
+/// before flipping the per-source `valerter_vl_source_up` gauge to 0.
+/// Debounces transient errors (EOF, isolated 5xx, timeout) so a flaky source
+/// does not generate spurious `ValerterVlSourceDown` Prometheus alerts. Fixed
+/// value (not configurable) to keep the contract simple; operators who want
+/// a different threshold should use Prometheus `for:` on the alert rule.
+pub const VL_SOURCE_UP_FAILURE_THRESHOLD: u32 = 3;
+
+/// Gate for the per-source reachability gauge flip. Extracted so the debounce
+/// decision is covered by a deterministic unit test without requiring a live
+/// Prometheus recorder.
+#[inline]
+pub(crate) fn should_report_source_down(consecutive_failures: u32) -> bool {
+    consecutive_failures >= VL_SOURCE_UP_FAILURE_THRESHOLD
+}
+
 /// Configuration for connecting to VictoriaLogs tail endpoint.
 #[derive(Debug, Clone)]
 pub struct TailConfig {
@@ -317,6 +333,7 @@ impl TailClient {
     {
         let mut attempt: u32 = 0;
         let mut had_failure = false;
+        let mut consecutive_failures: u32 = 0;
 
         loop {
             let url = self.build_url();
@@ -357,15 +374,22 @@ impl TailClient {
                     }
                     attempt = 0;
                     had_failure = false;
+                    consecutive_failures = 0;
                     resp
                 }
                 Ok(resp) => {
-                    // HTTP error (4xx, 5xx) - mark this source as down.
-                    metrics::gauge!(
-                        "valerter_vl_source_up",
-                        "vl_source" => vl_source.to_string(),
-                    )
-                    .set(0.0);
+                    // HTTP error (4xx, 5xx). Debounced flip via
+                    // `should_report_source_down`: only flips to 0 once we
+                    // reach `VL_SOURCE_UP_FAILURE_THRESHOLD` consecutive
+                    // failures, so transient 5xx do not page.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if should_report_source_down(consecutive_failures) {
+                        metrics::gauge!(
+                            "valerter_vl_source_up",
+                            "vl_source" => vl_source.to_string(),
+                        )
+                        .set(0.0);
+                    }
 
                     had_failure = true;
                     let delay = backoff_delay_with_jitter(attempt);
@@ -381,12 +405,16 @@ impl TailClient {
                     continue;
                 }
                 Err(e) => {
-                    // Connection error - mark this source as down.
-                    metrics::gauge!(
-                        "valerter_vl_source_up",
-                        "vl_source" => vl_source.to_string(),
-                    )
-                    .set(0.0);
+                    // Connection error (DNS, timeout, refused, ...). Same
+                    // debounce gate as the HTTP-error branch above.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if should_report_source_down(consecutive_failures) {
+                        metrics::gauge!(
+                            "valerter_vl_source_up",
+                            "vl_source" => vl_source.to_string(),
+                        )
+                        .set(0.0);
+                    }
 
                     had_failure = true;
                     let delay = backoff_delay_with_jitter(attempt);
@@ -467,12 +495,16 @@ impl TailClient {
                         }
                     }
                     Err(e) => {
-                        // Stream error - mark this source as down and reconnect.
-                        metrics::gauge!(
-                            "valerter_vl_source_up",
-                            "vl_source" => vl_source.to_string(),
-                        )
-                        .set(0.0);
+                        // Mid-stream error (EOF, broken pipe, ...). Same
+                        // debounce gate as the connect branches above.
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if should_report_source_down(consecutive_failures) {
+                            metrics::gauge!(
+                                "valerter_vl_source_up",
+                                "vl_source" => vl_source.to_string(),
+                            )
+                            .set(0.0);
+                        }
 
                         had_failure = true;
                         let delay = backoff_delay_with_jitter(attempt);
@@ -937,6 +969,28 @@ mod tests {
 
         let result = TailClient::new(config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn should_report_source_down_debounces_until_threshold() {
+        // Threshold-1 failures in a row must not flip the gauge; the Nth does.
+        for below in 0..VL_SOURCE_UP_FAILURE_THRESHOLD {
+            assert!(
+                !should_report_source_down(below),
+                "{} consecutive failures must not report the source as down (threshold is {})",
+                below,
+                VL_SOURCE_UP_FAILURE_THRESHOLD
+            );
+        }
+        assert!(
+            should_report_source_down(VL_SOURCE_UP_FAILURE_THRESHOLD),
+            "{} consecutive failures must report the source as down",
+            VL_SOURCE_UP_FAILURE_THRESHOLD
+        );
+        assert!(
+            should_report_source_down(VL_SOURCE_UP_FAILURE_THRESHOLD + 5),
+            "sustained failures past the threshold must keep reporting down"
+        );
     }
 
     // Test that StreamBuffer integration works correctly

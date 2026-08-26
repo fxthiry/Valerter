@@ -247,11 +247,12 @@ impl TelegramNotifier {
             });
         }
 
-        let resolved_token =
-            resolve_env_vars(&config.bot_token).map_err(|e| ConfigError::InvalidNotifier {
+        let resolved_token = resolve_env_vars(config.bot_token.expose()).map_err(|e| {
+            ConfigError::InvalidNotifier {
                 name: name.to_string(),
                 message: format!("bot_token: {}", e),
-            })?;
+            }
+        })?;
         if resolved_token.trim().is_empty() {
             return Err(ConfigError::InvalidNotifier {
                 name: name.to_string(),
@@ -537,7 +538,7 @@ mod tests {
 
     fn config_with(chat_ids: Vec<String>) -> TelegramNotifierConfig {
         TelegramNotifierConfig {
-            bot_token: "fake-token".to_string(),
+            bot_token: SecretString::new("fake-token".to_string()),
             chat_ids,
             parse_mode: None,
             disable_notification: None,
@@ -603,7 +604,7 @@ mod tests {
     fn from_config_fails_fast_on_unresolved_env_var() {
         let client = reqwest::Client::new();
         let mut cfg = config_with(vec!["-100".to_string()]);
-        cfg.bot_token = "${VALERTER_TELEGRAM_TEST_MISSING_VAR}".to_string();
+        cfg.bot_token = SecretString::new("${VALERTER_TELEGRAM_TEST_MISSING_VAR}".to_string());
         let err = TelegramNotifier::from_config("tg", &cfg, client).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidNotifier { .. }));
         assert!(err.to_string().contains("bot_token"));
@@ -644,7 +645,7 @@ mod tests {
     fn debug_impl_does_not_leak_token_or_endpoint() {
         let client = reqwest::Client::new();
         let mut cfg = config_with(vec!["-100".to_string()]);
-        cfg.bot_token = "SUPER_SECRET_TOKEN".to_string();
+        cfg.bot_token = SecretString::new("SUPER_SECRET_TOKEN".to_string());
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let dbg = format!("{:?}", notifier);
         assert!(dbg.contains("TelegramNotifier"));
@@ -756,7 +757,7 @@ mod tests {
     fn from_config_rejects_empty_resolved_bot_token() {
         let client = reqwest::Client::new();
         let mut cfg = config_with(vec!["-100".to_string()]);
-        cfg.bot_token = "   ".to_string();
+        cfg.bot_token = SecretString::new("   ".to_string());
         let err = TelegramNotifier::from_config("tg", &cfg, client).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidNotifier { .. }));
         assert!(err.to_string().contains("bot_token"));

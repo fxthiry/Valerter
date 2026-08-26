@@ -149,7 +149,7 @@ impl WebhookNotifier {
     ) -> Result<Self, ConfigError> {
         // Resolve environment variables in URL
         let resolved_url =
-            resolve_env_vars(&config.url).map_err(|e| ConfigError::InvalidNotifier {
+            resolve_env_vars(config.url.expose()).map_err(|e| ConfigError::InvalidNotifier {
                 name: name.to_string(),
                 message: format!("url: {}", e),
             })?;
@@ -174,7 +174,7 @@ impl WebhookNotifier {
         let mut headers = HeaderMap::new();
         for (key, value) in &config.headers {
             let resolved_value =
-                resolve_env_vars(value).map_err(|e| ConfigError::InvalidNotifier {
+                resolve_env_vars(value.expose()).map_err(|e| ConfigError::InvalidNotifier {
                     name: name.to_string(),
                     message: format!("header '{}': {}", key, e),
                 })?;
@@ -412,15 +412,18 @@ mod tests {
     fn from_config_with_all_fields() {
         temp_env::with_var("TEST_WEBHOOK_TOKEN", Some("secret-token-123"), || {
             let config = WebhookNotifierConfig {
-                url: "https://api.example.com/alerts".to_string(),
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
                 method: "PUT".to_string(),
                 headers: {
                     let mut h = HashMap::new();
                     h.insert(
                         "Authorization".to_string(),
-                        "Bearer ${TEST_WEBHOOK_TOKEN}".to_string(),
+                        SecretString::new("Bearer ${TEST_WEBHOOK_TOKEN}".to_string()),
                     );
-                    h.insert("Content-Type".to_string(), "application/json".to_string());
+                    h.insert(
+                        "Content-Type".to_string(),
+                        SecretString::new("application/json".to_string()),
+                    );
                     h
                 },
                 body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
@@ -440,7 +443,7 @@ mod tests {
     #[test]
     fn from_config_with_defaults() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -462,7 +465,7 @@ mod tests {
             Some("https://resolved.example.com/hook"),
             || {
                 let config = WebhookNotifierConfig {
-                    url: "${TEST_WEBHOOK_URL}".to_string(),
+                    url: SecretString::new("${TEST_WEBHOOK_URL}".to_string()),
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
@@ -482,7 +485,7 @@ mod tests {
     fn from_config_fails_on_undefined_url_env_var() {
         temp_env::with_var("UNDEFINED_WEBHOOK_URL", None::<&str>, || {
             let config = WebhookNotifierConfig {
-                url: "${UNDEFINED_WEBHOOK_URL}".to_string(),
+                url: SecretString::new("${UNDEFINED_WEBHOOK_URL}".to_string()),
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
@@ -509,13 +512,13 @@ mod tests {
     fn from_config_fails_on_undefined_header_env_var() {
         temp_env::with_var("UNDEFINED_TOKEN", None::<&str>, || {
             let config = WebhookNotifierConfig {
-                url: "https://api.example.com/alerts".to_string(),
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
                 method: "POST".to_string(),
                 headers: {
                     let mut h = HashMap::new();
                     h.insert(
                         "Authorization".to_string(),
-                        "Bearer ${UNDEFINED_TOKEN}".to_string(),
+                        SecretString::new("Bearer ${UNDEFINED_TOKEN}".to_string()),
                     );
                     h
                 },
@@ -542,7 +545,7 @@ mod tests {
     fn from_config_rejects_unsupported_methods() {
         // AC6: Only POST and PUT are supported
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "PATCH".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -567,7 +570,7 @@ mod tests {
     #[test]
     fn from_config_accepts_put_method() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "PUT".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -584,7 +587,7 @@ mod tests {
     #[test]
     fn from_config_rejects_delete_method() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "DELETE".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -599,7 +602,7 @@ mod tests {
     #[test]
     fn from_config_fails_on_invalid_body_template() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: Some("{% if unclosed".to_string()),
@@ -688,7 +691,7 @@ mod tests {
     #[test]
     fn webhook_notifier_properties() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -704,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_trait_is_object_safe() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -730,7 +733,7 @@ mod tests {
             Some("https://secret.example.com/hook/abc123"),
             || {
                 let config = WebhookNotifierConfig {
-                    url: "${TEST_SECRET_URL}".to_string(),
+                    url: SecretString::new("${TEST_SECRET_URL}".to_string()),
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
@@ -756,13 +759,13 @@ mod tests {
     fn debug_output_does_not_expose_headers() {
         temp_env::with_var("TEST_AUTH_TOKEN", Some("Bearer super-secret-token"), || {
             let config = WebhookNotifierConfig {
-                url: "https://api.example.com/alerts".to_string(),
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
                 method: "POST".to_string(),
                 headers: {
                     let mut h = HashMap::new();
                     h.insert(
                         "Authorization".to_string(),
-                        "${TEST_AUTH_TOKEN}".to_string(),
+                        SecretString::new("${TEST_AUTH_TOKEN}".to_string()),
                     );
                     h
                 },
@@ -839,12 +842,15 @@ mod tests {
     #[test]
     fn from_config_rejects_invalid_header_name() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: {
                 let mut h = HashMap::new();
                 // Header names cannot contain spaces or special chars
-                h.insert("Invalid Header Name".to_string(), "value".to_string());
+                h.insert(
+                    "Invalid Header Name".to_string(),
+                    SecretString::new("value".to_string()),
+                );
                 h
             },
             body_template: None,
@@ -867,12 +873,15 @@ mod tests {
     #[test]
     fn from_config_rejects_invalid_header_value() {
         let config = WebhookNotifierConfig {
-            url: "https://api.example.com/alerts".to_string(),
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
             method: "POST".to_string(),
             headers: {
                 let mut h = HashMap::new();
                 // Header values cannot contain control characters (e.g., newlines)
-                h.insert("X-Custom".to_string(), "value\nwith\nnewlines".to_string());
+                h.insert(
+                    "X-Custom".to_string(),
+                    SecretString::new("value\nwith\nnewlines".to_string()),
+                );
                 h
             },
             body_template: None,
