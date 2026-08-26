@@ -288,6 +288,24 @@ the top-level template fields (`title`, `body`, `email_body_html`), the
 
 These timestamps are computed **after** the top-level template renders, so they are only accessible in notifier-level templates. If you need a timestamp at the top-level, reference `{{ _time }}` (raw VictoriaLogs field) directly.
 
+### Fields with special characters
+
+VictoriaLogs field names may contain characters that are operators in Jinja,
+most commonly `/` in Kubernetes/OpenShift annotation keys such as
+`ocp.annotations.authentication.openshift.io/username`. Dotted keys are
+expanded into nested objects at render time, so reference the last segment
+with bracket notation:
+
+```jinja
+{# WRONG: '/' is parsed as a division #}
+{{ ocp.annotations.authentication.openshift.io/username }}
+
+{# RIGHT #}
+{{ ocp.annotations.authentication.openshift["io/username"] }}
+```
+
+`valerter --validate` detects this pattern and prints the rewritten expression.
+
 ### email_body_html Requirement
 
 **Important:** Templates used with email destinations MUST include `email_body_html`. Valerter validates this at startup and will fail if missing.
@@ -325,6 +343,21 @@ rules:
         - email-ops
       mattermost_channel: "alerts"    # Optional: override Mattermost channel
 ```
+
+### LogsQL query restrictions
+
+Valerter uses the VictoriaLogs `/select/logsql/tail` endpoint, which streams
+matching logs as they arrive. Pipes that need the **full result set** are not
+supported by `/tail` and are rejected by `valerter --validate`:
+`stats`, `sort`, `top`, `uniq`, `limit`, `offset`, `first`, `last`, `facets`,
+`join`, `field_names`, `field_values`, `block_stats`, `blocks_count`, `union`.
+
+Filter-style pipes (`filter`, `json`, `extract`, `extract_regexp`, `unpack_json`,
+`format`, `fields`, `rename`, `math`, `replace`, ...) work as expected.
+
+For aggregation-based alerts ("more than N distinct versions per host"),
+run the `stats` query on a schedule with [vmalert](https://docs.victoriametrics.com/vmalert/)
+and let Valerter alert on individual events instead.
 
 ### Parser Types
 

@@ -64,8 +64,86 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
         .get_template("_render_test")
         .map_err(|e| e.to_string())?;
     tmpl.render(Value::from_object(TruthyChainable))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            match slash_field_hint(source) {
+                Some(hint) if msg.contains("/ operator") => format!("{msg}\n  hint: {hint}"),
+                _ => msg,
+            }
+        })?;
 
+    Ok(())
+}
+
+/// Matches an identifier path containing a `/` inside a `{{ ... }}` expression,
+/// e.g. `ocp.annotations.openshift.io/username`.
+static SLASH_FIELD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{\{[^}]*?\b([A-Za-z_][\w.]*)/([A-Za-z_][\w./-]*)").expect("valid regex")
+});
+
+/// Issue #41: VictoriaLogs field names may contain `/` (e.g. Kubernetes
+/// annotations like `authentication.openshift.io/username`). In a Jinja
+/// expression `/` is the division operator, so `{{ a.b.io/username }}` fails
+/// to render. Returns a hint with the bracket-notation rewrite when the
+/// template contains such a path.
+pub(crate) fn slash_field_hint(source: &str) -> Option<String> {
+    let caps = SLASH_FIELD_REGEX.captures(source)?;
+    let left = &caps[1];
+    let right = &caps[2];
+    let (prefix, leaf) = match left.rfind('.') {
+        Some(i) => (&left[..i], &left[i + 1..]),
+        None => ("", left),
+    };
+    let rewrite = if prefix.is_empty() {
+        format!("{{{{ fields[\"{leaf}/{right}\"] }}}}")
+    } else {
+        format!("{{{{ {prefix}[\"{leaf}/{right}\"] }}}}")
+    };
+    Some(format!(
+        "field names containing '/' must use bracket notation, e.g. `{rewrite}` \
+         (in Jinja, '/' is the division operator; see docs/configuration.md#fields-with-special-characters)"
+    ))
+}
+
+/// LogsQL pipes that require the full result set and are therefore rejected
+/// by the VictoriaLogs `/select/logsql/tail` endpoint with HTTP 400.
+const TAIL_UNSUPPORTED_PIPES: &[&str] = &[
+    "stats",
+    "sort",
+    "top",
+    "uniq",
+    "limit",
+    "offset",
+    "first",
+    "last",
+    "facets",
+    "join",
+    "field_names",
+    "field_values",
+    "block_stats",
+    "blocks_count",
+    "union",
+];
+
+static PIPE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\|\s*([A-Za-z_]+)\b").expect("valid regex"));
+
+/// Issue #42: validates that a rule query only uses pipes supported by the
+/// VictoriaLogs `/tail` endpoint. Valerter streams logs in real time, so
+/// aggregations such as `stats by (...)` can never work and would otherwise
+/// fail at runtime with an opaque `HTTP 400` retry loop.
+pub(crate) fn validate_tail_query(query: &str) -> Result<(), String> {
+    for caps in PIPE_REGEX.captures_iter(query) {
+        let pipe = caps[1].to_ascii_lowercase();
+        if TAIL_UNSUPPORTED_PIPES.contains(&pipe.as_str()) {
+            return Err(format!(
+                "pipe '{pipe}' is not supported by the VictoriaLogs /tail endpoint \
+                 (valerter streams logs in real time; aggregations need the full result set). \
+                 Use filter pipes only, or pre-aggregate upstream (e.g. vmalert) and alert on the result. \
+                 See docs/configuration.md#logsql-query-restrictions"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -204,5 +282,60 @@ mod tests {
             "length on undefined should validate cleanly: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn slash_field_hint_suggests_bracket_notation() {
+        let hint =
+            slash_field_hint("<b>{{ ocp.annotations.authentication.openshift.io/username }}</b>")
+                .expect("hint");
+        assert!(
+            hint.contains(r#"{{ ocp.annotations.authentication.openshift["io/username"] }}"#),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn slash_field_hint_top_level_key() {
+        let hint = slash_field_hint("{{ io/username }}").expect("hint");
+        assert!(hint.contains(r#"{{ fields["io/username"] }}"#), "{hint}");
+    }
+
+    #[test]
+    fn slash_field_hint_none_for_plain_template() {
+        assert!(slash_field_hint("{{ host }} {{ a.b }}").is_none());
+    }
+
+    #[test]
+    fn validate_template_render_slash_field_error_carries_hint() {
+        let err = validate_template_render("{{ ocp.openshift.io/decision }}").unwrap_err();
+        assert!(err.contains("/ operator"), "{err}");
+        assert!(err.contains("bracket notation"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_render_accepts_bracket_notation_for_slash_field() {
+        assert!(validate_template_render(r#"{{ ocp.openshift["io/decision"] }}"#).is_ok());
+    }
+
+    #[test]
+    fn validate_tail_query_rejects_stats_pipe() {
+        let q =
+            "* | package_event_type:package_inventory | stats by (host) count() c | filter c:>1";
+        let err = validate_tail_query(q).unwrap_err();
+        assert!(err.contains("'stats'"), "{err}");
+    }
+
+    #[test]
+    fn validate_tail_query_rejects_sort_and_limit() {
+        assert!(validate_tail_query("error | sort by (_time)").is_err());
+        assert!(validate_tail_query("error | LIMIT 10").is_err());
+    }
+
+    #[test]
+    fn validate_tail_query_accepts_filter_pipes() {
+        assert!(validate_tail_query(r#"_stream:{host="s1"} | json | cpu > 90"#).is_ok());
+        assert!(validate_tail_query("error | extract \"<a> <b>\" | filter a:x").is_ok());
+        assert!(validate_tail_query("_msg:~\"stats by\"").is_ok());
     }
 }

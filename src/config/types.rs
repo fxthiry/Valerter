@@ -675,6 +675,13 @@ impl Config {
 
         // ===== Rule validations =====
         for rule in &self.rules {
+            if let Err(e) = super::validation::validate_tail_query(&rule.query) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "rule '{}': invalid query: {}",
+                    rule.name, e
+                )));
+            }
+
             if let Some(ref pattern) = rule.parser.regex
                 && let Err(e) = Regex::new(pattern)
             {
