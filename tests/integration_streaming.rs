@@ -913,5 +913,8 @@ async fn test_clean_eof_reconnects_with_delay_not_tight_loop() {
     let n = mock_server.received_requests().await.unwrap().len();
     // Empty EOFs back off (1s, 2s, ...): at most a handful of requests in 1.2s,
     // where the old tight loop produced hundreds.
-    assert!((1..=5).contains(&n), "expected backed-off reconnects, got {n}");
+    assert!(
+        (1..=5).contains(&n),
+        "expected backed-off reconnects, got {n}"
+    );
 }
