@@ -140,11 +140,11 @@ When VictoriaLogs connection fails:
 
 1. **Cause logged first:** `Connection failed`, `Stream read error` or `HTTP error from VictoriaLogs` is logged with the error, then `Connection failed, retrying` with the attempt number and the delay in milliseconds (`delay_ms`), all before the wait starts
 2. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max), with ±10% jitter
-3. **Metric update:** `valerter_victorialogs_up` set to 0 (restored to 1 on successful reconnection)
-4. **Reconnection metric:** `valerter_reconnections_total` incremented
+3. **Metric update:** the per-source gauge `valerter_vl_source_up{vl_source}` is set to 0 after 3 consecutive failures of a task (transient errors are debounced), and restored to 1 on successful reconnection
+4. **Reconnection metric:** `valerter_reconnections_total{rule_name, vl_source}` incremented: it only counts reconnections after a failure (connection error, HTTP error response or error while reading the stream)
 5. **On success:** the throttle keys fed only by this source are reset (prevents stale state); keys shared with the rule's other sources are kept
 
-When the server ends the response cleanly (EOF without error), this is not a failure: the throttle cache is kept and the tail is reopened after ~1s if the connection received data. If the server keeps closing the stream without sending anything, the delay grows with the number of consecutive empty EOFs: ~1s, then 2s, 4s, ... up to 60s, and drops back to ~1s as soon as a connection receives data.
+When the server ends the response cleanly (EOF without error), this is not a failure: the throttle cache is kept and the tail is reopened after ~1s if the connection received data. If the server keeps closing the stream without sending anything, the delay grows with the number of consecutive empty EOFs: ~1s, then 2s, 4s, ... up to 60s, and drops back to ~1s as soon as a connection receives data. Clean ends are counted in `valerter_stream_ends_total{rule_name, vl_source}`, not in `valerter_reconnections_total`, so a proxy closing idle streams does not look like a failing source.
 
 ## Notification Queue
 

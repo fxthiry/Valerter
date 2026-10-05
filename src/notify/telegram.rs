@@ -9,7 +9,7 @@ use crate::config::{
     SecretString, TelegramNotifierConfig, resolve_env_vars, validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use minijinja::{Environment, context};
 use regex::Regex;
@@ -477,7 +477,15 @@ impl Notifier for TelegramNotifier {
         );
 
         async {
-            let (text, truncated) = self.prepare_text(alert)?;
+            // A render error is a permanent failure for this alert: count it,
+            // send nothing.
+            let (text, truncated) = match self.prepare_text(alert) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    record_permanent_failure(alert, &self.name, "telegram");
+                    return Err(e);
+                }
+            };
             if truncated {
                 tracing::warn!(
                     rule_name = %alert.rule_name,
@@ -492,20 +500,13 @@ impl Notifier for TelegramNotifier {
                 .increment(1);
             }
 
+            // Counted once per alert, like email: sent if at least one chat
+            // succeeded, failed if every chat failed. Each failed chat is
+            // counted in `valerter_telegram_chat_errors_total`.
             let mut any_success = false;
             for chat_id in &self.chat_ids {
                 match self.send_to_chat(alert, chat_id, &text).await {
-                    Ok(()) => {
-                        any_success = true;
-                        metrics::counter!(
-                            "valerter_alerts_sent_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
-                        )
-                        .increment(1);
-                    }
+                    Ok(()) => any_success = true,
                     Err(e) => {
                         tracing::error!(
                             chat_id = %chat_id,
@@ -513,19 +514,10 @@ impl Notifier for TelegramNotifier {
                             "Telegram send permanently failed for chat"
                         );
                         metrics::counter!(
-                            "valerter_notify_errors_total",
+                            "valerter_telegram_chat_errors_total",
                             "rule_name" => alert.rule_name.clone(),
                             "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            "valerter_alerts_failed_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }
@@ -533,8 +525,17 @@ impl Notifier for TelegramNotifier {
             }
 
             if any_success {
+                metrics::counter!(
+                    "valerter_alerts_sent_total",
+                    "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
+                    "notifier_name" => self.name.clone(),
+                    "notifier_type" => "telegram",
+                )
+                .increment(1);
                 Ok(())
             } else {
+                record_permanent_failure(alert, &self.name, "telegram");
                 Err(NotifyError::SendFailed("all chat_ids failed".to_string()))
             }
         }
@@ -1455,5 +1456,149 @@ mod tests {
         let alert = sample_alert("hello", "world");
         let (text, _) = notifier.prepare_text(&alert).unwrap();
         assert_eq!(text, "<b>hello</b>\nworld");
+    }
+
+    // ── Per-alert counting ──────────────────────────────────────────────
+
+    /// Send one alert to `chat_ids` against a server answering `statuses`
+    /// per request (the last one repeats), under a local recorder. Returns
+    /// the result, the number of requests and the rendering.
+    fn send_counted(
+        chat_ids: &[&str],
+        statuses: &'static [u16],
+        body_template: Option<&str>,
+    ) -> (Result<(), NotifyError>, usize, String) {
+        use crate::notify::test_metrics::run_with_recorder;
+
+        let ((result, requests), rendered) = run_with_recorder(|| async {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicU32::new(0));
+            Mock::given(method("POST"))
+                .respond_with(move |_req: &wiremock::Request| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+                    let status = statuses[n.min(statuses.len() - 1)];
+                    ResponseTemplate::new(status).set_body_string(if status == 200 {
+                        "{\"ok\":true}"
+                    } else {
+                        "{\"ok\":false,\"description\":\"Forbidden\"}"
+                    })
+                })
+                .mount(&server)
+                .await;
+            let mut notifier =
+                test_notifier(&server, chat_ids.iter().map(|c| c.to_string()).collect());
+            notifier.body_template_source = body_template.map(str::to_string);
+            let result = notifier.send(&sample_alert("hi", "body")).await;
+            (result, server.received_requests().await.unwrap().len())
+        });
+        (result, requests, rendered)
+    }
+
+    #[test]
+    #[serial]
+    fn partial_success_counts_alert_once_and_failed_chat() {
+        use crate::notify::test_metrics::counter_total;
+
+        // Chat A succeeds, chat B gets a 403 (not resent as plain text).
+        let (result, _, rendered) = send_counted(&["-100A", "-100B"], &[200, 403], None);
+
+        assert!(result.is_ok());
+        for series in [
+            "valerter_alerts_sent_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+            "valerter_telegram_chat_errors_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "missing `{series}` in:\n{rendered}"
+            );
+        }
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 0);
+        assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn three_successful_chats_count_one_sent_alert() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, requests, rendered) = send_counted(&["-100A", "-100B", "-100C"], &[200], None);
+
+        assert!(result.is_ok());
+        assert_eq!(requests, 3);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 1);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn plain_text_resend_success_is_not_a_failure() {
+        use crate::notify::test_metrics::counter_total;
+
+        // HTML rejected with 400, then delivered as plain text.
+        let (result, requests, rendered) = send_counted(&["-100A"], &[400, 200], None);
+
+        assert!(result.is_ok());
+        assert_eq!(requests, 2);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 1);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn total_failure_counts_each_chat_and_one_failed_alert() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, _, rendered) = send_counted(&["-100A", "-100B"], &[403], None);
+
+        match result {
+            Err(NotifyError::SendFailed(m)) => assert_eq!(m, "all chat_ids failed"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            2
+        );
+        for series in [
+            "valerter_notify_errors_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+            "valerter_alerts_failed_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "missing `{series}` in:\n{rendered}"
+            );
+        }
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn render_failure_at_send_is_counted_and_sends_nothing() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, requests, rendered) = send_counted(
+            &["-100A", "-100B"],
+            &[200],
+            Some("{{ body | no_such_filter }}"),
+        );
+
+        assert!(
+            matches!(result, Err(NotifyError::TemplateError(_))),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(requests, 0, "no sendMessage request may be issued");
+        assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 1);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 1);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
     }
 }

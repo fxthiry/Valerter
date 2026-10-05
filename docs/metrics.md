@@ -24,21 +24,46 @@ metrics:
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `valerter_alerts_sent_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts sent successfully |
+| `valerter_alerts_sent_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts delivered, once per alert and notifier (an `email` or `telegram` alert delivered to at least one recipient or chat counts once) |
 | `valerter_alerts_throttled_total` | `rule_name`, `vl_source` | Alerts blocked by throttling |
 | `valerter_alerts_passed_total` | `rule_name`, `vl_source` | Alerts that passed throttling |
 | `valerter_alerts_dropped_total` | - | Deliveries dropped because a destination queue was full, summed over every destination (an alert dropped for two destinations counts twice) |
-| `valerter_alerts_failed_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts that permanently failed (including a notifier panic during the send) |
+| `valerter_alerts_failed_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts that permanently failed, once per alert and notifier: retries exhausted, non-retryable response, every recipient or chat failed, template render error at send time, or a notifier panic during the send |
+| `valerter_alerts_truncated_total` | `notifier_type`, `notifier_name` | Alerts whose message was truncated to fit the notifier length limit (Telegram: 4096 codepoints), once per alert. Initialized to 0 for every `telegram` notifier |
 | `valerter_destination_alerts_dropped_total` | `notifier_name`, `notifier_type` | Alerts dropped because the queue of this destination was full (oldest alert dropped). Initialized to 0 for every notifier |
-| `valerter_email_recipient_errors_total` | `rule_name`, `vl_source`, `notifier_name` | Email delivery failures per recipient |
+| `valerter_email_recipient_errors_total` | `rule_name`, `vl_source`, `notifier_name` | Email delivery failures, one unit per failed recipient |
 | `valerter_lines_discarded_total` | `rule_name`, `vl_source`, `reason` | Log lines discarded, one unit per line. `reason="oversized"`: line longer than 1 MiB, dropped whole (its remaining bytes are skipped up to the next `\n`); `reason="invalid_utf8"`: line that is not valid UTF-8. In both cases the other lines of the stream are kept |
 | `valerter_logs_matched_total` | `rule_name`, `vl_source` | Logs matched by rule (before throttling) |
-| `valerter_notifier_config_errors_total` | `notifier`, `error_type` | Notifier configuration errors (e.g., env var resolution) |
-| `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Notification send errors (including a notifier panic during the send, and `notifier_type="unknown"` for a destination missing from the registry) |
-| `valerter_parse_errors_total` | `rule_name`, `vl_source`, `error_type` | Parsing errors |
-| `valerter_reconnections_total` | `rule_name`, `vl_source` | VictoriaLogs reconnections |
+| `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Permanent notification failures, counted like `valerter_alerts_failed_total` (once per alert and notifier, render errors included), plus `notifier_type="unknown"` for a destination missing from the registry. Transient errors that a retry recovers from are not counted |
+| `valerter_parse_errors_total` | `rule_name`, `vl_source`, `error_type` | Parsing errors: `error_type="invalid_json"` (any rule) or `error_type="regex_no_match"` (rules with a regex parser) |
+| `valerter_reconnections_total` | `rule_name`, `vl_source` | VictoriaLogs reconnections after a failure: connection error, HTTP error response or error while reading the stream. Clean stream ends are counted in `valerter_stream_ends_total` |
 | `valerter_rule_panics_total` | `rule_name`, `vl_source` | Rule task panics. The task is auto-restarted with exponential backoff (5 s to 5 min), never abandoned: a steady increase means a task panicking in a loop |
 | `valerter_rule_errors_total` | `rule_name`, `vl_source` | Fatal rule errors |
+| `valerter_stream_ends_total` | `rule_name`, `vl_source` | Clean VictoriaLogs stream ends (EOF without error), each followed by a reconnection. Not a failure: a proxy closing idle streams makes it grow |
+| `valerter_telegram_chat_errors_total` | `rule_name`, `vl_source`, `notifier_name` | Telegram delivery failures, one unit per failed chat. A chat delivered through the plain-text fallback is not a failure |
+
+### Series initialized at startup
+
+Every series is created at 0 when valerter starts, with exactly the labels it
+is emitted with, so `rate()` and `increase()` work from the first event:
+
+- per `(enabled rule, resolved source)` pair: the `rule_name`, `vl_source`
+  counters above, `valerter_lines_discarded_total` for both reasons,
+  `valerter_parse_errors_total` for each possible `error_type`,
+  `valerter_last_query_timestamp` and `valerter_query_duration_seconds`;
+- per `(enabled rule, resolved source, rule destination)` triplet:
+  `valerter_alerts_sent_total`, `valerter_notify_errors_total`,
+  `valerter_alerts_failed_total`, plus `valerter_email_recipient_errors_total`
+  or `valerter_telegram_chat_errors_total` for an `email` or `telegram`
+  destination. A notifier used by no enabled rule gets none of these series;
+- per notifier: `valerter_destination_queue_size`,
+  `valerter_destination_alerts_dropped_total`, and
+  `valerter_alerts_truncated_total` for a `telegram` notifier;
+- per declared source: `valerter_vl_source_up`.
+
+Notifier configuration errors (such as an undefined `${VAR}`) have no metric:
+they stop valerter at startup, before the metrics endpoint opens, with an
+ERROR log and exit code 1.
 
 ### Gauges
 
@@ -176,7 +201,8 @@ groups:
 ### Errors
 
 - `valerter_parse_errors_total` - Log parsing issues
-- `valerter_notify_errors_total` - Transient notification errors
+- `valerter_notify_errors_total` - Permanent notification failures (after retries, or not retryable)
+- `valerter_email_recipient_errors_total` / `valerter_telegram_chat_errors_total` - Recipients or chats that missed an alert other targets received
 - `valerter_rule_panics_total` - Critical: indicates bugs
 
 ## See Also

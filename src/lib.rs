@@ -18,7 +18,8 @@ pub mod throttle;
 pub use cli::LogFormat;
 pub use engine::RuleEngine;
 pub use metrics::{
-    MetricsServer, initialize_destination_metrics, initialize_metrics, register_metric_descriptions,
+    DeliverySeries, MetricsInventory, MetricsServer, NotifierSeries, RuleSourceSeries,
+    initialize_destination_metrics, initialize_metrics, register_metric_descriptions,
 };
 pub use notify::{
     AlertPayload, DEFAULT_QUEUE_CAPACITY, DrainOutcome, MattermostNotifier, NotificationQueue,

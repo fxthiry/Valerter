@@ -160,15 +160,10 @@ impl NotifierRegistry {
         match config {
             NotifierConfig::Mattermost(mm_config) => {
                 // Resolve environment variables in webhook_url
+                // No metric here: notifiers are built before the metrics
+                // exporter is installed, and the error stops the daemon.
                 let resolved_url =
                     resolve_env_vars(mm_config.webhook_url.expose()).map_err(|e| {
-                        // Track env var resolution failures for monitoring (Fix M1)
-                        metrics::counter!(
-                            "valerter_notifier_config_errors_total",
-                            "notifier" => name.to_string(),
-                            "error_type" => "env_var_resolution"
-                        )
-                        .increment(1);
                         ConfigError::InvalidNotifier {
                             name: name.to_string(),
                             message: format!("webhook_url: {}", e),
