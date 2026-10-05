@@ -155,11 +155,19 @@ Chaque tâche SHALL traiter chaque ligne non vide reçue du flux dans l'ordre su
 - **THEN** un log WARN « Failed to send to notification queue » est émis et la ligne est abandonnée
 
 ### Requirement: État isolé par tâche
-Chaque tâche (règle, source) SHALL posséder son propre parser, son propre état de throttling et sa propre connexion au flux, de sorte que deux sources émettant des événements identiques pour une même règle ne partagent aucun état de throttling.
+Chaque tâche (règle, source) SHALL posséder son propre parser et sa propre connexion au flux ; l'état de throttling est en revanche partagé par toutes les tâches d'une même règle (voir la capacité `throttling`), l'isolation entre sources étant assurée par la clé de throttling par défaut, qui contient le nom de la source.
 
 #### Scenario: Événements identiques sur deux sources
 - **WHEN** deux sources émettent le même événement pour une même règle utilisant la clé de throttling par défaut
 - **THEN** les deux événements passent le throttling à leur première occurrence et produisent chacun une alerte
+
+#### Scenario: Événements identiques avec une clé commune aux sources
+- **WHEN** deux sources émettent le même événement pour une même règle dont `throttle.key` vaut `{{ rule_name }}` avec `count: 1`
+- **THEN** une seule alerte est produite
+
+#### Scenario: Défaillance de connexion d'une source
+- **WHEN** la connexion de la tâche (règle, `vlprod`) échoue
+- **THEN** la tâche (règle, `vldev`) continue de recevoir et de traiter ses lignes avec son propre parser
 
 ### Requirement: Arrêt gracieux sur signal
 Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIGINT (sous Unix ; Ctrl+C uniquement sur les autres plateformes), en annulant toutes les tâches de règles, puis en laissant au worker de notifications au plus 5 secondes et au serveur de métriques au plus 2 secondes pour se terminer, avant de quitter avec le code 0.
