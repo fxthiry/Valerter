@@ -52,7 +52,9 @@ const DEFAULT_PARSE_MODE: &str = "HTML";
 struct TelegramPayload<'a> {
     chat_id: &'a str,
     text: &'a str,
-    parse_mode: &'a str,
+    /// Omitted when resending as plain text after an HTML rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disable_notification: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +209,15 @@ async fn parse_retry_after(response: reqwest::Response, attempt: u32) -> Duratio
     extract_retry_after(header.as_deref(), &body, attempt)
 }
 
+/// Why a `sendMessage` request to one chat failed for good.
+#[derive(Debug)]
+enum ChatSendError {
+    /// 4xx other than 429: the request itself was rejected, not retried.
+    Client(reqwest::StatusCode),
+    /// 5xx, 429 and network errors until the retry pool was exhausted.
+    RetriesExhausted,
+}
+
 /// Telegram Bot notifier. One instance per configured `notifiers.<name>` entry.
 pub struct TelegramNotifier {
     name: String,
@@ -308,26 +319,78 @@ impl TelegramNotifier {
     /// Send the prepared text to a single chat_id with retry. Returns `Ok` on
     /// success, `Err` on permanent failure (retries exhausted or 4xx other
     /// than 429).
+    ///
+    /// A 400 on an HTML message (malformed markup: a tag cut by truncation, an
+    /// unescaped `<` or `&` in a custom template) is resent once as plain text,
+    /// so the alert is delivered with its tags shown literally rather than lost.
     async fn send_to_chat(
         &self,
         alert: &AlertPayload,
         chat_id: &str,
         text: &str,
     ) -> Result<(), NotifyError> {
-        let payload = TelegramPayload {
+        let mut payload = TelegramPayload {
             chat_id,
             text,
-            parse_mode: &self.parse_mode,
+            parse_mode: Some(&self.parse_mode),
             disable_notification: self.disable_notification,
             disable_web_page_preview: self.disable_web_page_preview,
         };
 
+        let result = match self.post_with_retry(chat_id, &payload).await {
+            Err(ChatSendError::Client(status))
+                if status == reqwest::StatusCode::BAD_REQUEST
+                    && self.parse_mode.eq_ignore_ascii_case("HTML") =>
+            {
+                tracing::warn!(
+                    notifier_name = %self.name,
+                    rule_name = %alert.rule_name,
+                    chat_id = %chat_id,
+                    status = %status,
+                    "Telegram rejected HTML message, resending as plain text"
+                );
+                payload.parse_mode = None;
+                self.post_with_retry(chat_id, &payload).await
+            }
+            other => other,
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(ChatSendError::Client(status)) => {
+                tracing::error!(
+                    chat_id = %chat_id,
+                    status = %status,
+                    "Telegram returned client error, not retrying"
+                );
+                Err(NotifyError::SendFailed(format!("client error: {}", status)))
+            }
+            Err(ChatSendError::RetriesExhausted) => {
+                tracing::error!(
+                    chat_id = %chat_id,
+                    max_retries = TELEGRAM_MAX_RETRIES,
+                    rule_name = %alert.rule_name,
+                    "Telegram send exhausted retries"
+                );
+                Err(NotifyError::MaxRetriesExceeded)
+            }
+        }
+    }
+
+    /// POST one `sendMessage` payload, retrying 5xx, 429 and network errors
+    /// up to [`TELEGRAM_MAX_RETRIES`] attempts. A 4xx other than 429 stops
+    /// immediately.
+    async fn post_with_retry(
+        &self,
+        chat_id: &str,
+        payload: &TelegramPayload<'_>,
+    ) -> Result<(), ChatSendError> {
         for attempt in 0..TELEGRAM_MAX_RETRIES {
             let result = self
                 .client
                 .post(self.endpoint.expose())
                 .timeout(TELEGRAM_HTTP_TIMEOUT)
-                .json(&payload)
+                .json(payload)
                 .send()
                 .await;
 
@@ -350,13 +413,7 @@ impl TelegramNotifier {
                     continue;
                 }
                 Ok(response) if response.status().is_client_error() => {
-                    let status = response.status();
-                    tracing::error!(
-                        chat_id = %chat_id,
-                        status = %status,
-                        "Telegram returned client error, not retrying"
-                    );
-                    return Err(NotifyError::SendFailed(format!("client error: {}", status)));
+                    return Err(ChatSendError::Client(response.status()));
                 }
                 Ok(response) => {
                     tracing::warn!(
@@ -385,13 +442,7 @@ impl TelegramNotifier {
             }
         }
 
-        tracing::error!(
-            chat_id = %chat_id,
-            max_retries = TELEGRAM_MAX_RETRIES,
-            rule_name = %alert.rule_name,
-            "Telegram send exhausted retries"
-        );
-        Err(NotifyError::MaxRetriesExceeded)
+        Err(ChatSendError::RetriesExhausted)
     }
 }
 
@@ -659,7 +710,7 @@ mod tests {
         let payload = TelegramPayload {
             chat_id: "-100",
             text: "hello",
-            parse_mode: "HTML",
+            parse_mode: Some("HTML"),
             disable_notification: None,
             disable_web_page_preview: Some(true),
         };
@@ -862,9 +913,10 @@ mod tests {
             .await
             .expect("partial success should be Ok");
 
-        // 1 success + 2 permanent failures = 3 requests. The failing chats are
-        // 4xx so there is no retry.
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // 1 success + 2 permanent failures. The failing chats get a 400 in HTML
+        // mode, so each is resent once as plain text (rejected again) and then
+        // given up without retry: 1 + 2 * 2 = 5 requests.
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
@@ -876,7 +928,8 @@ mod tests {
                 ResponseTemplate::new(400)
                     .set_body_string("{\"ok\":false,\"description\":\"bad chat\"}"),
             )
-            .expect(2)
+            // Each chat: HTML request + one plain-text resend, both rejected.
+            .expect(4)
             .mount(&server)
             .await;
 
@@ -991,6 +1044,174 @@ mod tests {
         let alert = sample_alert("hello", "world");
         notifier.send(&alert).await.expect("should succeed");
         server.verify().await;
+    }
+
+    // ── Plain-text fallback on HTML rejection ────────────────────────────
+
+    /// Mount a responder answering the given statuses in order (the last one
+    /// repeats) and return the notifier pointed at it.
+    async fn scripted_notifier(
+        server: &MockServer,
+        statuses: &'static [u16],
+        parse_mode: &str,
+    ) -> TelegramNotifier {
+        let calls = Arc::new(AtomicU32::new(0));
+        Mock::given(method("POST"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+                let status = statuses[n.min(statuses.len() - 1)];
+                ResponseTemplate::new(status).set_body_string(if status == 200 {
+                    "{\"ok\":true}"
+                } else {
+                    "{\"ok\":false,\"description\":\"Bad Request: can't parse entities\"}"
+                })
+            })
+            .mount(server)
+            .await;
+        let mut notifier = test_notifier(server, vec!["-100A".to_string()]);
+        notifier.parse_mode = parse_mode.to_string();
+        notifier
+    }
+
+    async fn request_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_400_is_resent_once_as_plain_text() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&sample_alert("hi", "a < b"))
+            .await
+            .expect("plain-text resend should succeed");
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[0]["text"], bodies[1]["text"]);
+        assert_eq!(bodies[0]["chat_id"], bodies[1]["chat_id"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_parse_mode_is_matched_case_insensitively() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "html").await;
+
+        notifier.send(&sample_alert("hi", "body")).await.unwrap();
+
+        assert_eq!(request_bodies(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plain_text_resend_rejected_fails_chat() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 400], "HTML").await;
+
+        let err = notifier
+            .send_to_chat(&sample_alert("hi", "body"), "-100A", "text")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, NotifyError::SendFailed(msg) if msg == "client error: 400 Bad Request"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(request_bodies(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn markdown_400_is_not_resent() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "MarkdownV2").await;
+
+        assert!(notifier.send(&sample_alert("hi", "body")).await.is_err());
+        assert_eq!(request_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_403_is_not_resent() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[403, 200], "HTML").await;
+
+        assert!(notifier.send(&sample_alert("hi", "body")).await.is_err());
+        assert_eq!(request_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plain_text_resend_follows_retry_policy() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 500, 200], "HTML").await;
+
+        notifier
+            .send(&sample_alert("hi", "body"))
+            .await
+            .expect("resend should be retried after 5xx");
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert!(bodies[2].get("parse_mode").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn truncated_html_rejected_is_delivered_as_plain_text() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let bodies = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let mut notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+                // `<pre>` opened and never closed once the text is cut.
+                notifier.body_template_source = Some("<pre>{{ body }}</pre>".to_string());
+                let long_body = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 100);
+
+                notifier
+                    .send(&sample_alert("hi", &long_body))
+                    .await
+                    .expect("plain-text resend should deliver the alert");
+                request_bodies(&server).await
+            })
+        });
+
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("parse_mode").is_none());
+        let text = bodies[1]["text"].as_str().unwrap();
+        assert!(text.starts_with("<pre>"));
+        assert!(text.ends_with('…'));
+        assert_eq!(text.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+
+        let rendered = handle.render();
+        let truncated: Vec<_> = rendered
+            .lines()
+            .filter(|l| l.starts_with("valerter_alerts_truncated_total{"))
+            .collect();
+        assert_eq!(
+            truncated,
+            vec![
+                "valerter_alerts_truncated_total{notifier_type=\"telegram\",notifier_name=\"tg-test\"} 1"
+            ]
+        );
     }
 
     // ── Imports for the wiremock tests (kept near the tests to minimize

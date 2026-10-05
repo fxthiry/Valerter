@@ -17,6 +17,7 @@ use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::transport::smtp::response::{Code, Severity};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use minijinja::{Environment, context};
 use std::path::Path;
@@ -59,8 +60,63 @@ pub trait EmailTransport: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(())` - Email sent successfully
-    /// * `Err(String)` - Error message describing the failure
-    async fn send_email(&self, message: Message) -> Result<(), String>;
+    /// * `Err(EmailSendError)` - Failure, classified as permanent or transient
+    async fn send_email(&self, message: Message) -> Result<(), EmailSendError>;
+}
+
+/// Failure reported by an [`EmailTransport`].
+///
+/// `permanent` drives the retry decision: a permanent error is not retried
+/// for the recipient, a transient one is retried with backoff. `message` is
+/// only used for logs and the returned error, never for the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailSendError {
+    /// True for a 5xx SMTP reply, false for anything else.
+    pub permanent: bool,
+    /// Human-readable description of the failure.
+    pub message: String,
+}
+
+impl EmailSendError {
+    /// A permanent (non-retryable) failure.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            permanent: true,
+            message: message.into(),
+        }
+    }
+
+    /// A transient (retryable) failure.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            permanent: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EmailSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Classify an SMTP failure from its reply code.
+///
+/// A 5xx reply (RFC 5321 permanent negative completion, including `535`
+/// authentication failures) is permanent. A 4xx reply, or no reply at all
+/// (network, TLS, timeout, client-side errors), is transient. The message
+/// text never takes part in the decision.
+fn classify_smtp_status(status: Option<Code>, message: String) -> EmailSendError {
+    let permanent =
+        status.is_some_and(|code| code.severity == Severity::PermanentNegativeCompletion);
+    EmailSendError { permanent, message }
+}
+
+/// Classify a lettre SMTP error. `status()` is only set for 4xx/5xx replies,
+/// which is exactly what `is_permanent()`/`is_transient()` match on.
+fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> EmailSendError {
+    classify_smtp_status(error.status(), error.to_string())
 }
 
 /// Real SMTP transport wrapper implementing `EmailTransport`.
@@ -79,12 +135,12 @@ impl SmtpTransport {
 
 #[async_trait]
 impl EmailTransport for SmtpTransport {
-    async fn send_email(&self, message: Message) -> Result<(), String> {
+    async fn send_email(&self, message: Message) -> Result<(), EmailSendError> {
         self.inner
             .send(message)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| classify_smtp_error(&e))
     }
 }
 
@@ -99,10 +155,10 @@ impl EmailTransport for SmtpTransport {
 ///
 /// # Retry Policy
 ///
-/// - **Connection errors**: Retry (timeout, connection refused)
-/// - **Authentication errors**: Do NOT retry (invalid credentials)
-/// - **Transient SMTP errors**: Retry (4xx responses)
-/// - **Permanent SMTP errors**: Do NOT retry (5xx responses)
+/// - **Connection, TLS and timeout errors**: Retry (no SMTP reply)
+/// - **Transient SMTP errors**: Retry (4xx replies)
+/// - **Permanent SMTP errors**: Do NOT retry (5xx replies, including `535`
+///   authentication failures)
 ///
 /// # Testability (Story 7.2)
 ///
@@ -470,24 +526,23 @@ impl EmailNotifier {
                     );
                     return Ok(());
                 }
-                Err(error_str) => {
-                    // Check for permanent errors (don't retry)
-                    if Self::is_permanent_error(&error_str) {
+                Err(error) => {
+                    if error.permanent {
                         tracing::warn!(
                             recipient = %recipient,
-                            error = %error_str,
+                            error = %error,
                             "Permanent SMTP error, not retrying for this recipient"
                         );
                         return Err(NotifyError::SendFailed(format!(
                             "permanent error for {}: {}",
-                            recipient, error_str
+                            recipient, error
                         )));
                     }
 
                     tracing::debug!(
                         attempt = attempt,
                         recipient = %recipient,
-                        error = %error_str,
+                        error = %error,
                         "Failed to send email, retrying"
                     );
 
@@ -500,30 +555,6 @@ impl EmailNotifier {
         }
 
         Err(NotifyError::MaxRetriesExceeded)
-    }
-
-    /// Check if an SMTP error is permanent and should not be retried.
-    ///
-    /// Uses word boundary matching to avoid false positives when SMTP codes
-    /// appear in email addresses or other contexts.
-    fn is_permanent_error(error_str: &str) -> bool {
-        // Helper to check if a code appears as a word boundary (not part of email/text)
-        let contains_smtp_code = |code: &str| {
-            error_str
-                .split(|c: char| !c.is_ascii_digit())
-                .any(|segment| segment == code)
-        };
-
-        // Authentication failures
-        error_str.to_lowercase().contains("authentication")
-            || contains_smtp_code("535")
-            || error_str.to_lowercase().contains("invalid credentials")
-            // Mailbox/recipient permanent errors (5xx)
-            || contains_smtp_code("550") // Mailbox unavailable
-            || contains_smtp_code("551") // User not local
-            || contains_smtp_code("552") // Message size exceeded
-            || contains_smtp_code("553") // Mailbox name invalid
-            || contains_smtp_code("554") // Transaction failed
     }
 }
 
@@ -681,8 +712,8 @@ mod tests {
         send_count: AtomicU32,
         /// If Some, returns this error on next send.
         fail_next_n: AtomicU32,
-        /// Error message to return when failing.
-        error_message: Mutex<String>,
+        /// Error to return when failing.
+        error: Mutex<EmailSendError>,
     }
 
     /// Captured email for verification.
@@ -701,14 +732,14 @@ mod tests {
                 sent_messages: Mutex::new(Vec::new()),
                 send_count: AtomicU32::new(0),
                 fail_next_n: AtomicU32::new(0),
-                error_message: Mutex::new("mock failure".to_string()),
+                error: Mutex::new(EmailSendError::transient("mock failure")),
             }
         }
 
         /// Configure the mock to fail the next n sends.
-        pub fn fail_next(&self, count: u32, error: &str) {
+        pub fn fail_next(&self, count: u32, error: EmailSendError) {
             self.fail_next_n.store(count, Ordering::SeqCst);
-            *self.error_message.lock().unwrap() = error.to_string();
+            *self.error.lock().unwrap() = error;
         }
 
         /// Get the number of times send was called.
@@ -731,14 +762,14 @@ mod tests {
 
     #[async_trait]
     impl EmailTransport for MockEmailTransport {
-        async fn send_email(&self, message: Message) -> Result<(), String> {
+        async fn send_email(&self, message: Message) -> Result<(), EmailSendError> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
 
             // Check if we should fail
             let fail_count = self.fail_next_n.load(Ordering::SeqCst);
             if fail_count > 0 {
                 self.fail_next_n.fetch_sub(1, Ordering::SeqCst);
-                return Err(self.error_message.lock().unwrap().clone());
+                return Err(self.error.lock().unwrap().clone());
             }
 
             // Extract email details from the message
@@ -1364,7 +1395,10 @@ mod tests {
         // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
         let mock = Arc::new(MockEmailTransport::new());
         // Fail first 2 attempts with transient error, succeed on 3rd
-        mock.fail_next(2, "connection timeout");
+        mock.fail_next(
+            2,
+            EmailSendError::transient("network error: connection timeout"),
+        );
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("retry_test");
@@ -1381,7 +1415,10 @@ mod tests {
         // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
         let mock = Arc::new(MockEmailTransport::new());
         // Fail all 3 attempts
-        mock.fail_next(3, "connection timeout");
+        mock.fail_next(
+            3,
+            EmailSendError::transient("network error: connection timeout"),
+        );
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("fail_test");
@@ -1400,7 +1437,7 @@ mod tests {
     async fn mock_transport_no_retry_on_permanent_error() {
         let mock = Arc::new(MockEmailTransport::new());
         // Fail with authentication error (permanent)
-        mock.fail_next(1, "535 authentication failed");
+        mock.fail_next(1, smtp_reply_error("535 5.7.8 authentication failed"));
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("auth_fail_test");
@@ -1414,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn mock_transport_no_retry_on_550_mailbox_unavailable() {
         let mock = Arc::new(MockEmailTransport::new());
-        mock.fail_next(1, "550 mailbox unavailable");
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("mailbox_fail");
@@ -1430,7 +1467,7 @@ mod tests {
         // Test that if one recipient fails permanently, others still succeed
         let mock = Arc::new(MockEmailTransport::new());
         // First send fails permanently, others succeed
-        mock.fail_next(1, "550 mailbox unavailable");
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
 
         let notifier = EmailNotifier::with_transport(
             "partial-success",
@@ -1461,7 +1498,7 @@ mod tests {
     async fn mock_transport_all_recipients_fail_returns_error() {
         let mock = Arc::new(MockEmailTransport::new());
         // All sends fail permanently
-        mock.fail_next(3, "550 all mailboxes unavailable");
+        mock.fail_next(3, smtp_reply_error("550 all mailboxes unavailable"));
 
         let notifier = EmailNotifier::with_transport(
             "all-fail",
@@ -1480,6 +1517,137 @@ mod tests {
         let result = notifier.send(&alert).await;
 
         assert!(result.is_err(), "Should fail when all recipients fail");
+    }
+
+    // ===================================================================
+    // SMTP error classification (by reply code, never by message text)
+    // ===================================================================
+
+    /// Classify a raw SMTP reply line the way `SmtpTransport` does for a
+    /// lettre error carrying that reply.
+    fn smtp_reply_error(reply: &str) -> EmailSendError {
+        use lettre::transport::smtp::response::Response;
+        use std::str::FromStr;
+
+        let response = Response::from_str(&format!("{reply}\r\n")).expect("valid SMTP reply");
+        classify_smtp_status(Some(response.code()), reply.to_string())
+    }
+
+    #[test]
+    fn classify_5xx_replies_as_permanent() {
+        for reply in [
+            "535 5.7.8 authentication failed",
+            "550 mailbox unavailable",
+            "503 bad sequence of commands",
+        ] {
+            assert!(
+                smtp_reply_error(reply).permanent,
+                "{reply} should be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_4xx_replies_as_transient() {
+        for reply in [
+            "454 4.7.0 temporary authentication failure",
+            "451 4.3.0 local error in processing",
+            "421 4.4.2 queue id 15501 timed out, closing connection",
+        ] {
+            assert!(
+                !smtp_reply_error(reply).permanent,
+                "{reply} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_errors_without_reply_as_transient() {
+        for message in [
+            "network error: connection refused (mx550.example.com:550)",
+            "tls error: invalid peer certificate: 550",
+            "Connection error: timed out after 550 ms",
+        ] {
+            let error = classify_smtp_status(None, message.to_string());
+            assert!(!error.permanent, "{message} should be transient");
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn classify_lettre_error_without_reply_as_transient() {
+        use lettre::transport::smtp::response::Response;
+        use std::str::FromStr;
+
+        // A reply lettre cannot parse yields a lettre error with no status.
+        let error = Response::from_str("550").unwrap_err();
+        assert!(error.status().is_none());
+        assert!(!classify_smtp_error(&error).permanent);
+    }
+
+    #[tokio::test]
+    async fn mock_transport_permanent_error_single_attempt() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(3, smtp_reply_error("503 bad sequence of commands"));
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("permanent_503")).await;
+
+        assert!(result.is_err());
+        assert_eq!(mock.send_count(), 1, "Should NOT retry on a 5xx reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_retries_transient_error_mentioning_authentication() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(
+            3,
+            smtp_reply_error("454 4.7.0 temporary authentication failure"),
+        );
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("transient_454")).await;
+
+        assert!(result.is_err());
+        assert_eq!(mock.send_count(), 3, "4xx reply should be retried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_retries_network_error_mentioning_550() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(
+            3,
+            classify_smtp_status(None, "network error: mx550.example.com:550".to_string()),
+        );
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("network_550")).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            mock.send_count(),
+            3,
+            "error without reply should be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_error_message_names_recipient() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let recipient: Mailbox = "recipient@test.com".parse().unwrap();
+        let err = notifier
+            .send_to_recipient("subject", "body", &recipient)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, NotifyError::SendFailed(msg)
+                if msg == "permanent error for recipient@test.com: 550 mailbox unavailable"),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ===================================================================

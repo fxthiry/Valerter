@@ -206,27 +206,40 @@ notifiers:
   #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"
   # }
 
+  #
+  # Requests carry "Content-Type: application/json" unless headers set one.
+  # Values are inserted without escaping: in JSON bodies, use the tojson filter
+  # WITHOUT surrounding quotes ({{ body | tojson }}, not "{{ body }}"), or a
+  # quote or line break in a log line produces invalid JSON (logged as
+  # "Webhook body is not valid JSON"; the request is still sent).
+  # ${VAR} references are NOT resolved inside body_template.
+
   # slack-alerts:
   #   type: webhook
   #   url: "${SLACK_WEBHOOK_URL}"
+  #   body_template: |
+  #     {
+  #       "text": {{ ("*" ~ title ~ "*\n" ~ body) | tojson }},
+  #       "username": "Valerter"
+  #     }
 
   # pagerduty:
   #   type: webhook
   #   url: "https://events.pagerduty.com/v2/enqueue"
-  #   headers:
-  #     Authorization: "Token token=${PAGERDUTY_TOKEN}"
-  #     Content-Type: "application/json"
+  #   # Events API v2: the routing key in the body authenticates the event, no
+  #   # Authorization header needed. Replace the placeholder with your
+  #   # integration key (stored in clear text in this file).
   #   body_template: |
   #     {
-  #       "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+  #       "routing_key": "<your-integration-key>",
   #       "event_action": "trigger",
   #       "payload": {
-  #         "summary": "{{ title }}",
+  #         "summary": {{ title | tojson }},
   #         "source": "valerter",
   #         "severity": "error",
   #         "custom_details": {
-  #           "body": "{{ body }}",
-  #           "rule": "{{ rule_name }}"
+  #           "body": {{ body | tojson }},
+  #           "rule": {{ rule_name | tojson }}
   #         }
   #       }
   #     }
@@ -380,7 +393,6 @@ metrics:
 #   ${VL_TOKEN}                - Bearer token for VictoriaLogs
 #   ${SMTP_USER}, ${SMTP_PASSWORD} - Email credentials
 #   ${SLACK_WEBHOOK_URL}       - Slack webhook
-#   ${PAGERDUTY_TOKEN}         - PagerDuty API token
 #
 # Runtime variables (not substituted in config, read directly by the process):
 #   RUST_LOG   - Log level: error, warn, info (default), debug, trace

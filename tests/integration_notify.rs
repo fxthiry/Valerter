@@ -1006,3 +1006,128 @@ fn test_saturated_destination_drops_only_its_own_alerts() {
         "mm-ops must not drop anything:\n{rendered}"
     );
 }
+
+// ============================================================================
+// Webhook payload hardening: default Content-Type, tojson, invalid JSON warning
+// ============================================================================
+
+/// Send one alert through a webhook notifier and return the requests received
+/// by the mock server (which always answers 200).
+async fn send_webhook_once(
+    headers: HashMap<String, String>,
+    body_template: Option<String>,
+    body: &str,
+) -> Vec<wiremock::Request> {
+    use valerter::notify::Notifier;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let url = format!("{}/api/alerts", mock_server.uri());
+    let notifier = make_webhook_notifier("payload-webhook", &url, "POST", headers, body_template);
+    let mut payload =
+        make_payload_with_destinations("payload_rule", vec!["payload-webhook".to_string()]);
+    payload.message.body = body.to_string();
+
+    notifier.send(&payload).await.unwrap();
+    mock_server.received_requests().await.unwrap()
+}
+
+fn content_types(request: &wiremock::Request) -> Vec<String> {
+    request
+        .headers
+        .get_all("content-type")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_webhook_default_body_has_json_content_type() {
+    let requests = send_webhook_once(HashMap::new(), None, "Test body content").await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(content_types(&requests[0]), vec!["application/json"]);
+}
+
+#[tokio::test]
+async fn test_webhook_body_template_has_json_content_type() {
+    let requests = send_webhook_once(
+        HashMap::new(),
+        Some(r#"{"text": {{ body | tojson }}}"#.to_string()),
+        "Test body content",
+    )
+    .await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(content_types(&requests[0]), vec!["application/json"]);
+}
+
+#[tokio::test]
+async fn test_webhook_configured_content_type_not_duplicated() {
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".to_string(), "text/plain".to_string());
+    let requests = send_webhook_once(headers, Some("{{ body }}".to_string()), "plain").await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(content_types(&requests[0]), vec!["text/plain"]);
+}
+
+#[tokio::test]
+async fn test_webhook_invalid_json_body_still_sent() {
+    // Unescaped quote: the notifier warns but still sends the request.
+    let requests = send_webhook_once(
+        HashMap::new(),
+        Some(r#"{"text": "{{ body }}"}"#.to_string()),
+        r#"say "hi""#,
+    )
+    .await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        String::from_utf8(requests[0].body.clone()).unwrap(),
+        r#"{"text": "say "hi""}"#
+    );
+}
+
+#[tokio::test]
+async fn test_webhook_non_json_content_type_body_sent() {
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".to_string(), "text/plain".to_string());
+    let requests = send_webhook_once(headers, Some("{{ body }}".to_string()), "not json").await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"not json");
+}
+
+#[tokio::test]
+async fn test_webhook_tojson_body_is_valid_json() {
+    let original = "say \"hi\"\npath C:\\tmp";
+    let requests = send_webhook_once(
+        HashMap::new(),
+        Some(r#"{"text": {{ body | tojson }}}"#.to_string()),
+        original,
+    )
+    .await;
+
+    assert_eq!(requests.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(parsed["text"], original);
+}
+
+#[tokio::test]
+async fn test_webhook_env_var_syntax_in_body_template_sent_literally() {
+    let requests = send_webhook_once(
+        HashMap::new(),
+        Some(r#"{"routing_key": "${ROUTING_KEY}"}"#.to_string()),
+        "body",
+    )
+    .await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, br#"{"routing_key": "${ROUTING_KEY}"}"#);
+}
