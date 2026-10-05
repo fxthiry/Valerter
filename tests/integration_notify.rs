@@ -20,6 +20,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
 
 fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body content".to_string(),
@@ -1119,15 +1120,134 @@ async fn test_webhook_tojson_body_is_valid_json() {
     assert_eq!(parsed["text"], original);
 }
 
+// ============================================================================
+// `${VAR}` in the webhook body_template: resolved in the source only
+// ============================================================================
+
+/// Send one alert through an already built webhook notifier and return the
+/// requests received by the mock server (which always answers 200).
+async fn send_with_notifier(
+    server: &MockServer,
+    notifier: &WebhookNotifier,
+    body: &str,
+) -> Vec<wiremock::Request> {
+    use valerter::notify::Notifier;
+
+    let mut payload =
+        make_payload_with_destinations("payload_rule", vec!["payload-webhook".to_string()]);
+    payload.message.body = body.to_string();
+    notifier.send(&payload).await.unwrap();
+    server.received_requests().await.unwrap()
+}
+
+async fn start_ok_server() -> MockServer {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+    mock_server
+}
+
 #[tokio::test]
-async fn test_webhook_env_var_syntax_in_body_template_sent_literally() {
-    let requests = send_webhook_once(
-        HashMap::new(),
-        Some(r#"{"routing_key": "${ROUTING_KEY}"}"#.to_string()),
-        "body",
-    )
-    .await;
+#[serial_test::serial]
+async fn test_webhook_env_var_in_body_template_is_resolved() {
+    let mock_server = start_ok_server().await;
+    let url = format!("{}/api/alerts", mock_server.uri());
+    // Only the notifier construction reads the environment.
+    let notifier = temp_env::with_var("ROUTING_KEY", Some("abc123"), || {
+        make_webhook_notifier(
+            "payload-webhook",
+            &url,
+            "POST",
+            HashMap::new(),
+            Some(r#"{"routing_key": "${ROUTING_KEY}"}"#.to_string()),
+        )
+    });
+
+    let requests = send_with_notifier(&mock_server, &notifier, "body").await;
 
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].body, br#"{"routing_key": "${ROUTING_KEY}"}"#);
+    assert_eq!(requests[0].body, br#"{"routing_key": "abc123"}"#);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_webhook_env_var_syntax_in_alert_body_sent_literally() {
+    let mock_server = start_ok_server().await;
+    let url = format!("{}/api/alerts", mock_server.uri());
+    let notifier = temp_env::with_var("HOME", Some("/home/secret"), || {
+        make_webhook_notifier(
+            "payload-webhook",
+            &url,
+            "POST",
+            HashMap::new(),
+            Some(r#"{"text": {{ body | tojson }}}"#.to_string()),
+        )
+    });
+
+    let requests = send_with_notifier(&mock_server, &notifier, "path is ${HOME}").await;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, br#"{"text": "path is ${HOME}"}"#);
+}
+
+// ============================================================================
+// Mattermost: rule-level mattermost_channel override and fallback
+// ============================================================================
+
+#[tokio::test]
+async fn test_mattermost_rule_channel_override_falls_back_without_channel() {
+    let mock_server = MockServer::start().await;
+    // Webhook locked to its own channel: the override is rejected once.
+    Mock::given(method("POST"))
+        .and(path("/hooks/locked"))
+        .and(body_partial_json(serde_json::json!({"channel": "alerts"})))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hooks/locked"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut registry = NotifierRegistry::new();
+    registry
+        .register(Arc::new(MattermostNotifier::with_options(
+            "default".to_string(),
+            SecretString::new(format!("{}/hooks/locked", mock_server.uri())),
+            Some("ops".to_string()),
+            None,
+            None,
+            make_client(),
+        )))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let mut payload = make_payload("override_rule");
+    payload.mattermost_channel = Some("alerts".to_string());
+    queue.send(payload).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let worker_handle = tokio::spawn(async move {
+        worker.run(cancel_clone).await;
+    });
+    wait_for_requests(&mock_server, 2, Duration::from_secs(5)).await;
+    cancel.cancel();
+    worker_handle.await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(first["channel"], "alerts");
+    assert!(second.get("channel").is_none());
+    mock_server.verify().await;
 }

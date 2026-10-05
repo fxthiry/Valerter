@@ -615,6 +615,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         // Get template name and destinations for this rule (both are now required)
         let template_name = ctx.rule.notify.template.clone();
         let destinations = ctx.rule.notify.destinations.clone();
+        let mattermost_channel = ctx.rule.notify.mattermost_channel.clone();
         debug!(
             template_name = %template_name,
             destination_count = destinations.len(),
@@ -644,6 +645,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
         let vl_source = Arc::new(ctx.vl_source_name.clone());
         let template_name = Arc::new(template_name);
         let destinations = Arc::new(destinations);
+        let mattermost_channel = Arc::new(mattermost_channel);
         let template_engine = ctx.template_engine;
         let queue = ctx.queue;
         let timestamp_timezone = Arc::new(ctx.timestamp_timezone.clone());
@@ -663,6 +665,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
                     let rule_name = rule_name.clone();
                     let vl_source = Arc::clone(&vl_source);
                     let destinations = Arc::clone(&destinations);
+                    let mattermost_channel = Arc::clone(&mattermost_channel);
                     let timestamp_timezone = Arc::clone(&timestamp_timezone);
 
                     async move {
@@ -675,6 +678,7 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
                             &rule_name,
                             &vl_source,
                             &destinations,
+                            mattermost_channel.as_deref(),
                             &queue,
                             &timestamp_timezone,
                         )
@@ -720,6 +724,7 @@ async fn process_log_line(
     rule_name: &str,
     vl_source: &str,
     destinations: &[String],
+    mattermost_channel: Option<&str>,
     queue: &NotificationQueue,
     timestamp_timezone: &str,
 ) -> Result<(), ProcessError> {
@@ -778,6 +783,7 @@ async fn process_log_line(
         rule_name: rule_name.to_string(),
         vl_source: vl_source.to_string(),
         destinations: destinations.to_vec(),
+        mattermost_channel: mattermost_channel.map(str::to_string),
         log_timestamp,
         log_timestamp_formatted,
     };
@@ -1541,6 +1547,7 @@ mod tests {
             "test_rule",
             "vlprod",
             &destinations,
+            None,
             &queue,
             "UTC",
         )
@@ -1574,6 +1581,7 @@ mod tests {
             "test_rule",
             "vlprod",
             &["mattermost-test".to_string()],
+            None,
             &queue,
             "UTC",
         )
@@ -1609,6 +1617,7 @@ mod tests {
             "test_rule",
             "vlprod",
             &["mattermost-test".to_string()],
+            None,
             &queue,
             "UTC",
         )
@@ -1626,6 +1635,7 @@ mod tests {
             "test_rule",
             "vlprod",
             &["mattermost-test".to_string()],
+            None,
             &queue,
             "UTC",
         )
@@ -1660,6 +1670,7 @@ mod tests {
             "test_rule",
             "vlprod",
             &destinations,
+            None,
             &queue,
             "UTC",
         )
@@ -1677,6 +1688,51 @@ mod tests {
         assert_eq!(payload.log_timestamp, "2026-01-09T10:00:00Z");
         assert_eq!(payload.log_timestamp_formatted, "09/01/2026 10:00:00 UTC");
         assert_eq!(payload.vl_source, "vlprod");
+        assert_eq!(payload.mattermost_channel, None);
+    }
+
+    #[tokio::test]
+    async fn process_log_line_carries_rule_mattermost_channel() {
+        let parser = RuleParser::new(None, None);
+        let throttle_config = CompiledThrottle {
+            key_template: None,
+            count: 10,
+            window: Duration::from_secs(60),
+        };
+        let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
+        let template_engine = TemplateEngine::new(make_test_templates());
+        let queue = make_test_queue();
+        let destinations = vec!["mattermost-test".to_string()];
+
+        for (line, channel) in [
+            (
+                r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"with"}"#,
+                Some("alerts"),
+            ),
+            (
+                r#"{"_time":"2026-01-09T10:00:01Z","_stream":"{}","_msg":"without"}"#,
+                None,
+            ),
+        ] {
+            process_log_line(
+                line,
+                &parser,
+                &throttler,
+                &template_engine,
+                "default",
+                "test_rule",
+                "vlprod",
+                &destinations,
+                channel,
+                &queue,
+                "UTC",
+            )
+            .await
+            .unwrap();
+
+            let payload = queue.take_pending("mattermost-test").unwrap();
+            assert_eq!(payload.mattermost_channel.as_deref(), channel);
+        }
     }
 
     // ===================================================================

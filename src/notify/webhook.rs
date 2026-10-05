@@ -93,7 +93,7 @@ pub struct WebhookNotifier {
     method: Method,
     /// Headers to include in requests (secrets resolved).
     headers: HeaderMap,
-    /// Body template source (if configured).
+    /// Body template source, environment variables resolved (if configured).
     body_template_source: Option<String>,
 }
 
@@ -228,16 +228,23 @@ impl WebhookNotifier {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
 
-        // Validate body template if provided (syntax, then render test)
+        // Resolve `${VAR}` in the template source (never in rendered values),
+        // then validate the resolved source (syntax, then render test). The
+        // resolved source may hold a secret: it is never logged.
         let body_template_source = match &config.body_template {
             Some(template_str) => {
-                validate_notifier_template("body_template", template_str).map_err(|message| {
+                let resolved =
+                    resolve_env_vars(template_str).map_err(|e| ConfigError::InvalidNotifier {
+                        name: name.to_string(),
+                        message: format!("body_template: {}", e),
+                    })?;
+                validate_notifier_template("body_template", &resolved).map_err(|message| {
                     ConfigError::InvalidNotifier {
                         name: name.to_string(),
                         message,
                     }
                 })?;
-                Some(template_str.clone())
+                Some(resolved)
             }
             None => None,
         };
@@ -426,6 +433,7 @@ mod tests {
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
         AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
@@ -700,6 +708,7 @@ mod tests {
     #[test]
     fn default_webhook_payload_is_generic() {
         let alert = AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: "Simple".to_string(),
                 body: "Body".to_string(),
@@ -841,6 +850,7 @@ mod tests {
         let source = r#"{"title": "{{ title }}", "rule": "{{ rule_name }}", "log_time": "{{ log_timestamp_formatted }}"}"#;
 
         let alert = AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: "Test".to_string(),
                 body: "Body".to_string(),
@@ -1099,12 +1109,59 @@ mod tests {
         assert_eq!(parsed["text"], original);
     }
 
-    #[test]
-    fn body_template_env_var_syntax_is_sent_literally() {
-        let alert = make_alert_payload("test_rule");
-        let body = render_body_template(r#"{"routing_key": "${ROUTING_KEY}"}"#, &alert).unwrap();
+    // ===================================================================
+    // `${VAR}` resolution in body_template
+    // ===================================================================
 
-        assert_eq!(body, r#"{"routing_key": "${ROUTING_KEY}"}"#);
+    #[test]
+    #[serial]
+    fn from_config_resolves_env_var_in_body_template() {
+        temp_env::with_var("TEST_ROUTING_KEY", Some("abc123"), || {
+            let config = body_template_config(r#"{"routing_key": "${TEST_ROUTING_KEY}"}"#);
+            let notifier =
+                WebhookNotifier::from_config("pagerduty", &config, reqwest::Client::new()).unwrap();
+
+            let body = notifier.build_body(&make_alert_payload("r")).unwrap();
+            assert_eq!(body, r#"{"routing_key": "abc123"}"#);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn from_config_fails_on_undefined_env_var_in_body_template() {
+        temp_env::with_var("UNDEFINED_ROUTING_KEY", None::<&str>, || {
+            let config = body_template_config(r#"{"routing_key": "${UNDEFINED_ROUTING_KEY}"}"#);
+            let err = from_config_error(&config);
+
+            // Same wording as `url` and `headers`.
+            assert!(
+                err.starts_with("invalid notifier 'wh': body_template: "),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains("undefined environment variable: UNDEFINED_ROUTING_KEY"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn debug_output_does_not_expose_resolved_body_template() {
+        temp_env::with_var("TEST_BODY_SECRET", Some("s3cr3t-routing-key"), || {
+            let config = body_template_config(r#"{"routing_key": "${TEST_BODY_SECRET}"}"#);
+            let notifier =
+                WebhookNotifier::from_config("pagerduty", &config, reqwest::Client::new()).unwrap();
+            let debug = format!("{:?}", notifier);
+
+            assert!(!debug.contains("s3cr3t-routing-key"));
+            assert!(debug.contains("has_body_template: true"));
+        });
+    }
+
+    #[test]
+    fn rendered_values_are_not_env_resolved() {
+        let alert = make_alert_with_body("path is ${HOME}");
+        let body = render_body_template(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
+
+        assert_eq!(body, r#"{"text": "path is ${HOME}"}"#);
     }
 
     /// Body templates of the examples in docs/notifiers.md and
@@ -1113,7 +1170,7 @@ mod tests {
         (
             "pagerduty",
             r#"{
-  "routing_key": "<your-integration-key>",
+  "routing_key": "${PAGERDUTY_ROUTING_KEY}",
   "event_action": "trigger",
   "payload": {
     "summary": {{ title | tojson }},
@@ -1150,19 +1207,40 @@ mod tests {
     ];
 
     #[test]
+    #[serial]
     fn doc_example_templates_render_valid_json() {
         let mut alert = make_alert_with_body("line 1 \"quoted\"\nline 2 C:\\path <x> & y");
         alert.message.title = "Disk \"full\" on db-1".to_string();
 
-        for (name, source) in DOC_EXAMPLE_TEMPLATES {
-            validate_notifier_template("body_template", source).unwrap();
-            let body = render_body_template(source, &alert).unwrap();
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
-            assert!(
-                parsed.is_ok(),
-                "{name} example rendered invalid JSON: {body}"
-            );
-        }
+        temp_env::with_var("PAGERDUTY_ROUTING_KEY", Some("abc123"), || {
+            for (name, source) in DOC_EXAMPLE_TEMPLATES {
+                let notifier = WebhookNotifier::from_config(
+                    name,
+                    &body_template_config(source),
+                    reqwest::Client::new(),
+                )
+                .unwrap();
+                let body = notifier.build_body(&alert).unwrap();
+                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
+                assert!(
+                    parsed.is_ok(),
+                    "{name} example rendered invalid JSON: {body}"
+                );
+            }
+        });
+
+        let pagerduty = temp_env::with_var("PAGERDUTY_ROUTING_KEY", Some("abc123"), || {
+            WebhookNotifier::from_config(
+                "pagerduty",
+                &body_template_config(DOC_EXAMPLE_TEMPLATES[0].1),
+                reqwest::Client::new(),
+            )
+            .unwrap()
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pagerduty.build_body(&alert).unwrap()).unwrap();
+        assert_eq!(parsed["routing_key"], "abc123");
+        assert_eq!(parsed["payload"]["summary"], alert.message.title);
 
         let slack = render_body_template(DOC_EXAMPLE_TEMPLATES[1].1, &alert).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&slack).unwrap();

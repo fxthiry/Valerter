@@ -703,6 +703,7 @@ mod tests {
         use crate::parser::record_parse_error;
 
         let alert = AlertPayload {
+            mattermost_channel: None,
             message: crate::template::RenderedMessage {
                 title: String::new(),
                 body: String::new(),

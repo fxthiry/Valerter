@@ -32,7 +32,7 @@ notifiers:
     method: POST                    # Optional, default: POST
     body_template: |
       {
-        "routing_key": "<your-integration-key>",
+        "routing_key": "${PAGERDUTY_ROUTING_KEY}",
         "event_action": "trigger",
         "payload": {
           "summary": {{ title | tojson }},
@@ -47,10 +47,9 @@ notifiers:
 ```
 
 The PagerDuty Events API v2 authenticates with the `routing_key` in the body, so no
-`Authorization` header is needed. Replace `<your-integration-key>` with the integration
-key of your PagerDuty service: the key is then stored in clear text in the configuration
-file, so restrict its permissions accordingly. `${VAR}` references are **not** resolved
-inside `body_template` (they are sent literally).
+`Authorization` header is needed. Set `PAGERDUTY_ROUTING_KEY` to the integration key of
+your PagerDuty service in the daemon's environment: the key stays out of the
+configuration file (see [`${VAR}` in `body_template`](#var-in-body_template)).
 
 ### Fields
 
@@ -59,7 +58,22 @@ inside `body_template` (they are sent literally).
 | `url` | Yes | Endpoint URL (`http` or `https`, supports `${VAR}` substitution) |
 | `method` | No | HTTP method (default: `POST`) |
 | `headers` | No | Custom headers (supports `${VAR}` substitution) |
-| `body_template` | No | Custom JSON body (Jinja2 template) |
+| `body_template` | No | Custom JSON body (Jinja2 template, supports `${VAR}` substitution in its source) |
+
+### `${VAR}` in `body_template`
+
+Like `url` and `headers`, `body_template` supports `${VAR}` placeholders, resolved
+from the environment **once, in the template source**, when the notifier is built
+(daemon startup and `valerter --validate`):
+
+- An undefined variable refuses the configuration with
+  `invalid notifier '<name>': body_template: invalid configuration: undefined environment variable: <VAR>`.
+  There is no escape syntax: a literal `${...}` cannot be kept in the template.
+- Values rendered from logs are never resolved: a `${HOME}` in a log line is sent as is.
+- The resolved value is inserted **as is** in the template source, before Jinja
+  parses it. A value containing `{{`, `{%` or `"` is interpreted by Jinja or breaks
+  the JSON body: keep such values out of `body_template` (use a header instead).
+- The resolved template is never logged, so a secret placed there is not exposed.
 
 ### Checks at startup and in `--validate`
 
@@ -67,9 +81,10 @@ The notifier is built at daemon startup and by `valerter --validate`, which
 refuse the configuration (`invalid notifier '<name>': ...`, logged under
 `Notifier configuration error`) when:
 
+- `url`, `headers` or `body_template` reference an undefined `${VAR}`.
 - `url`, once `${VAR}` placeholders are resolved, does not parse or does not use
   `http`/`https` (`url: invalid URL: ...`). The URL itself is never printed.
-- `body_template` has a syntax error (`body_template: ...`) or uses an unknown
+- `body_template` (after `${VAR}` resolution) has a syntax error (`body_template: ...`) or uses an unknown
   filter, test, function or method (`body_template render: ...`). The template is
   test-rendered with placeholder values, so value-dependent errors such as
   `{{ status | int }}` are not reported at this stage.
@@ -319,7 +334,7 @@ notifiers:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `webhook_url` | Yes | Mattermost incoming webhook URL (`http` or `https`, supports `${VAR}` substitution) |
-| `channel` | No | Override default channel |
+| `channel` | No | Override default channel (a rule's `notify.mattermost_channel` takes precedence) |
 | `username` | No | Bot username |
 | `icon_url` | No | Bot avatar URL |
 
@@ -327,6 +342,44 @@ notifiers:
 daemon startup and by `valerter --validate`: a value that does not parse or does
 not use `http`/`https` is refused with `invalid notifier '<name>': webhook_url:
 invalid URL: ...`, without printing the URL (it carries the hook token).
+
+### Channel per rule
+
+A rule can send its alerts to another channel with `notify.mattermost_channel`:
+
+```yaml
+rules:
+  - name: "db_errors"
+    query: '_stream:{app="db"} level:error'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "default_alert"
+      mattermost_channel: "db-alerts"   # Only used by Mattermost destinations
+      destinations:
+        - mattermost-ops
+```
+
+The channel is chosen in this order: the rule's `mattermost_channel`, then the
+notifier's `channel`, then the default channel of the incoming webhook (no
+`channel` key is sent). Other notifier types ignore `mattermost_channel`, and a
+rule that sets it without any Mattermost destination logs
+`mattermost_channel ignored - no mattermost notifier in destinations` at startup.
+
+If Mattermost rejects the rule's channel with a 4xx response other than 429
+(webhook locked to its own channel with "Lock to this channel", channel that
+does not exist), the alert is **resent once without `channel`**, so it lands in
+the webhook's default channel instead of being lost, and this warning is logged
+for every such alert until the configuration is fixed:
+
+```
+WARN Mattermost rejected channel override, resending without channel notifier_name=mattermost-ops rule_name=db_errors channel=db-alerts status=400 Bad Request
+```
+
+The resend follows the usual retry policy; a 4xx on the resend fails the alert
+(`client error: <status>`). There is no such fallback for the notifier's own
+`channel`: a 4xx fails the alert immediately.
 
 ### accent_color
 
@@ -474,7 +527,7 @@ All notifiers implement exponential backoff retry, up to **3 attempts** per send
 | `webhook`, `mattermost`, `telegram` | 500ms | 5s |
 | `email` | 1s | 30s |
 
-What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) for its single exception); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
+What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) and the Mattermost [resend without channel](#channel-per-rule) for the two exceptions); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
 
 After all retries are exhausted, the alert is marked as failed and logged.
 
@@ -499,7 +552,7 @@ Metrics count each alert **once per notifier** (see [Metrics](metrics.md)): `val
 
 1. Verify webhook URL is correct
 2. Check webhook is enabled in Mattermost
-3. Verify channel exists (if specified)
+3. Verify channel exists (if specified); a rejected `mattermost_channel` logs `Mattermost rejected channel override, resending without channel`
 4. Check logs for HTTP errors
 
 ## See Also

@@ -647,3 +647,140 @@ fn validate_telegram_unsupported_parse_mode_exits_failure() {
         stderr
     );
 }
+
+// ============================================================================
+// docs/notifiers.md examples pass --validate
+// ============================================================================
+
+/// Every ```yaml block of docs/notifiers.md that declares a notifier, as
+/// (notifier name, block). Blocks loading an external file
+/// (`body_template_file`) are skipped: the file is not shipped.
+fn doc_notifier_examples() -> Vec<(String, String)> {
+    let doc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("notifiers.md");
+    let doc = std::fs::read_to_string(&doc_path).expect("Failed to read docs/notifiers.md");
+
+    doc.split("```yaml\n")
+        .skip(1)
+        .filter_map(|chunk| chunk.split("\n```").next())
+        .filter(|block| block.starts_with("notifiers:\n") && !block.contains("body_template_file"))
+        .map(|block| {
+            let name = block
+                .lines()
+                .nth(1)
+                .and_then(|l| l.trim().strip_suffix(':'))
+                .expect("notifier name on the second line")
+                .to_string();
+            (name, block.to_string())
+        })
+        .collect()
+}
+
+/// Run `valerter --validate` on a configuration routing one rule to the
+/// notifier of a docs/notifiers.md example.
+fn run_validate_doc_example(name: &str, block: &str, envs: &[(&str, &str)]) -> Output {
+    let config = format!(
+        r#"victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{{{ _msg }}}}"
+    body: "Message: {{{{ _msg }}}}"
+    email_body_html: "<p>{{{{ _msg }}}}</p>"
+
+{block}
+
+rules:
+  - name: "r"
+    query: '_stream:{{app="myapp"}}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "{name}"
+"#
+    );
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, config).expect("Failed to write config");
+
+    Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(&config_path)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("Failed to run valerter")
+}
+
+/// Dummy values for the `${VAR}` referenced by the docs/notifiers.md examples.
+const DOC_EXAMPLE_ENV: &[(&str, &str)] = &[
+    ("PAGERDUTY_ROUTING_KEY", "dummy-routing-key"),
+    (
+        "SLACK_WEBHOOK_URL",
+        "https://hooks.slack.example.com/services/dummy",
+    ),
+    (
+        "DISCORD_WEBHOOK_URL",
+        "https://discord.example.com/api/webhooks/dummy",
+    ),
+    ("API_TOKEN", "dummy-token"),
+    ("SMTP_USER", "dummy_smtp_user"),
+    ("SMTP_PASSWORD", "dummy_smtp_pass"),
+    ("TELEGRAM_BOT_TOKEN", "dummy_bot_token"),
+];
+
+#[test]
+fn doc_notifier_examples_pass_validate() {
+    let examples = doc_notifier_examples();
+    assert!(
+        examples.iter().any(|(name, _)| name == "pagerduty"),
+        "the PagerDuty example should be found in docs/notifiers.md"
+    );
+
+    for (name, block) in &examples {
+        let output = run_validate_doc_example(name, block, DOC_EXAMPLE_ENV);
+        assert!(
+            output.status.success(),
+            "docs/notifiers.md example '{}' must pass --validate (exit 0)\nstdout: {}\nstderr: {}",
+            name,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+// Test: an undefined ${VAR} in a webhook body_template fails the preflight,
+// without echoing the template
+#[test]
+fn validate_webhook_body_template_undefined_env_var_exits_failure() {
+    let (name, block) = doc_notifier_examples()
+        .into_iter()
+        .find(|(name, _)| name == "pagerduty")
+        .expect("PagerDuty example in docs/notifiers.md");
+    let output = run_validate_doc_example(&name, &block, &[]);
+    let stderr = assert_preflight_failure(&output);
+
+    assert!(
+        stderr.contains(
+            "invalid notifier 'pagerduty': body_template: invalid configuration: \
+             undefined environment variable: PAGERDUTY_ROUTING_KEY"
+        ),
+        "stderr should report the undefined variable: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("event_action"),
+        "stderr should not echo the template: {}",
+        stderr
+    );
+}

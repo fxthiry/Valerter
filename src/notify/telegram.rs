@@ -586,6 +586,7 @@ mod tests {
 
     fn sample_alert(title: &str, body: &str) -> AlertPayload {
         AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: title.to_string(),
                 body: body.to_string(),
