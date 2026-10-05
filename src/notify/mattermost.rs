@@ -248,17 +248,20 @@ impl Notifier for MattermostNotifier {
             let mut delivery = self.post_with_retries(&mattermost_payload).await;
 
             // A rejected rule override (locked webhook, unknown channel) is
-            // resent once without `channel`, to the webhook's default channel.
+            // resent once to the notifier's channel if it has one (and it
+            // differs), otherwise without `channel`, to the webhook's default.
             if let (Delivery::ClientError(status), Some(channel)) = (&delivery, rule_channel) {
+                let fallback_channel = self.channel.as_deref().filter(|c| *c != channel);
                 tracing::warn!(
                     notifier_name = %self.name,
                     rule_name = %alert.rule_name,
                     channel = %channel,
+                    fallback_channel = fallback_channel.map(tracing::field::display),
                     status = %status,
-                    "Mattermost rejected channel override, resending without channel"
+                    "Mattermost rejected channel override, resending to notifier default"
                 );
                 let fallback_payload = MattermostPayload {
-                    channel: None,
+                    channel: fallback_channel.map(str::to_string),
                     ..mattermost_payload
                 };
                 delivery = self.post_with_retries(&fallback_payload).await;
@@ -660,21 +663,14 @@ mod tests {
         assert!(out.bodies[0].get("channel").is_none());
     }
 
-    #[test]
-    fn rejected_rule_channel_is_resent_without_channel() {
-        let out = send_with_responses(Some("ops"), make_alert(Some("alerts")), &[400]);
-
-        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
-        assert_eq!(out.bodies.len(), 2);
-        assert_eq!(out.bodies[0]["channel"], "alerts");
-        assert!(out.bodies[1].get("channel").is_none());
-        // Same message otherwise.
-        assert_eq!(out.bodies[0]["attachments"], out.bodies[1]["attachments"]);
-
+    /// The fallback warning line, which must never carry the webhook URL.
+    fn fallback_warning(out: &SendOutcome) -> &str {
         let warn = out
             .logs
             .lines()
-            .find(|l| l.contains("Mattermost rejected channel override, resending without channel"))
+            .find(|l| {
+                l.contains("Mattermost rejected channel override, resending to notifier default")
+            })
             .unwrap_or_else(|| panic!("missing fallback warning in:\n{}", out.logs));
         assert!(warn.contains("WARN"));
         assert!(warn.contains("notifier_name=mm"));
@@ -686,6 +682,20 @@ mod tests {
             "webhook URL leaked:\n{}",
             out.logs
         );
+        warn
+    }
+
+    #[test]
+    fn rejected_rule_channel_is_resent_to_notifier_channel() {
+        let out = send_with_responses(Some("ops"), make_alert(Some("alerts")), &[400]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 2);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+        assert_eq!(out.bodies[1]["channel"], "ops");
+        // Same message otherwise.
+        assert_eq!(out.bodies[0]["attachments"], out.bodies[1]["attachments"]);
+        assert!(fallback_warning(&out).contains("fallback_channel=ops"));
 
         assert_eq!(counter_total(&out.metrics, "valerter_alerts_sent_total"), 1);
         assert_eq!(
@@ -696,6 +706,28 @@ mod tests {
             counter_total(&out.metrics, "valerter_notify_errors_total"),
             0
         );
+    }
+
+    #[test]
+    fn rejected_rule_channel_without_notifier_channel_is_resent_without_channel() {
+        let out = send_with_responses(None, make_alert(Some("alerts")), &[400]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 2);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+        assert!(out.bodies[1].get("channel").is_none());
+        assert!(!fallback_warning(&out).contains("fallback_channel"));
+        assert_eq!(counter_total(&out.metrics, "valerter_alerts_sent_total"), 1);
+    }
+
+    #[test]
+    fn rejected_rule_channel_equal_to_notifier_channel_is_resent_without_channel() {
+        let out = send_with_responses(Some("ops"), make_alert(Some("ops")), &[400]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 2);
+        assert_eq!(out.bodies[0]["channel"], "ops");
+        assert!(out.bodies[1].get("channel").is_none());
     }
 
     #[test]
@@ -744,7 +776,7 @@ mod tests {
             out.result.unwrap_err().to_string(),
             "failed to send notification: client error: 400 Bad Request"
         );
-        assert!(!out.logs.contains("resending without channel"));
+        assert!(!out.logs.contains("Mattermost rejected channel override"));
     }
 
     #[test]
@@ -755,6 +787,6 @@ mod tests {
         assert_eq!(out.bodies.len(), 2);
         assert_eq!(out.bodies[0]["channel"], "alerts");
         assert_eq!(out.bodies[1]["channel"], "alerts");
-        assert!(!out.logs.contains("resending without channel"));
+        assert!(!out.logs.contains("Mattermost rejected channel override"));
     }
 }

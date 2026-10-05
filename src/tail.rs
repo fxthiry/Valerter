@@ -31,14 +31,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONNECTION, HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, info, trace, warn};
 
-use crate::config::{BasicAuthConfig, SecretString, TlsConfig, VlSourceConfig};
+use crate::config::{BasicAuthConfig, SecretString, TlsConfig, VlSourceConfig, redact_url};
 use crate::error::StreamError;
+use crate::http_body::read_body_prefix;
 use crate::stream_buffer::{MAX_LINE_SIZE, StreamBuffer};
 
 // Note: No read_timeout - VictoriaLogs tail endpoint doesn't send keepalives,
@@ -94,6 +94,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of characters of an error response body kept in logs.
 const ERROR_BODY_MAX_CHARS: usize = 512;
+
+/// Bytes of a non-2xx response body read at most (512 characters are at most
+/// 2 KiB of UTF-8, with margin).
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+
+/// Time spent reading a non-2xx response body at most.
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of characters of an invalid header name kept in errors.
 const HEADER_NAME_MAX_CHARS: usize = 64;
@@ -169,8 +176,13 @@ fn invalid_header_error(name: &str) -> StreamError {
 /// Reads the body of a non-2xx VictoriaLogs response so the actual error
 /// (e.g. `unsupported pipe "stats" in /tail`) surfaces in logs instead of a
 /// bare status code (issue #42). Truncated and collapsed to a single line.
+///
+/// At most [`ERROR_BODY_MAX_BYTES`] are read, for at most
+/// [`ERROR_BODY_READ_TIMEOUT`]: a proxy streaming an endless error body must
+/// not block the task.
 async fn response_error_body(resp: reqwest::Response) -> String {
-    let text = resp.text().await.unwrap_or_default();
+    let bytes = read_body_prefix(resp, ERROR_BODY_MAX_BYTES, ERROR_BODY_READ_TIMEOUT).await;
+    let text = String::from_utf8_lossy(&bytes);
     let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.is_empty() {
         return "<empty body>".to_string();
@@ -279,69 +291,6 @@ impl TailClient {
         url
     }
 
-    /// Connect to VictoriaLogs and stream log lines.
-    ///
-    /// This method establishes a streaming HTTP connection to the VictoriaLogs
-    /// tail endpoint and processes incoming chunks through the `StreamBuffer`
-    /// to handle UTF-8 boundaries correctly.
-    ///
-    /// # Arguments
-    ///
-    /// * `rule_name` - Name of the rule for tracing and metrics
-    /// * `on_reconnect` - Callback invoked when connection is restored after failure (FR7)
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(Vec<String>)` with complete log lines, or an error if the
-    /// connection fails. Invalid UTF-8 and oversized lines are dropped, logged
-    /// and counted, never returned as errors.
-    ///
-    /// # Errors
-    ///
-    /// - `StreamError::ConnectionFailed` if HTTP connection fails
-    pub async fn connect_and_receive(
-        &mut self,
-        rule_name: &str,
-        vl_source: &str,
-    ) -> Result<Vec<String>, StreamError> {
-        let url = self.build_url();
-
-        let response = self
-            .build_request(&url)
-            .send()
-            .await
-            .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response_error_body(response).await;
-            return Err(StreamError::ConnectionFailed(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
-
-        // Get the bytes stream
-        let mut stream = response.bytes_stream();
-
-        // Collect lines from this connection attempt
-        let mut all_lines = Vec::new();
-
-        // Process chunks as they arrive
-        while let Some(chunk_result) = stream.next().await {
-            let chunk: Bytes =
-                chunk_result.map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
-
-            all_lines.extend(process_chunk_logged(
-                &mut self.buffer,
-                &chunk,
-                rule_name,
-                vl_source,
-            ));
-        }
-
-        Ok(all_lines)
-    }
-
     /// Get a reference to the internal buffer for testing.
     #[cfg(test)]
     pub fn buffer(&self) -> &StreamBuffer {
@@ -421,7 +370,8 @@ impl TailClient {
             debug!(
                 rule_name = %rule_name,
                 vl_source = %vl_source,
-                url = %url,
+                url = %redact_url(&url),
+                query = %self.config.query,
                 "Connecting to VictoriaLogs tail endpoint"
             );
 
@@ -504,7 +454,7 @@ impl TailClient {
                     warn!(
                         rule_name = %rule_name,
                         vl_source = %vl_source,
-                        error = %e,
+                        error = %e.without_url(),
                         "Connection failed"
                     );
                     let delay = backoff_delay_with_jitter(attempt);
@@ -568,7 +518,7 @@ impl TailClient {
                         warn!(
                             rule_name = %rule_name,
                             vl_source = %vl_source,
-                            error = %e,
+                            error = %e.without_url(),
                             "Stream read error"
                         );
                         let delay = backoff_delay_with_jitter(attempt);

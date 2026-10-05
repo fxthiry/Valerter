@@ -12,15 +12,15 @@ case "$1" in
         fi
         # Remove config directory
         rm -rf /etc/valerter || true
-        # Reload systemd (if available)
-        if command -v systemctl >/dev/null 2>&1; then
+        # Reload systemd (if it is the running init)
+        if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
         fi
         ;;
     remove)
-        # Disable service on remove (but keep user for potential reinstall)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl disable valerter 2>/dev/null || true
+        # prerm already stopped and disabled the service (the user is kept
+        # for a potential reinstall)
+        if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
         fi
         ;;

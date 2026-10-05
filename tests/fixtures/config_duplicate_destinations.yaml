@@ -1,0 +1,32 @@
+# Fixture: a rule lists the same notifier twice in notify.destinations.
+# Rejected by Config::validate().
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+
+rules:
+  - name: "r"
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "mattermost-ops"
+        - "mattermost-ops"

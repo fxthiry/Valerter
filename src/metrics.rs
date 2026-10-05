@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::config::RuntimeConfig;
+use crate::notify::NotifierRegistry;
+
 /// Global flag to track if recorder is installed (for tests)
 static RECORDER_INSTALLED: OnceLock<()> = OnceLock::new();
 
@@ -248,11 +251,11 @@ pub struct NotifierSeries {
 
 /// Every label combination [`initialize_metrics`] seeds at startup.
 ///
-/// Built by the binary from the enabled rules (same source fan-out as the
-/// engine), their destinations and the notifier registry.
+/// Built by [`build_metrics_inventory`] from the enabled rules (same source
+/// fan-out as the engine), their destinations and the notifier registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricsInventory {
-    /// Every configured `vl_source`, whether a rule tails it or not.
+    /// Every `vl_source` targeted by at least one enabled rule, sorted.
     pub sources: Vec<String>,
     /// Every `(enabled rule, resolved source)` pair.
     pub rule_sources: Vec<RuleSourceSeries>,
@@ -260,6 +263,73 @@ pub struct MetricsInventory {
     pub deliveries: Vec<DeliverySeries>,
     /// Every registered notifier, used or not.
     pub notifiers: Vec<NotifierSeries>,
+}
+
+/// Build the metric series inventory seeded at startup.
+///
+/// Multi-source observability (v2.0.0 part 2): every per-rule metric also
+/// carries `vl_source`, so one pair per `(enabled rule, resolved source)`, with
+/// the same fan-out as the engine: empty `vl_sources` means every configured
+/// source, a non-empty list restricts to the named, declared sources. Each
+/// pair is crossed with the rule destinations, typed through the registry.
+/// `sources` holds the sources targeted by at least one enabled rule (sorted,
+/// without duplicates): a source no task tails gets no `vl_source_up` series.
+pub fn build_metrics_inventory(
+    config: &RuntimeConfig,
+    registry: &NotifierRegistry,
+) -> MetricsInventory {
+    let mut inventory = MetricsInventory::default();
+
+    for rule in config.rules.iter().filter(|r| r.enabled) {
+        let rule_sources = config
+            .victorialogs
+            .keys()
+            .filter(|s| rule.vl_sources.is_empty() || rule.vl_sources.contains(s));
+        for vl_source in rule_sources {
+            inventory.rule_sources.push(RuleSourceSeries {
+                rule_name: rule.name.clone(),
+                vl_source: vl_source.clone(),
+                regex_parser: rule.parser.regex.is_some(),
+            });
+            // Destinations missing from the registry were rejected by the
+            // preflight checks.
+            for (notifier_name, notifier) in rule
+                .notify
+                .destinations
+                .iter()
+                .filter_map(|d| registry.get(d).map(|n| (d, n)))
+            {
+                inventory.deliveries.push(DeliverySeries {
+                    rule_name: rule.name.clone(),
+                    vl_source: vl_source.clone(),
+                    notifier_name: notifier_name.clone(),
+                    notifier_type: notifier.notifier_type().to_string(),
+                });
+            }
+        }
+    }
+
+    let mut sources: Vec<String> = inventory
+        .rule_sources
+        .iter()
+        .map(|p| p.vl_source.clone())
+        .collect();
+    sources.sort_unstable();
+    sources.dedup();
+    inventory.sources = sources;
+
+    let mut notifiers: Vec<NotifierSeries> = registry
+        .names()
+        .filter_map(|name| {
+            registry.get(name).map(|n| NotifierSeries {
+                name: name.to_string(),
+                notifier_type: n.notifier_type().to_string(),
+            })
+        })
+        .collect();
+    notifiers.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    inventory.notifiers = notifiers;
+    inventory
 }
 
 /// Initialize all known metrics to their default values.
@@ -276,8 +346,9 @@ pub fn initialize_metrics(inventory: &MetricsInventory) {
     gauge!("valerter_uptime_seconds").set(0.0);
     gauge!("valerter_queue_size").set(0.0);
 
-    // Initialize per-source `vl_source_up` gauge to 0 for every configured
-    // source. The engine flips it to 1 on the first successful tail connect.
+    // Initialize per-source `vl_source_up` gauge to 0 for every source an
+    // enabled rule targets. The engine flips it to 1 on the first successful
+    // tail connect.
     for source_name in &inventory.sources {
         gauge!("valerter_vl_source_up", "vl_source" => source_name.clone()).set(0.0);
     }
@@ -739,5 +810,195 @@ mod tests {
             assert_eq!(lines.len(), expected, "one series for {prefix}: {lines:?}");
             assert!(lines[0].ends_with(" 1"), "{lines:?}");
         }
+    }
+
+    // build_metrics_inventory
+
+    /// Notifier stub: only its name and type matter to the inventory.
+    struct StubNotifier(&'static str, &'static str);
+
+    #[async_trait::async_trait]
+    impl crate::Notifier for StubNotifier {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn notifier_type(&self) -> &str {
+            self.1
+        }
+        async fn send(
+            &self,
+            _alert: &crate::AlertPayload,
+        ) -> Result<(), crate::error::NotifyError> {
+            Ok(())
+        }
+    }
+
+    fn inventory_rule(
+        name: &str,
+        enabled: bool,
+        vl_sources: &[&str],
+        destinations: &[&str],
+        regex: Option<&str>,
+    ) -> crate::config::CompiledRule {
+        use crate::config::{CompiledParser, CompiledRule, JsonParserConfig, NotifyConfig};
+        CompiledRule {
+            name: name.to_string(),
+            enabled,
+            query: "_stream:test".to_string(),
+            parser: CompiledParser {
+                regex: regex.map(|r| regex::Regex::new(r).unwrap()),
+                json: regex.is_none().then(|| JsonParserConfig {
+                    fields: vec!["_msg".to_string()],
+                }),
+            },
+            throttle: None,
+            notify: NotifyConfig {
+                template: "tpl".to_string(),
+                mattermost_channel: None,
+                destinations: destinations.iter().map(|d| d.to_string()).collect(),
+            },
+            vl_sources: vl_sources.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn inventory_config(rules: Vec<crate::config::CompiledRule>) -> RuntimeConfig {
+        use crate::config::{
+            DEFAULT_MAX_STREAMS, DefaultsConfig, MetricsConfig, ThrottleConfig, VlSourceConfig,
+        };
+        let source = |url: &str| VlSourceConfig {
+            url: url.to_string(),
+            basic_auth: None,
+            headers: None,
+            tls: None,
+        };
+        RuntimeConfig {
+            victorialogs: [
+                ("vldev".to_string(), source("http://vldev:9428")),
+                ("vlprod".to_string(), source("http://vlprod:9428")),
+                ("vlstaging".to_string(), source("http://vlstaging:9428")),
+            ]
+            .into_iter()
+            .collect(),
+            defaults: DefaultsConfig {
+                throttle: ThrottleConfig {
+                    key: None,
+                    count: 5,
+                    window: Duration::from_secs(60),
+                },
+                timestamp_timezone: "UTC".to_string(),
+                max_streams: DEFAULT_MAX_STREAMS,
+            },
+            templates: std::collections::HashMap::new(),
+            rules,
+            metrics: MetricsConfig::default(),
+            notifiers: None,
+            config_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn metrics_inventory_crosses_rule_sources_with_typed_destinations() {
+        let config = inventory_config(vec![
+            inventory_rule(
+                "errors",
+                true,
+                &["vlprod", "vldev"],
+                &["hook", "mail"],
+                Some(r"(?P<x>.*)"),
+            ),
+            inventory_rule("off", false, &[], &["idle"], None),
+        ]);
+        let mut registry = NotifierRegistry::new();
+        for (name, kind) in [("hook", "webhook"), ("mail", "email"), ("idle", "telegram")] {
+            registry
+                .register(std::sync::Arc::new(StubNotifier(name, kind)))
+                .unwrap();
+        }
+
+        let inventory = build_metrics_inventory(&config, &registry);
+
+        assert_eq!(
+            inventory.sources,
+            ["vldev", "vlprod"],
+            "vlstaging, targeted by no enabled rule, gets no vl_source_up series"
+        );
+        let pairs: Vec<_> = inventory
+            .rule_sources
+            .iter()
+            .map(|p| (p.rule_name.as_str(), p.vl_source.as_str(), p.regex_parser))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("errors", "vldev", true), ("errors", "vlprod", true)],
+            "the disabled rule gets no series"
+        );
+        let deliveries: Vec<_> = inventory
+            .deliveries
+            .iter()
+            .map(|d| {
+                (
+                    d.vl_source.as_str(),
+                    d.notifier_name.as_str(),
+                    d.notifier_type.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            deliveries,
+            [
+                ("vldev", "hook", "webhook"),
+                ("vldev", "mail", "email"),
+                ("vlprod", "hook", "webhook"),
+                ("vlprod", "mail", "email"),
+            ]
+        );
+        assert!(
+            inventory
+                .deliveries
+                .iter()
+                .all(|d| d.notifier_name != "idle"),
+            "a notifier used by no enabled rule gets no delivery series"
+        );
+        let notifiers: Vec<_> = inventory
+            .notifiers
+            .iter()
+            .map(|n| (n.name.as_str(), n.notifier_type.as_str()))
+            .collect();
+        assert_eq!(
+            notifiers,
+            [("hook", "webhook"), ("idle", "telegram"), ("mail", "email")]
+        );
+    }
+
+    #[test]
+    fn metrics_inventory_fans_out_empty_vl_sources_to_every_source() {
+        let config = inventory_config(vec![inventory_rule("all", true, &[], &[], None)]);
+
+        let inventory = build_metrics_inventory(&config, &NotifierRegistry::new());
+
+        let pairs: Vec<_> = inventory
+            .rule_sources
+            .iter()
+            .map(|p| (p.vl_source.as_str(), p.regex_parser))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("vldev", false), ("vlprod", false), ("vlstaging", false)]
+        );
+        assert!(inventory.deliveries.is_empty());
+        assert_eq!(inventory.sources, ["vldev", "vlprod", "vlstaging"]);
+    }
+
+    #[test]
+    fn metrics_inventory_sources_exclude_untargeted_and_disabled_rule_sources() {
+        let config = inventory_config(vec![
+            inventory_rule("prod", true, &["vlprod"], &[], None),
+            inventory_rule("prod2", true, &["vlprod"], &[], None),
+            inventory_rule("off", false, &["vlstaging"], &[], None),
+        ]);
+
+        let inventory = build_metrics_inventory(&config, &NotifierRegistry::new());
+
+        assert_eq!(inventory.sources, ["vlprod"]);
     }
 }

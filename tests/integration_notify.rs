@@ -2,6 +2,9 @@
 //!
 //! Uses wiremock to simulate webhook endpoints for Mattermost and generic webhooks.
 
+mod common;
+
+use common::logs::capture_logs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1081,6 +1084,7 @@ async fn test_webhook_configured_content_type_not_duplicated() {
 #[tokio::test]
 async fn test_webhook_invalid_json_body_still_sent() {
     // Unescaped quote: the notifier warns but still sends the request.
+    let (logs, _guard) = capture_logs(tracing::Level::WARN);
     let requests = send_webhook_once(
         HashMap::new(),
         Some(r#"{"text": "{{ body }}"}"#.to_string()),
@@ -1093,6 +1097,14 @@ async fn test_webhook_invalid_json_body_still_sent() {
         String::from_utf8(requests[0].body.clone()).unwrap(),
         r#"{"text": "say "hi""}"#
     );
+    let logs = logs.text();
+    let warn = logs
+        .lines()
+        .find(|l| l.contains("Webhook body is not valid JSON"))
+        .unwrap_or_else(|| panic!("missing invalid JSON warning in:\n{logs}"));
+    assert!(warn.contains("WARN"), "{warn}");
+    // The rendered body may carry event data: it is never logged.
+    assert!(!logs.contains(r#"say "hi""#), "{logs}");
 }
 
 #[tokio::test]
@@ -1198,7 +1210,7 @@ async fn test_webhook_env_var_syntax_in_alert_body_sent_literally() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_mattermost_rule_channel_override_falls_back_without_channel() {
+async fn test_mattermost_rule_channel_override_falls_back_to_notifier_channel() {
     let mock_server = MockServer::start().await;
     // Webhook locked to its own channel: the override is rejected once.
     Mock::given(method("POST"))
@@ -1248,6 +1260,7 @@ async fn test_mattermost_rule_channel_override_falls_back_without_channel() {
     let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
     assert_eq!(first["channel"], "alerts");
-    assert!(second.get("channel").is_none());
+    // Resent once to the notifier's own channel.
+    assert_eq!(second["channel"], "ops");
     mock_server.verify().await;
 }

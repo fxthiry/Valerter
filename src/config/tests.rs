@@ -2907,6 +2907,71 @@ fn validate_rejects_defaults_throttle_key_unknown_filter() {
 }
 
 #[test]
+fn validate_rejects_duplicate_destinations() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains(
+            "rule 'r': notify.destinations contains duplicate entry 'mm' (each notifier may appear at most once)"
+        ),
+        "{msg}"
+    );
+    assert_eq!(msg.matches("duplicate entry").count(), 1, "{msg}");
+}
+
+#[test]
+fn validate_rejects_duplicate_destinations_in_disabled_rule() {
+    let yaml = v203_yaml(
+        r#"
+  - name: off
+    enabled: false
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains("rule 'off': notify.destinations contains duplicate entry 'mm'"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn validate_accepts_distinct_destinations() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm2] }
+"#,
+    )
+    .replace(
+        "notifiers:\n",
+        "notifiers:\n  mm2:\n    type: mattermost\n    webhook_url: \"https://mattermost.example.com/hooks/other\"\n",
+    );
+    let msg = v203_errors(&yaml);
+    assert!(msg.is_empty(), "{msg}");
+}
+
+#[test]
+fn validate_rejects_defaults_throttle_key_unknown_filter_after_conversion() {
+    let msg = v203_errors(&with_defaults_throttle(
+        r#"{ key: "{{ status | int }}-{{ host | truncat(10) }}", count: 5, window: 60s }"#,
+    ));
+    assert!(msg.contains("defaults.throttle.key render: "), "{msg}");
+    assert!(msg.contains("truncat"), "{msg}");
+}
+
+#[test]
 fn validate_accepts_valid_defaults_throttle() {
     let msg = v203_errors(&with_defaults_throttle(
         r#"{ key: "{{ host }}", count: 5, window: 60s }"#,

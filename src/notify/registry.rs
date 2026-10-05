@@ -132,7 +132,10 @@ impl NotifierRegistry {
         let mut registry = NotifierRegistry::new();
         let mut errors = Vec::new();
 
-        for (name, config) in notifiers_config {
+        // By sorted name, for a stable error order.
+        let mut sorted: Vec<_> = notifiers_config.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, config) in sorted {
             match Self::create_notifier(name, config, &http_client, config_dir) {
                 Ok(notifier) => {
                     if let Err(e) = registry.register(notifier) {

@@ -197,9 +197,12 @@ impl WebhookNotifier {
             message: format!("invalid method: {}", config.method),
         })?;
 
-        // Resolve headers with environment variable substitution
+        // Resolve headers with environment variable substitution (by sorted
+        // name, so the reported invalid header is stable)
         let mut headers = HeaderMap::new();
-        for (key, value) in &config.headers {
+        let mut sorted_headers: Vec<_> = config.headers.iter().collect();
+        sorted_headers.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in sorted_headers {
             let resolved_value =
                 resolve_env_vars(value.expose()).map_err(|e| ConfigError::InvalidNotifier {
                     name: name.to_string(),
@@ -985,6 +988,33 @@ mod tests {
     }
 
     #[test]
+    fn from_config_reports_first_invalid_header_in_name_order() {
+        // Several HashMaps built in the same run iterate in different orders.
+        for _ in 0..8 {
+            let config = WebhookNotifierConfig {
+                url: SecretString::new("https://api.example.com/alerts".to_string()),
+                method: "POST".to_string(),
+                headers: ["Bad Header B", "Bad Header A"]
+                    .into_iter()
+                    .map(|k| (k.to_string(), SecretString::new("value".to_string())))
+                    .collect(),
+                body_template: None,
+            };
+
+            let Err(err) = WebhookNotifier::from_config("wh", &config, reqwest::Client::new())
+            else {
+                panic!("invalid header names must be rejected");
+            };
+            match err {
+                ConfigError::InvalidNotifier { message, .. } => {
+                    assert_eq!(message, "invalid header name: Bad Header A");
+                }
+                other => panic!("Expected InvalidNotifier, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
     fn from_config_rejects_invalid_header_value() {
         let config = WebhookNotifierConfig {
             url: SecretString::new("https://api.example.com/alerts".to_string()),
@@ -1153,6 +1183,22 @@ mod tests {
 
             assert!(!debug.contains("s3cr3t-routing-key"));
             assert!(debug.contains("has_body_template: true"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn escaped_placeholder_renders_literal_dollar_brace() {
+        temp_env::with_var("NOT_A_VAR", None::<&str>, || {
+            let notifier = WebhookNotifier::from_config(
+                "wh",
+                &body_template_config(r#"{"note": "{{ '$' }}{NOT_A_VAR}"}"#),
+                reqwest::Client::new(),
+            )
+            .expect("an escaped placeholder is not an env var reference");
+
+            let body = notifier.build_body(&make_alert_with_body("b")).unwrap();
+            assert_eq!(body, r#"{"note": "${NOT_A_VAR}"}"#);
         });
     }
 
