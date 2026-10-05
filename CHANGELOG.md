@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - 2026-10-05
+## [2.1.0] - Unreleased
 
 ### Fixed
 
@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A slow or endless error body from VictoriaLogs no longer blocks the tail task.** The body of a non-2xx response was read until its end: a proxy answering `502` with a chunked body that never ends froze the `(rule, source)` task. At most 4 KiB are now read, for at most 5 s, before logging `HTTP error from VictoriaLogs` and backing off.
 - **`${VAR}` substitution is done in a single pass.** A variable whose value contains `${...}` had that text substituted in turn (`A='${B}'` made `${A}` resolve to the value of `B`); the inserted value is now kept as is.
 - **The Debian package stops and disables the service before removing it, and leaves systemd alone when it is not running.** `prerm remove` only stopped an `active` service: a unit in `activating (auto-restart)` between two restarts kept running onto a deleted binary, and the unit was disabled only after the files were gone. `prerm` now always stops the service on `remove`/`deconfigure` and disables it on `remove`; `postrm remove` only reloads systemd. The maintainer scripts now act on the service only when systemd is the running init (`/run/systemd/system`), so an install in a container or a chroot no longer prints `valerter failed to start after upgrade`.
+- **docs: Telegram no longer advises HTML in `body`.** `docs/notifiers.md` and `config/config.example.yaml` told to put `<b>`/`<code>` markup in the rule template's `body`, but the default Telegram `body_template` escapes `body` (`{{ body|e }}`), so the tags were shown literally. The documentation now writes the markup in the Telegram `body_template` and escapes each inserted value (`<code>{{ log.host|e }}</code>`). See [MIGRATION.md](MIGRATION.md#log-fields-in-notifier-templates).
 
 ### Changed
 
@@ -65,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `${VAR}` placeholders in a webhook `body_template` are now resolved from the environment.** Like `url` and `headers`, the template source is resolved once when the notifier is built, at startup and by `--validate`; an undefined variable refuses the configuration with `invalid notifier '<name>': body_template: invalid configuration: undefined environment variable: <VAR>` (exit code 1). A literal `${...}` used to be sent as is; write `{{ '$' }}{VAR}` to send a literal `${VAR}` (the substitution does not recognize it and the render produces `${VAR}`). Values rendered from logs are never resolved, and the resolved template is never logged, except that the message of a syntax error may quote a fragment of it (a value containing `{{`, `{%` or breaking the syntax). A value containing `{{`, `{%` or `"` is inserted before Jinja parses the template: keep such values out of `body_template`. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
 - **Breaking: a rule's `notify.mattermost_channel` is now applied.** It was documented as a channel override but silently ignored: alerts of a rule that sets it now go to that channel. Priority: the rule's `mattermost_channel`, then the notifier's `channel`, then the webhook's default channel. Other notifier types ignore it. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
 - **`valerter::initialize_metrics` now takes a `&MetricsInventory`** (sources, `(rule, source)` pairs with their parser kind, `(rule, source, destination)` triplets and registered notifiers) instead of three slices of names. The new `MetricsInventory`, `RuleSourceSeries`, `DeliverySeries` and `NotifierSeries` types are exported by the crate.
+- **Notifier templates are compiled once**, when the notifier is built, instead of at every send: the webhook, Telegram and email `body_template` and the email `subject_template`. Each alert also unflattens its dotted keys once instead of once per rendered field. Rendering and error messages are unchanged.
 
 ### Added
 
@@ -75,6 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`valerter_telegram_chat_errors_total{rule_name, vl_source, notifier_name}`** counts the Telegram chats an alert could not be delivered to, the counterpart of `valerter_email_recipient_errors_total`.
 - **HELP text for `valerter_email_recipient_errors_total` and `valerter_lines_discarded_total`**, which had none.
 - **Mattermost resends an alert to the notifier's default when the rule's channel is rejected.** When an alert carrying a rule's `mattermost_channel` gets a 4xx response other than 429 (webhook locked to its channel, channel that does not exist), it is resent once to the notifier's `channel` if it has one (and it differs from the rule's), otherwise without `channel` (the webhook's default channel), instead of being lost, and the WARN `Mattermost rejected channel override, resending to notifier default` is logged (notifier, rule, requested channel, fallback channel when there is one, and status; never the webhook URL). The resend follows the usual retry policy; a 4xx on the resend fails the alert (`client error: <status>`). The alert is counted once, as sent or failed. A notifier's own `channel` keeps failing immediately on a 4xx.
+- **`log` variable in notifier templates.** The webhook, Telegram and email `body_template` and the email `subject_template` can read every field of the event under `log`: `{{ log.host }}`, `{{ log["k8s.pod"] }}` or `{{ log.k8s.pod }}`, `{{ log | tojson }}` for the whole event. Markup and structured payloads (PagerDuty `custom_details`, HTML tables, Telegram tags) can now be built in the template of the channel they target, each value escaped for it, instead of being baked into the rule's `body` ([#24](https://github.com/fxthiry/valerter/issues/24)). The rule template is unchanged: `log` is not injected there. Event fields are never logged: the debug output of an alert shows only their count.
+- **`md_escape` and `mdv2_escape` filters**, available in every template: `md_escape` escapes the Markdown characters Mattermost recognises (`` \ ` * _ { } [ ] ( ) # + - . ! > | ~ ``), `mdv2_escape` the 18 reserved characters of Telegram MarkdownV2 and `\`. HTML escaping stays `| e`. They are known to the test render of `--validate`.
+- **Warning for unknown variables in notifier templates.** At startup and in `--validate`, a `body_template` or `subject_template` reading a variable that does not exist at its level (typically `{{ host }}` instead of `{{ log.host }}`) logs `Notifier template references unknown variable` with the notifier, the field and the variable. The configuration is still accepted.
 
 ### Removed
 

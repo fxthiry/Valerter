@@ -243,7 +243,7 @@ Tests that valerter recovers from VictoriaLogs outages.
 | With throttle (any load) | ~18-20 MB |
 | Without throttle (extreme) | ~22 MB |
 
-Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied), so even dozens of notifiers keep the pending alerts within a few MB.
+Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied), so even dozens of notifiers keep the pending alerts within a few MB. Each pending alert also keeps the fields of its event (the `log` variable of notifier templates), at most one log line of 1 MiB, shared between destinations like the rest of the payload.
 
 ---
 

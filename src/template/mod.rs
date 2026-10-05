@@ -25,10 +25,13 @@
 //! }
 //! ```
 
+pub mod filters;
+
 use crate::config::CompiledTemplate;
 use crate::error::TemplateError;
-use minijinja::{Environment, UndefinedBehavior};
-use serde_json::Value;
+use minijinja::value::merge_maps;
+use minijinja::{Environment, UndefinedBehavior, context};
+use serde::Serialize;
 use std::collections::HashMap;
 
 /// Rendered message ready for notification.
@@ -54,8 +57,8 @@ pub struct RenderedMessage {
 ///
 /// # Thread Safety
 ///
-/// The engine is NOT thread-safe for rendering (Environment is not Sync).
-/// Create one engine per task/thread or wrap in appropriate synchronization.
+/// The engine is `Send + Sync` (`Environment<'static>` is): one engine is
+/// shared by every rule task through an `Arc`.
 pub struct TemplateEngine {
     /// Pre-created Jinja environment (created once, reused for performance).
     env: Environment<'static>,
@@ -86,11 +89,13 @@ impl TemplateEngine {
         // AC #5: Configure lenient undefined behavior for missing fields
         // This returns empty string instead of erroring on undefined variables
         env.set_undefined_behavior(UndefinedBehavior::Lenient);
+        filters::register(&mut env);
 
         // Pre-create HTML environment for email_body_html rendering (performance optimization)
         let mut html_env = Environment::new();
         html_env.set_undefined_behavior(UndefinedBehavior::Lenient);
         html_env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+        filters::register(&mut html_env);
 
         Self {
             env,
@@ -104,7 +109,11 @@ impl TemplateEngine {
     /// # Arguments
     ///
     /// * `template_name` - Name of the template to render.
-    /// * `fields` - Extracted log fields as JSON value.
+    /// * `fields` - Event fields with their dotted keys already unflattened
+    ///   (`parser::unflatten_dotted_keys`, done once per alert by the engine):
+    ///   a JSON value, or the `minijinja::Value` the alert payload carries
+    ///   (`AlertPayload::log_from_fields`). Converted once for the three
+    ///   rendered fields.
     /// * `rule_name` - Name of the rule that triggered this render. Injected
     ///   into the render context as `rule_name` so templates can reference
     ///   `{{ rule_name }}` (issue #31). Overrides any event field with the
@@ -122,10 +131,10 @@ impl TemplateEngine {
     /// let fields = json!({"host": "server-01", "message": "Alert!"});
     /// let msg = engine.render("alert", &fields, "my_rule")?;
     /// ```
-    pub fn render(
+    pub fn render<S: Serialize + ?Sized>(
         &self,
         template_name: &str,
-        fields: &Value,
+        fields: &S,
         rule_name: &str,
         vl_source: &str,
     ) -> Result<RenderedMessage, TemplateError> {
@@ -139,20 +148,16 @@ impl TemplateEngine {
                     name: template_name.to_string(),
                 })?;
 
-        // Render each field. `rule_name` and `vl_source` are injected in the
-        // render helpers so they are available at layer 1 (title, body,
-        // email_body_html), matching the notifier-level (layer 2) contexts.
-        let title = self.render_string(&template.title, fields, rule_name, vl_source)?;
-        let body = self.render_string(&template.body, fields, rule_name, vl_source)?;
+        // `rule_name` and `vl_source` are injected so they are available at
+        // layer 1 (title, body, email_body_html), matching the notifier-level
+        // (layer 2) contexts.
+        let ctx = layer1_context(fields, rule_name, vl_source);
+        let title = self.render_string(&template.title, &ctx)?;
+        let body = self.render_string(&template.body, &ctx)?;
 
         // Render email_body_html with HTML auto-escape if present
         let email_body_html = if let Some(email_body_html_template) = &template.email_body_html {
-            Some(self.render_string_html_escaped(
-                email_body_html_template,
-                fields,
-                rule_name,
-                vl_source,
-            )?)
+            Some(self.render_string_html_escaped(email_body_html_template, &ctx)?)
         } else {
             None
         };
@@ -177,14 +182,10 @@ impl TemplateEngine {
     fn render_string(
         &self,
         template_str: &str,
-        fields: &Value,
-        rule_name: &str,
-        vl_source: &str,
+        ctx: &minijinja::Value,
     ) -> Result<String, TemplateError> {
-        let mut ctx = crate::parser::unflatten_dotted_keys(fields);
-        inject_context(&mut ctx, rule_name, vl_source);
         self.env
-            .render_str(template_str, &ctx)
+            .render_str(template_str, ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
@@ -195,14 +196,10 @@ impl TemplateEngine {
     fn render_string_html_escaped(
         &self,
         template_str: &str,
-        fields: &Value,
-        rule_name: &str,
-        vl_source: &str,
+        ctx: &minijinja::Value,
     ) -> Result<String, TemplateError> {
-        let mut ctx = crate::parser::unflatten_dotted_keys(fields);
-        inject_context(&mut ctx, rule_name, vl_source);
         self.html_env
-            .render_str(template_str, &ctx)
+            .render_str(template_str, ctx)
             .map_err(|e| TemplateError::RenderFailed {
                 message: e.to_string(),
             })
@@ -217,16 +214,17 @@ impl TemplateEngine {
     /// # Arguments
     ///
     /// * `template_name` - Name of the template to render.
-    /// * `fields` - Extracted log fields as JSON value.
+    /// * `fields` - Event fields, dotted keys already unflattened (see
+    ///   [`TemplateEngine::render`]).
     /// * `rule_name` - Name of the rule (for fallback message and logging).
     ///
     /// # Returns
     ///
     /// Always returns a `RenderedMessage`, using fallback values on error.
-    pub fn render_with_fallback(
+    pub fn render_with_fallback<S: Serialize + ?Sized>(
         &self,
         template_name: &str,
-        fields: &Value,
+        fields: &S,
         rule_name: &str,
         vl_source: &str,
     ) -> RenderedMessage {
@@ -262,24 +260,22 @@ impl TemplateEngine {
     }
 }
 
-/// Inject the synthetic `rule_name` (issue #31) and `vl_source` (v2.0.0)
-/// keys into a render context.
+/// Layer 1 render context: the event fields plus the synthetic `rule_name`
+/// (issue #31) and `vl_source` (v2.0.0) keys.
 ///
 /// The synthetic values win over any event field literally named `rule_name`
 /// or `vl_source` so operators can rely on them consistently across layer 1
-/// and layer 2 templates. If `ctx` is not a JSON object (should not happen
-/// in practice — VL events are always objects), injection is skipped.
-fn inject_context(ctx: &mut Value, rule_name: &str, vl_source: &str) {
-    if let Some(obj) = ctx.as_object_mut() {
-        obj.insert(
-            "rule_name".to_string(),
-            Value::String(rule_name.to_string()),
-        );
-        obj.insert(
-            "vl_source".to_string(),
-            Value::String(vl_source.to_string()),
-        );
-    }
+/// and layer 2 templates. The merge is lazy: the fields are not copied.
+fn layer1_context<S: Serialize + ?Sized>(
+    fields: &S,
+    rule_name: &str,
+    vl_source: &str,
+) -> minijinja::Value {
+    // `merge_maps`: the last map holding a key wins.
+    merge_maps([
+        minijinja::Value::from_serialize(fields),
+        context! { rule_name => rule_name, vl_source => vl_source },
+    ])
 }
 
 impl std::fmt::Debug for TemplateEngine {
@@ -777,6 +773,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_applies_valerter_filters() {
+        let mut templates = HashMap::new();
+        let mut template = make_template("{{ host | mdv2_escape }}", "{{ host | md_escape }}");
+        template.email_body_html = Some("<p>{{ host | md_escape }}</p>".to_string());
+        templates.insert("alert".to_string(), template);
+        let engine = TemplateEngine::new(templates);
+
+        let result = engine
+            .render("alert", &json!({"host": "web_01"}), "test_rule", "vlprod")
+            .unwrap();
+
+        assert_eq!(result.title, r"web\_01");
+        assert_eq!(result.body, r"web\_01");
+        assert_eq!(result.email_body_html.unwrap(), r"<p>web\_01</p>");
+    }
+
+    #[test]
+    fn rule_template_does_not_inject_log() {
+        // `log` is a notifier-level variable only: at layer 1 it is the event
+        // field of that name, if any (Fluent Bit container output).
+        let mut templates = HashMap::new();
+        templates.insert("alert".to_string(), make_template("{{ log }}", "b"));
+        let engine = TemplateEngine::new(templates);
+
+        let fields = json!({"log": "container output"});
+        let result = engine
+            .render("alert", &fields, "test_rule", "vlprod")
+            .unwrap();
+
+        assert_eq!(result.title, "container output");
+    }
+
     // ===================================================================
     // Issue #25: dotted flat-key resolution at render time
     // ===================================================================
@@ -794,10 +823,9 @@ mod tests {
 
         let engine = TemplateEngine::new(templates);
         let fields = json!({"nginx.http.request_id": "abc"});
+        let log = crate::notify::AlertPayload::log_from_fields(&fields);
 
-        let result = engine
-            .render("alert", &fields, "test_rule", "vlprod")
-            .unwrap();
+        let result = engine.render("alert", &log, "test_rule", "vlprod").unwrap();
         assert_eq!(result.title, "abc");
         assert_eq!(result.body, "id=abc");
     }
@@ -825,8 +853,10 @@ mod tests {
             "nginx.http.status_code": "400"
         });
 
+        let log = crate::notify::AlertPayload::log_from_fields(&fields);
+
         let result = engine
-            .render("my_template", &fields, "test_rule", "vlprod")
+            .render("my_template", &log, "test_rule", "vlprod")
             .unwrap();
         assert_eq!(result.title, "T");
         assert_eq!(result.body, "B");

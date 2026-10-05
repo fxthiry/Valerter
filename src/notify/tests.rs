@@ -33,6 +33,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
         destinations: vec![], // Uses default notifier
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -50,6 +51,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         destinations,
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -1164,6 +1166,7 @@ fn alert_payload_clone_works() {
         destinations: vec!["mattermost-infra".to_string()],
         log_timestamp: "2026-01-15T10:00:00Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     };
 
     let cloned = payload.clone();

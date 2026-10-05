@@ -35,6 +35,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         destinations,
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -1203,6 +1204,304 @@ async fn test_webhook_env_var_syntax_in_alert_body_sent_literally() {
 
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, br#"{"text": "path is ${HOME}"}"#);
+}
+
+// ============================================================================
+// `log`: event fields in the webhook body_template
+// ============================================================================
+
+/// Send one alert carrying the event `fields` through a webhook notifier
+/// whose `body_template` is `template`, against a server answering
+/// `statuses` per request (the last one repeats). Returns the request bodies.
+async fn send_with_log_fields(
+    template: &str,
+    fields: serde_json::Value,
+    statuses: &'static [u16],
+) -> Vec<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use valerter::notify::Notifier;
+
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(statuses[n.min(statuses.len() - 1)])
+        })
+        .mount(&mock_server)
+        .await;
+    let url = format!("{}/api/alerts", mock_server.uri());
+    let notifier = make_webhook_notifier(
+        "log-webhook",
+        &url,
+        "POST",
+        HashMap::new(),
+        Some(template.to_string()),
+    );
+    let mut payload = make_payload_with_destinations("log_rule", vec!["log-webhook".to_string()]);
+    payload.log = AlertPayload::log_from_fields(&fields);
+
+    notifier.send(&payload).await.unwrap();
+    mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_webhook_body_template_reads_log_fields() {
+    let bodies = send_with_log_fields(
+        r#"{"host": {{ log.host | tojson }}, "pod": {{ log["k8s.pod"] | tojson }}}"#,
+        serde_json::json!({"host": "web-01", "k8s.pod": "api-7f", "_msg": "m"}),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies, vec![r#"{"host": "web-01", "pod": "api-7f"}"#]);
+}
+
+#[tokio::test]
+async fn test_webhook_body_template_whole_log_is_valid_json() {
+    let bodies = send_with_log_fields(
+        r#"{"details": {{ log | tojson }}}"#,
+        serde_json::json!({
+            "_msg": "say \"hi\"\nnext",
+            "_time": "2026-01-15T10:49:35Z",
+            "k8s.pod": "api-7f"
+        }),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let details = &parsed["details"];
+    assert_eq!(details["_msg"], "say \"hi\"\nnext");
+    assert_eq!(details["_time"], "2026-01-15T10:49:35Z");
+    // Flat and unflattened views of a dotted key.
+    assert_eq!(details["k8s.pod"], "api-7f");
+    assert_eq!(details["k8s"]["pod"], "api-7f");
+}
+
+#[tokio::test]
+async fn test_webhook_env_var_syntax_in_log_field_sent_literally() {
+    // `${VAR}` is resolved in the template source when the notifier is built,
+    // never in rendered values: an undefined variable in a field is no error.
+    let bodies = send_with_log_fields(
+        r#"{"key": {{ log.key | tojson }}}"#,
+        serde_json::json!({"key": "${ROUTING_KEY_NEVER_DEFINED}"}),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies, vec![r#"{"key": "${ROUTING_KEY_NEVER_DEFINED}"}"#]);
+}
+
+#[tokio::test]
+async fn test_webhook_log_body_identical_across_retries() {
+    let bodies = send_with_log_fields(
+        r#"{"host": {{ log.host | tojson }}, "msg": {{ log._msg | tojson }}}"#,
+        serde_json::json!({"host": "web-01", "_msg": "boom"}),
+        &[500, 200],
+    )
+    .await;
+
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[0], r#"{"host": "web-01", "msg": "boom"}"#);
+}
+
+// ============================================================================
+// `log` end to end: VictoriaLogs line -> engine -> queue -> webhook
+// ============================================================================
+
+/// Run a `RuleEngine` tailing `event` from a mocked VictoriaLogs, whose rule
+/// sends to a webhook notifier `hook` (POST to `webhook_url`, `body_template`
+/// = `template`), until the webhook received `expected` requests or `deadline`
+/// passed. The engine runs on the current thread, so `capture_logs` sees the
+/// logs of every task.
+async fn run_engine_to_webhook(
+    event: serde_json::Value,
+    template: &str,
+    webhook: &MockServer,
+    expected: usize,
+    deadline: Duration,
+) {
+    use std::collections::BTreeMap;
+    use tokio_util::sync::CancellationToken;
+    use valerter::RuleEngine;
+    use valerter::config::{
+        CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, MetricsConfig,
+        NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    };
+
+    let vl = MockServer::start().await;
+    let mut line = serde_json::to_vec(&event).unwrap();
+    line.push(b'\n');
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(line, "application/x-ndjson"))
+        .up_to_n_times(1)
+        .mount(&vl)
+        .await;
+
+    let mut registry = NotifierRegistry::new();
+    registry
+        .register(Arc::new(make_webhook_notifier(
+            "hook",
+            &format!("{}/api/alerts", webhook.uri()),
+            "POST",
+            HashMap::new(),
+            Some(template.to_string()),
+        )))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let config = RuntimeConfig {
+        victorialogs: BTreeMap::from([(
+            "vlprod".to_string(),
+            VlSourceConfig {
+                url: vl.uri(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+        )]),
+        defaults: DefaultsConfig {
+            throttle: ThrottleConfig {
+                key: None,
+                count: 5,
+                window: Duration::from_secs(60),
+            },
+            timestamp_timezone: "UTC".to_string(),
+            max_streams: valerter::config::DEFAULT_MAX_STREAMS,
+        },
+        templates: HashMap::from([(
+            "tpl".to_string(),
+            CompiledTemplate {
+                title: "Alert on {{ host }}".to_string(),
+                body: "pod {{ k8s.pod }}".to_string(),
+                email_body_html: None,
+                accent_color: None,
+            },
+        )]),
+        rules: vec![CompiledRule {
+            name: "log_rule".to_string(),
+            enabled: true,
+            query: "_stream:test".to_string(),
+            parser: CompiledParser {
+                regex: None,
+                json: None,
+            },
+            throttle: None,
+            notify: NotifyConfig {
+                template: "tpl".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["hook".to_string()],
+            },
+            vl_sources: vec![],
+        }],
+        metrics: MetricsConfig::default(),
+        notifiers: None,
+        config_dir: std::path::PathBuf::from("."),
+    };
+    let engine = RuleEngine::new(config, make_client(), queue);
+
+    let cancel = CancellationToken::new();
+    let engine_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { engine.run(cancel).await }
+    });
+    let worker_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+
+    wait_for_requests(webhook, expected, deadline).await;
+    // Let the worker log the outcome of the last request.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), engine_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+}
+
+#[tokio::test]
+async fn test_engine_log_fields_reach_webhook_body_template() {
+    let webhook = start_ok_server().await;
+
+    run_engine_to_webhook(
+        serde_json::json!({
+            "_time": "2026-01-15T10:49:35Z",
+            "_stream": "{}",
+            "_msg": "upstream error",
+            "host": "web-01",
+            "k8s.pod": "api-7f"
+        }),
+        r#"{"host": {{ log.host | tojson }}, "pod": {{ log["k8s.pod"] | tojson }}, "nested": {{ log.k8s.pod | tojson }}, "title": {{ title | tojson }}, "body": {{ body | tojson }}}"#,
+        &webhook,
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let requests = webhook.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "host": "web-01",
+            "pod": "api-7f",
+            "nested": "api-7f",
+            "title": "Alert on web-01",
+            "body": "pod api-7f"
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_engine_failed_delivery_never_logs_log_fields() {
+    let webhook = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&webhook)
+        .await;
+    let (logs, _guard) = capture_logs(tracing::Level::TRACE);
+
+    run_engine_to_webhook(
+        serde_json::json!({
+            "_time": "2026-01-15T10:49:35Z",
+            "_stream": "{}",
+            "_msg": "login token=s3cr3t",
+            "host": "web-01",
+            "token": "s3cr3t"
+        }),
+        r#"{"token": {{ log.token | tojson }}, "msg": {{ log._msg | tojson }}}"#,
+        &webhook,
+        3,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let requests = webhook.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "the webhook should be retried");
+    assert!(String::from_utf8_lossy(&requests[0].body).contains("s3cr3t"));
+    let text = logs.text();
+    assert!(
+        text.contains("Failed to send notification after all retries"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("s3cr3t"),
+        "a log line leaks a log field:\n{text}"
+    );
 }
 
 // ============================================================================

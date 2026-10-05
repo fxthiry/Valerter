@@ -1,0 +1,184 @@
+# Fixture: the YAML examples added or changed by the "log fields in notifier
+# templates" change, copied from docs/notifiers.md (PagerDuty, email,
+# Telegram), config/config.example.yaml (PagerDuty, Telegram) and MIGRATION.md
+# ("Log fields in notifier templates", after). Keep them in sync: every
+# notifier must pass --validate without an unknown-variable warning.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+    email_body_html: "<p>{{ _msg }}</p>"
+  # MIGRATION.md, after
+  disk_alert:
+    title: "Disk alert"
+    body: "Host: {{ host }}"
+    email_body_html: "<p>Host: {{ host }}</p>"
+
+notifiers:
+  # docs/notifiers.md, Webhook > Configuration
+  pagerduty:
+    type: webhook
+    url: "https://events.pagerduty.com/v2/enqueue"
+    method: POST                    # Optional, default: POST
+    body_template: |
+      {
+        "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+        "event_action": "trigger",
+        "payload": {
+          "summary": {{ title | tojson }},
+          "source": {{ log.host | default("valerter") | tojson }},
+          "severity": "error",
+          "custom_details": {
+            "rule": {{ rule_name | tojson }},
+            "vl_source": {{ vl_source | tojson }},
+            "log_time": {{ log._time | tojson }},
+            "message": {{ log._msg | tojson }},
+            "pod": {{ log["k8s.pod"] | tojson }}
+          }
+          {#- Or send every field of the event:
+          "custom_details": {{ log | tojson }}
+          #}
+        }
+      }
+
+  # docs/notifiers.md, Webhook > commented variant enabled
+  pagerduty-full:
+    type: webhook
+    url: "https://events.pagerduty.com/v2/enqueue"
+    body_template: |
+      {
+        "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+        "event_action": "trigger",
+        "payload": {
+          "summary": {{ title | tojson }},
+          "source": "valerter",
+          "severity": "error",
+          "custom_details": {{ log | tojson }}
+        }
+      }
+
+  # config/config.example.yaml, pagerduty (uncommented)
+  pagerduty-example:
+    type: webhook
+    url: "https://events.pagerduty.com/v2/enqueue"
+    body_template: |
+      {
+        "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+        "event_action": "trigger",
+        "payload": {
+          "summary": {{ title | tojson }},
+          "source": {{ log.host | default("valerter") | tojson }},
+          "severity": "error",
+          "custom_details": {
+            "rule": {{ rule_name | tojson }},
+            "vl_source": {{ vl_source | tojson }},
+            "log_time": {{ log._time | tojson }},
+            "message": {{ log._msg | tojson }},
+            "pod": {{ log["k8s.pod"] | tojson }}
+          }
+          {#- Or send every field of the event (dotted keys appear twice,
+              flat and expanded, and secrets in the log line go along):
+          "custom_details": {{ log | tojson }}
+          #}
+        }
+      }
+
+  # docs/notifiers.md, Email > Template Variables
+  email-oncall:
+    type: email
+    smtp:
+      host: smtp.example.com
+      port: 587
+      username: "${SMTP_USER}"
+      password: "${SMTP_PASSWORD}"
+    from: "valerter@example.com"
+    to:
+      - "oncall@example.com"
+    subject_template: "[{{ log.severity | default('alert') | upper }}] {{ title }}"
+    body_template: |
+      <h2>{{ title }}</h2>
+      <table>
+        <tr><td>Host</td><td>{{ log.host }}</td></tr>
+        <tr><td>Time</td><td>{{ log_timestamp_formatted }}</td></tr>
+      </table>
+      {{ body }}
+
+  # docs/notifiers.md, Telegram > Formatting messages
+  telegram-formatted:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-100123456789"
+    body_template: |
+      <b>{{ title|e }}</b>
+      Host: <code>{{ log.host|e }}</code>
+      Rule: <i>{{ rule_name|e }}</i> · {{ log_timestamp_formatted|e }}
+      <pre>{{ log._msg|e }}</pre>
+
+  # docs/notifiers.md, Telegram > Formatting messages (MarkdownV2 variant)
+  telegram-mdv2:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-100123456789"
+    parse_mode: MarkdownV2
+    body_template: "*{{ title | mdv2_escape }}*"
+
+  # config/config.example.yaml, telegram-alerts (uncommented)
+  telegram-alerts:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-100123456789"
+      - "-100987654321"
+    parse_mode: HTML
+    disable_notification: false
+    disable_web_page_preview: true
+    body_template: |
+      <b>{{ title|e }}</b>
+      Host: <code>{{ log.host|e }}</code>
+      {{ body|e }}
+
+  # MIGRATION.md, Log fields in notifier templates (after)
+  telegram-ops:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids: ["-100123456789"]
+    body_template: |
+      <b>{{ title|e }}</b>
+      Host: <code>{{ log.host|e }}</code>
+
+rules:
+  - name: "r"
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "pagerduty"
+        - "pagerduty-full"
+        - "pagerduty-example"
+        - "email-oncall"
+        - "telegram-formatted"
+        - "telegram-mdv2"
+        - "telegram-alerts"
+  - name: "disk"
+    query: '_stream:{app="disk"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "disk_alert"
+      destinations:
+        - "telegram-ops"

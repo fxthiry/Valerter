@@ -211,6 +211,47 @@ With the shipped systemd unit, define the variable like your other notifier secr
   The resend costs one extra request per alert; the alert is counted once in the metrics, as sent or failed. A 4xx on the resend fails the alert. The notifier's own `channel` keeps its behavior: a 4xx fails the alert immediately.
 - **Rules without a Mattermost destination** still log `mattermost_channel ignored - no mattermost notifier in destinations` at startup; other notifier types ignore the key.
 
+### Log fields in notifier templates
+
+**No action required:** existing templates render exactly as before. 2.1.0 adds:
+
+- **The `log` variable** in notifier templates (webhook, Telegram and email `body_template`, email `subject_template`): every field of the event, `{{ log.host }}`, `{{ log["k8s.pod"] }}` or `{{ log.k8s.pod }}`, `{{ log | tojson }}` for the whole event. Rule templates (`title`, `body`, `email_body_html`, `throttle.key`) are unchanged and keep reading fields at the top level (`{{ host }}`); an event field named `log` stays available there as `{{ log }}`.
+- **The `md_escape` and `mdv2_escape` filters**, to escape a value for Markdown (Mattermost) and Telegram MarkdownV2, next to `| e` for HTML. See [docs/configuration.md](docs/configuration.md#valerter-filters).
+- **A possible new warning at startup and in `--validate`:** `Notifier template references unknown variable notifier=<name> field=<body_template|subject_template> variable=<name>`. Such a variable already rendered empty; the warning points at it, usually a log field written `{{ host }}` instead of `{{ log.host }}`. Fix the template, or remove the variable, to silence it. The exit code is unchanged.
+
+**Telegram: move the markup from `body` to `body_template`.** Until now the documentation advised writing Telegram HTML tags in the rule template's `body`. With the default Telegram `body_template` (`<b>{{ title|e }}</b>\n{{ body|e }}`), `body` is escaped and those tags were shown literally; a custom `{{ body }}` without `|e` displayed them, but then a `<` or `&` from the log line broke the message. Write the markup in the Telegram `body_template` and escape each value there:
+
+```yaml
+# before: markup in the rule template, shown literally by Telegram
+templates:
+  disk_alert:
+    title: "Disk alert"
+    body: "Host: <code>{{ host }}</code>"
+    email_body_html: "<p>Host: {{ host }}</p>"
+notifiers:
+  telegram-ops:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids: ["-100123456789"]
+
+# after: plain rule template, markup in the Telegram body_template
+templates:
+  disk_alert:
+    title: "Disk alert"
+    body: "Host: {{ host }}"
+    email_body_html: "<p>Host: {{ host }}</p>"
+notifiers:
+  telegram-ops:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids: ["-100123456789"]
+    body_template: |
+      <b>{{ title|e }}</b>
+      Host: <code>{{ log.host|e }}</code>
+```
+
+The other notifiers of the rule keep receiving the plain `body`. See [docs/notifiers.md](docs/notifiers.md#formatting-messages).
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

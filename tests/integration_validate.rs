@@ -320,6 +320,17 @@ fn shipped_config_example_validates() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_no_unknown_variable_warning(&output);
+}
+
+/// Assert that `--validate` reported no unknown variable in a notifier template.
+fn assert_no_unknown_variable_warning(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(UNKNOWN_VARIABLE_WARNING),
+        "unexpected unknown-variable warning: {}",
+        stderr
+    );
 }
 
 // Test: every shipped examples/<name>/config.yaml passes --validate
@@ -366,6 +377,7 @@ fn shipped_examples_pass_validate() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_no_unknown_variable_warning(&output);
         checked += 1;
     }
 
@@ -533,6 +545,64 @@ fn validate_warns_unused_mattermost_channel() {
         "stdout should list notifiers with their type: {}",
         stdout
     );
+}
+
+/// Warning logged when a notifier template reads an unknown variable.
+const UNKNOWN_VARIABLE_WARNING: &str = "Notifier template references unknown variable";
+
+// Test: --validate warns about a notifier template reading `{{ host }}`
+// instead of `{{ log.host }}`, and still succeeds
+#[test]
+fn validate_warns_unknown_variable_in_notifier_template() {
+    let output = run_validate("config_webhook_body_template_unknown_variable.yaml", &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a warning must not fail --validate\nstderr: {}",
+        stderr
+    );
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains(UNKNOWN_VARIABLE_WARNING))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning expected: {}", stderr);
+    for expected in ["hook", "body_template", "host"] {
+        assert!(
+            warnings[0].contains(expected),
+            "warning should name {expected}: {}",
+            warnings[0]
+        );
+    }
+}
+
+// Test: the YAML examples of the `log` documentation (docs, config example,
+// MIGRATION.md) pass --validate without an unknown-variable warning
+#[test]
+fn docs_log_field_examples_pass_validate() {
+    let output = run_validate(
+        "config_docs_log_fields.yaml",
+        &[
+            ("PAGERDUTY_ROUTING_KEY", "dummy-routing-key"),
+            ("SMTP_USER", "dummy_smtp_user"),
+            ("SMTP_PASSWORD", "dummy_smtp_pass"),
+            ("TELEGRAM_BOT_TOKEN", "dummy_bot_token"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Notifiers: 8"),
+        "every documented notifier should be built: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_no_unknown_variable_warning(&output);
 }
 
 // Test: --validate redacts credentials and query strings of source URLs
@@ -810,6 +880,7 @@ fn doc_notifier_examples_pass_validate() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_no_unknown_variable_warning(&output);
     }
 }
 

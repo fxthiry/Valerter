@@ -222,6 +222,7 @@ fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload 
         destinations: vec![],
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -411,6 +412,7 @@ async fn test_send_email_html_format() {
         destinations: vec![],
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     };
 
     let result = notifier.send(&alert).await;

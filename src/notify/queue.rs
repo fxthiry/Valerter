@@ -586,6 +586,7 @@ mod tests {
             destinations: vec!["mm-ops".to_string()],
             log_timestamp: String::new(),
             log_timestamp_formatted: String::new(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         })
     }
 

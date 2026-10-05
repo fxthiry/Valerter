@@ -8,10 +8,11 @@ use crate::config::{
     validate_resolved_url,
 };
 use crate::error::{ConfigError, NotifyError};
+use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
 use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use chrono::Utc;
-use minijinja::{Environment, context};
+use minijinja::context;
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
@@ -93,32 +94,37 @@ pub struct WebhookNotifier {
     method: Method,
     /// Headers to include in requests (secrets resolved).
     headers: HeaderMap,
-    /// Body template source, environment variables resolved (if configured).
-    body_template_source: Option<String>,
+    /// Body template compiled once from its source with environment
+    /// variables resolved (if configured). The resolved source may hold a
+    /// secret: it is never logged nor shown by `Debug`.
+    body_template: Option<NotifierTemplate>,
 }
 
-/// Render a body template with alert context.
+/// Render a compiled body template with alert context.
 ///
-/// Generic webhook templates have access to standard fields (title, body, rule_name)
-/// plus log timestamps. accent_color is not exposed as webhooks are meant to be generic.
-fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
-    let mut env = Environment::new();
-    env.add_template("body", source)
-        .map_err(|e| NotifyError::SendFailed(format!("template error: {}", e)))?;
+/// Generic webhook templates have access to standard fields (title, body,
+/// rule_name), log timestamps and the event fields (`log`). accent_color is
+/// not exposed as webhooks are meant to be generic.
+fn render_body_template(
+    template: &NotifierTemplate,
+    alert: &AlertPayload,
+) -> Result<String, NotifyError> {
+    template
+        .render(context! {
+            title => &alert.message.title,
+            body => &alert.message.body,
+            rule_name => &alert.rule_name,
+            vl_source => &alert.vl_source,
+            log_timestamp => &alert.log_timestamp,
+            log_timestamp_formatted => &alert.log_timestamp_formatted,
+            log => &alert.log,
+        })
+        .map_err(|e| NotifyError::SendFailed(format!("template render error: {}", e)))
+}
 
-    let tmpl = env
-        .get_template("body")
-        .map_err(|e| NotifyError::SendFailed(format!("template error: {}", e)))?;
-
-    tmpl.render(context! {
-        title => &alert.message.title,
-        body => &alert.message.body,
-        rule_name => &alert.rule_name,
-        vl_source => &alert.vl_source,
-        log_timestamp => &alert.log_timestamp,
-        log_timestamp_formatted => &alert.log_timestamp_formatted,
-    })
-    .map_err(|e| NotifyError::SendFailed(format!("template render error: {}", e)))
+/// Compile a validated, env-resolved `body_template` source.
+fn compile_body_template(source: String) -> Result<NotifierTemplate, String> {
+    NotifierTemplate::compile(source, false).map_err(|e| format!("body_template: {e}"))
 }
 
 /// Whether a Content-Type header value denotes JSON.
@@ -232,25 +238,29 @@ impl WebhookNotifier {
         }
 
         // Resolve `${VAR}` in the template source (never in rendered values),
-        // then validate the resolved source (syntax, then render test). The
-        // resolved source may hold a secret: it is never logged.
-        let body_template_source = match &config.body_template {
+        // validate the resolved source (syntax, then render test), then
+        // compile it once. The resolved source may hold a secret: it is never
+        // logged.
+        let body_template = match &config.body_template {
             Some(template_str) => {
                 let resolved =
                     resolve_env_vars(template_str).map_err(|e| ConfigError::InvalidNotifier {
                         name: name.to_string(),
                         message: format!("body_template: {}", e),
                     })?;
-                validate_notifier_template("body_template", &resolved).map_err(|message| {
-                    ConfigError::InvalidNotifier {
+                validate_notifier_template("body_template", &resolved)
+                    .and_then(|()| compile_body_template(resolved))
+                    .map_err(|message| ConfigError::InvalidNotifier {
                         name: name.to_string(),
                         message,
-                    }
-                })?;
-                Some(resolved)
+                    })
+                    .map(Some)?
             }
             None => None,
         };
+        if let Some(template) = &body_template {
+            template.warn_unknown_variables(name, "body_template", &CONTEXT_VARIABLES);
+        }
 
         Ok(Self {
             name: name.to_string(),
@@ -258,16 +268,16 @@ impl WebhookNotifier {
             url: SecretString::new(resolved_url),
             method,
             headers,
-            body_template_source,
+            body_template,
         })
     }
 
     /// Build the request body: the rendered `body_template`, or the default
     /// JSON payload.
     fn build_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        match &self.body_template_source {
-            Some(template_source) => {
-                let rendered = render_body_template(template_source, alert)?;
+        match &self.body_template {
+            Some(template) => {
+                let rendered = render_body_template(template, alert)?;
                 // Safety net: warn (without the body, which may hold secrets or
                 // log data) but still send, as some endpoints tolerate it.
                 if let Some(e) = json_body_error(&self.headers, &rendered) {
@@ -309,7 +319,7 @@ impl WebhookNotifier {
     /// Check if a body template is configured (for testing).
     #[cfg(test)]
     pub fn has_body_template(&self) -> bool {
-        self.body_template_source.is_some()
+        self.body_template.is_some()
     }
 }
 
@@ -422,7 +432,7 @@ impl std::fmt::Debug for WebhookNotifier {
         f.debug_struct("WebhookNotifier")
             .field("name", &self.name)
             .field("method", &self.method.as_str())
-            .field("has_body_template", &self.body_template_source.is_some())
+            .field("has_body_template", &self.body_template.is_some())
             .finish()
     }
 }
@@ -433,6 +443,11 @@ mod tests {
     use crate::template::RenderedMessage;
     use serial_test::serial;
     use std::collections::HashMap;
+
+    /// Compile `source` and render it for `alert`.
+    fn render_source(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
+        render_body_template(&compile_body_template(source.to_string()).unwrap(), alert)
+    }
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
         AlertPayload {
@@ -448,6 +463,7 @@ mod tests {
             destinations: vec![],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 
@@ -723,6 +739,7 @@ mod tests {
             destinations: vec![],
             log_timestamp: "2026-01-15T10:00:00Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         };
         let payload = DefaultWebhookPayload::from_alert(&alert, "webhook");
         let json = serde_json::to_string(&payload).unwrap();
@@ -840,7 +857,7 @@ mod tests {
         let source = r#"{"title": "{{ title }}", "body": "{{ body }}", "rule": "{{ rule_name }}"}"#;
 
         let alert = make_alert_payload("test_rule");
-        let result = render_body_template(source, &alert).unwrap();
+        let result = render_source(source, &alert).unwrap();
 
         assert!(result.contains("\"title\": \"Test Alert\""));
         assert!(result.contains("\"body\": \"Something happened\""));
@@ -865,8 +882,9 @@ mod tests {
             destinations: vec![],
             log_timestamp: "2026-01-15T10:00:00Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         };
-        let result = render_body_template(source, &alert).unwrap();
+        let result = render_source(source, &alert).unwrap();
 
         assert!(result.contains("\"title\": \"Test\""));
         assert!(result.contains("\"rule\": \"test_rule\""));
@@ -1106,7 +1124,7 @@ mod tests {
         let notifier =
             WebhookNotifier::from_config("json-check", &config, reqwest::Client::new()).unwrap();
         let alert = make_alert_with_body(r#"say "hi""#);
-        let body = render_body_template(r#"{"text": "{{ body }}"}"#, &alert).unwrap();
+        let body = render_source(r#"{"text": "{{ body }}"}"#, &alert).unwrap();
 
         assert!(json_body_error(notifier.headers(), &body).is_some());
     }
@@ -1133,7 +1151,7 @@ mod tests {
     fn tojson_filter_produces_valid_json() {
         let original = "say \"hi\"\npath C:\\tmp <b>&'";
         let alert = make_alert_with_body(original);
-        let body = render_body_template(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
+        let body = render_source(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["text"], original);
@@ -1187,6 +1205,26 @@ mod tests {
     }
 
     #[test]
+    fn build_body_reads_log_fields() {
+        let notifier = WebhookNotifier::from_config(
+            "wh",
+            &body_template_config(
+                r#"{"host": {{ log.host | tojson }}, "pod": {{ log["k8s.pod"] | tojson }}}"#,
+            ),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut alert = make_alert_with_body("b");
+        alert.log = AlertPayload::log_from_fields(
+            &serde_json::json!({"host": "web-01", "k8s.pod": "api-7f"}),
+        );
+
+        let body = notifier.build_body(&alert).unwrap();
+
+        assert_eq!(body, r#"{"host": "web-01", "pod": "api-7f"}"#);
+    }
+
+    #[test]
     #[serial]
     fn escaped_placeholder_renders_literal_dollar_brace() {
         temp_env::with_var("NOT_A_VAR", None::<&str>, || {
@@ -1205,7 +1243,7 @@ mod tests {
     #[test]
     fn rendered_values_are_not_env_resolved() {
         let alert = make_alert_with_body("path is ${HOME}");
-        let body = render_body_template(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
+        let body = render_source(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
 
         assert_eq!(body, r#"{"text": "path is ${HOME}"}"#);
     }
@@ -1220,12 +1258,18 @@ mod tests {
   "event_action": "trigger",
   "payload": {
     "summary": {{ title | tojson }},
-    "source": "valerter",
+    "source": {{ log.host | default("valerter") | tojson }},
     "severity": "error",
     "custom_details": {
-      "body": {{ body | tojson }},
-      "rule": {{ rule_name | tojson }}
+      "rule": {{ rule_name | tojson }},
+      "vl_source": {{ vl_source | tojson }},
+      "log_time": {{ log._time | tojson }},
+      "message": {{ log._msg | tojson }},
+      "pod": {{ log["k8s.pod"] | tojson }}
     }
+    {#- Or send every field of the event:
+    "custom_details": {{ log | tojson }}
+    #}
   }
 }
 "#,
@@ -1257,6 +1301,12 @@ mod tests {
     fn doc_example_templates_render_valid_json() {
         let mut alert = make_alert_with_body("line 1 \"quoted\"\nline 2 C:\\path <x> & y");
         alert.message.title = "Disk \"full\" on db-1".to_string();
+        alert.log = AlertPayload::log_from_fields(&serde_json::json!({
+            "_msg": "say \"hi\"\nC:\\tmp <x> & y",
+            "_time": "2026-01-15T10:49:35Z",
+            "host": "db-1",
+            "k8s.pod": "api-7f"
+        }));
 
         temp_env::with_var("PAGERDUTY_ROUTING_KEY", Some("abc123"), || {
             for (name, source) in DOC_EXAMPLE_TEMPLATES {
@@ -1287,8 +1337,20 @@ mod tests {
             serde_json::from_str(&pagerduty.build_body(&alert).unwrap()).unwrap();
         assert_eq!(parsed["routing_key"], "abc123");
         assert_eq!(parsed["payload"]["summary"], alert.message.title);
+        assert_eq!(parsed["payload"]["source"], "db-1");
+        let details = &parsed["payload"]["custom_details"];
+        assert_eq!(details["message"], "say \"hi\"\nC:\\tmp <x> & y");
+        assert_eq!(details["pod"], "api-7f");
+        assert_eq!(details["log_time"], "2026-01-15T10:49:35Z");
 
-        let slack = render_body_template(DOC_EXAMPLE_TEMPLATES[1].1, &alert).unwrap();
+        // Fields the event does not carry render as null: still valid JSON.
+        alert.log = AlertPayload::log_from_fields(&serde_json::json!({}));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pagerduty.build_body(&alert).unwrap()).unwrap();
+        assert_eq!(parsed["payload"]["source"], "valerter");
+        assert!(parsed["payload"]["custom_details"]["pod"].is_null());
+
+        let slack = render_source(DOC_EXAMPLE_TEMPLATES[1].1, &alert).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&slack).unwrap();
         assert_eq!(
             parsed["text"],
@@ -1320,7 +1382,8 @@ mod tests {
             let mut notifier =
                 WebhookNotifier::from_config("hook", &config, reqwest::Client::new()).unwrap();
             // Fails only at render time (load-time validation bypassed).
-            notifier.body_template_source = Some("{{ title | no_such_filter }}".to_string());
+            notifier.body_template =
+                Some(compile_body_template("{{ title | no_such_filter }}".to_string()).unwrap());
 
             let err = notifier
                 .send(&make_alert_payload("r"))

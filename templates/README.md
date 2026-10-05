@@ -27,6 +27,8 @@ You can provide your own template via:
 | `accent_color` | string \| null | Accent color from template (e.g., `#ff0000`) |
 | `log_timestamp` | string | Original log timestamp in ISO 8601 format (for VictoriaLogs search) |
 | `log_timestamp_formatted` | string | Human-readable timestamp (respects `timestamp_timezone` setting) |
+| `vl_source` | string | Name of the VictoriaLogs source the event came from |
+| `log` | object | Every field of the event: `{{ log.host }}`, `{{ log["k8s.pod"] }}` (HTML-escaped like the other values) |
 
 ## Jinja2 Syntax
 

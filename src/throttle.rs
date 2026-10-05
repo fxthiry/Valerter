@@ -230,7 +230,8 @@ impl Throttler {
         }
 
         // H1 fix: Pre-create Jinja environment once
-        let jinja_env = Environment::new();
+        let mut jinja_env = Environment::new();
+        crate::template::filters::register(&mut jinja_env);
 
         Self {
             store,
@@ -452,6 +453,16 @@ mod tests {
         let key = throttler.render_key(&fields);
 
         assert_eq!(key, "SW-01");
+    }
+
+    #[test]
+    fn render_key_applies_valerter_filters() {
+        let config = make_config(Some("{{ host | md_escape }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
+
+        let key = throttler.render_key(&json!({"host": "web_01"}));
+
+        assert_eq!(key, r"web\_01");
     }
 
     // ===================================================================

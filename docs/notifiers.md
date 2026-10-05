@@ -17,10 +17,10 @@ The most flexible notifier - works with any HTTP API.
 
 > **Note about `email_body_html`** — Webhook reads the outer template's `body`
 > output key (and `title`, `rule_name`, `log_timestamp`, `log_timestamp_formatted`)
-> inside its own `body_template`. It does **not** receive `email_body_html`;
-> `email_body_html` is email-only. If your HTTP target needs HTML, put it in `body`
-> at the outer template and reference `{{ body }}` from the webhook
-> `body_template`.
+> inside its own `body_template`, along with the event fields under `log`. It
+> does **not** receive `email_body_html`; `email_body_html` is email-only. If
+> your HTTP target needs HTML, write the markup in the webhook `body_template`
+> and insert each value escaped (`{{ log.host | e }}`).
 
 ### Configuration
 
@@ -36,12 +36,18 @@ notifiers:
         "event_action": "trigger",
         "payload": {
           "summary": {{ title | tojson }},
-          "source": "valerter",
+          "source": {{ log.host | default("valerter") | tojson }},
           "severity": "error",
           "custom_details": {
-            "body": {{ body | tojson }},
-            "rule": {{ rule_name | tojson }}
+            "rule": {{ rule_name | tojson }},
+            "vl_source": {{ vl_source | tojson }},
+            "log_time": {{ log._time | tojson }},
+            "message": {{ log._msg | tojson }},
+            "pod": {{ log["k8s.pod"] | tojson }}
           }
+          {#- Or send every field of the event:
+          "custom_details": {{ log | tojson }}
+          #}
         }
       }
 ```
@@ -50,6 +56,12 @@ The PagerDuty Events API v2 authenticates with the `routing_key` in the body, so
 `Authorization` header is needed. Set `PAGERDUTY_ROUTING_KEY` to the integration key of
 your PagerDuty service in the daemon's environment: the key stays out of the
 configuration file (see [`${VAR}` in `body_template`](#var-in-body_template)).
+
+`custom_details` is built from the event fields (`log`): each one becomes a
+separate PagerDuty field, `null` when the event does not carry it. The
+commented variant sends the whole event instead; it then also contains every
+dotted key twice, flat (`"k8s.pod"`) and expanded (`"k8s": {"pod": ...}`), and
+every field of the log line, secrets included: prefer an explicit selection.
 
 ### Fields
 
@@ -95,6 +107,12 @@ refuse the configuration (`invalid notifier '<name>': ...`, logged under
   test-rendered with placeholder values, so value-dependent errors such as
   `{{ status | int }}` are not reported at this stage.
 
+A `body_template` reading a variable that does not exist at this level is not
+refused (it renders empty) but logs
+`Notifier template references unknown variable` with the notifier, the field
+(`body_template`) and the variable: most often a log field written
+`{{ host }}` instead of `{{ log.host }}`.
+
 ### Content-Type
 
 Requests carry `Content-Type: application/json` unless `headers` defines a
@@ -137,10 +155,19 @@ When using `body_template`, these variables are available:
 | `vl_source` | Name of the VictoriaLogs source the event came from |
 | `log_timestamp` | Original log timestamp (ISO 8601) |
 | `log_timestamp_formatted` | Human-readable timestamp |
+| `log` | Every field of the event: `{{ log.host }}`, `{{ log._msg }}`, `{{ log["k8s.pod"] }}` or `{{ log.k8s.pod }}` |
 
 `{{ vl_source }}` is available wherever `{{ rule_name }}` is, and follows the
 same collision policy: an event field literally named `vl_source` is masked
 by the synthetic source name.
+
+`log` exposes the event the way the rule template sees it: dotted keys both flat
+(`log["k8s.pod"]`) and expanded (`log.k8s.pod`), a missing field rendering empty
+(`null` with `tojson`). It does not contain `rule_name` nor `vl_source`, and
+exists only in notifier templates, not in the rule template (see
+[Rule templates and notifier templates](configuration.md#rule-templates-and-notifier-templates)).
+`{{ log | tojson }}` renders the whole event as a JSON object, dotted keys
+included twice. Values are inserted as is, never resolved as `${VAR}`.
 
 ### Writing JSON bodies: the `tojson` filter
 
@@ -251,6 +278,40 @@ notifiers:
 | `body_template` | No | Inline HTML body template |
 | `body_template_file` | No | Path to HTML template file |
 
+### Template Variables
+
+`subject_template` and the body template see `title`, `body`, `rule_name`,
+`vl_source`, `accent_color`, `log_timestamp`, `log_timestamp_formatted` and
+`log`, the event fields (`{{ log.host }}`, `{{ log["k8s.pod"] }}`, see the
+[webhook variables](#template-variables)). In the body template, `body` is the
+rendered `email_body_html` (the plain `body` when it is missing), inserted
+without escaping; every other value, `log` fields included, is escaped as HTML
+automatically:
+
+```yaml
+notifiers:
+  email-oncall:
+    type: email
+    smtp:
+      host: smtp.example.com
+      port: 587
+      username: "${SMTP_USER}"
+      password: "${SMTP_PASSWORD}"
+    from: "valerter@example.com"
+    to:
+      - "oncall@example.com"
+    subject_template: "[{{ log.severity | default('alert') | upper }}] {{ title }}"
+    body_template: |
+      <h2>{{ title }}</h2>
+      <table>
+        <tr><td>Host</td><td>{{ log.host }}</td></tr>
+        <tr><td>Time</td><td>{{ log_timestamp_formatted }}</td></tr>
+      </table>
+      {{ body }}
+```
+
+With `host=<b>x</b>`, the cell contains `&lt;b&gt;x&lt;&#x2f;b&gt;`.
+
 ### TLS Modes
 
 | Mode | Port | Description |
@@ -296,7 +357,10 @@ notifier is built, at daemon startup and by `valerter --validate`: a syntax
 error is reported as `invalid notifier '<name>': body_template: ...`, an unknown
 filter, test, function or method as `invalid notifier '<name>': body_template
 render: ...`. `subject_template` gets the same checks (`subject_template: ...`,
-`subject_template render: ...`).
+`subject_template render: ...`). A variable that does not exist at this level
+(`{{ host }}` instead of `{{ log.host }}`) logs the warning
+`Notifier template references unknown variable` (field `subject_template` or
+`body_template`) without refusing the configuration.
 
 ### Example: Minimal (internal network)
 
@@ -422,11 +486,11 @@ This helps operators quickly locate the original log entry in VictoriaLogs.
 Send alerts to one or more Telegram chats via the Bot API.
 
 > **Note about `email_body_html`** — Telegram reads the outer template's `body`
-> output key, **not** `email_body_html`. `email_body_html` is email-only. For rich
-> formatting inside Telegram, put the markup directly in `body` using
-> Telegram's supported HTML subset: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`,
-> `<pre>`, `<blockquote>`, `<a href="…">`, `<span>`, `<tg-spoiler>`.
-> Keep `parse_mode: HTML` (the default) so the Bot API interprets those tags.
+> output key, **not** `email_body_html`. `email_body_html` is email-only. With
+> the default `body_template`, `body` is escaped (`{{ body|e }}`): HTML written
+> in the rule template's `body` is shown literally, tags included. For rich
+> formatting, write the markup in the Telegram `body_template` and escape each
+> inserted value (see [Formatting messages](#formatting-messages)).
 
 ### Prerequisites
 
@@ -461,7 +525,7 @@ notifiers:
 | `parse_mode` | No | `HTML` (default), `MarkdownV2` or `Markdown`, case-insensitive (`html` is sent as `HTML`). Any other value is refused at startup and by `--validate`: `parse_mode '<value>' is not supported (expected HTML, MarkdownV2 or Markdown)`. |
 | `disable_notification` | No | When `true`, Telegram delivers silently (no push sound). |
 | `disable_web_page_preview` | No | When `true`, Telegram does not expand link previews. |
-| `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. Checked at startup and by `--validate`: a syntax error (`body_template: ...`) or an unknown filter, test, function or method (`body_template render: ...`) is refused. |
+| `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. Sees `title`, `body`, `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted` and `log` (the event fields, see the [webhook variables](#template-variables)). Checked at startup and by `--validate`: a syntax error (`body_template: ...`) or an unknown filter, test, function or method (`body_template render: ...`) is refused; an unknown variable (`{{ host }}` instead of `{{ log.host }}`) logs `Notifier template references unknown variable`. |
 
 ### Multi-chat delivery
 
@@ -489,7 +553,43 @@ Telegram returns HTTP 429 with a `Retry-After` header when you hit a rate limit.
 
 ### HTML escaping
 
-With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`, or `&`. The default `body_template` uses the `|e` Jinja filter to escape these automatically. If you provide a custom `body_template`, make sure to escape user-controlled fields (`title`, `body`, `rule_name`...) the same way (`{{ body|e }}`, not `{{ body }}`): otherwise a log line containing `a < b` makes Telegram reject the message with a 400, and it is only delivered through the plain-text fallback, without formatting.
+With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`, or `&`. The default `body_template` uses the `|e` Jinja filter to escape these automatically. If you provide a custom `body_template`, make sure to escape user-controlled fields (`title`, `body`, `rule_name`, `log.*`...) the same way (`{{ body|e }}`, not `{{ body }}`): otherwise a log line containing `a < b` makes Telegram reject the message with a 400, and it is only delivered through the plain-text fallback, without formatting.
+
+### Formatting messages
+
+The markup belongs in the Telegram `body_template`, which is written for
+Telegram only; the values come from the alert and the event, each one escaped
+with `|e`:
+
+```yaml
+notifiers:
+  telegram-formatted:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-100123456789"
+    body_template: |
+      <b>{{ title|e }}</b>
+      Host: <code>{{ log.host|e }}</code>
+      Rule: <i>{{ rule_name|e }}</i> · {{ log_timestamp_formatted|e }}
+      <pre>{{ log._msg|e }}</pre>
+```
+
+With `host=<web&01>`, the message shows `Host: <web&01>` in monospace, and a
+`<` or `&` in the log line can no longer break the HTML.
+
+- Do not put HTML in the rule template's `body`: the default `body_template`
+  escapes it, and a custom one inserting `{{ body }}` without `|e` passes the
+  log data it contains unescaped. Write `{{ body }}` without `|e` only for a
+  `body` that holds no data from the log.
+- With `parse_mode: MarkdownV2`, escape values with
+  [`mdv2_escape`](configuration.md#valerter-filters) instead of `|e`:
+  `*{{ title | mdv2_escape }}*`.
+- A rule template can also produce Markdown rendered for each notifier with
+  [`body_format: markdown`](configuration.md#markdown-bodies-body_format),
+  which follows the same approach without a `body_template` per notifier.
+
+Background and next steps: [issue #24](https://github.com/fxthiry/valerter/issues/24).
 
 ### Example: two destinations, silent delivery
 

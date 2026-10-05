@@ -756,9 +756,12 @@ async fn process_log_line(
         }
     }
 
-    // Step 3: Render template (layer 1 sees both rule_name and vl_source)
-    let rendered =
-        template_engine.render_with_fallback(template_name, &fields, rule_name, vl_source);
+    // Step 3: Unflatten the dotted keys once, then render the rule template
+    // (layer 1 sees both rule_name and vl_source). The same view travels in
+    // the payload as `log` for the notifier templates (layer 2), even when
+    // layer 1 falls back.
+    let log = AlertPayload::log_from_fields(&fields);
+    let rendered = template_engine.render_with_fallback(template_name, &log, rule_name, vl_source);
 
     // Step 4: Extract _time from parsed fields for log timestamp
     let log_timestamp = fields
@@ -786,6 +789,7 @@ async fn process_log_line(
         mattermost_channel: mattermost_channel.map(str::to_string),
         log_timestamp,
         log_timestamp_formatted,
+        log,
     };
 
     if let Err(e) = queue.send(payload) {
@@ -1733,6 +1737,82 @@ mod tests {
             let payload = queue.take_pending("mattermost-test").unwrap();
             assert_eq!(payload.mattermost_channel.as_deref(), channel);
         }
+    }
+
+    /// Queue one line through `process_log_line` with `template` as the rule
+    /// template and return the payload queued for `mattermost-test`.
+    async fn payload_for_line(line: &str, template: CompiledTemplate) -> AlertPayload {
+        let parser = RuleParser::new(None, None);
+        let throttler = Throttler::new(None, "test_rule", "vlprod");
+        let template_engine =
+            TemplateEngine::new(HashMap::from([("default".to_string(), template)]));
+        let queue = make_test_queue();
+        process_log_line(
+            line,
+            &parser,
+            &throttler,
+            &template_engine,
+            "default",
+            "test_rule",
+            "vlprod",
+            &["mattermost-test".to_string()],
+            None,
+            &queue,
+            "UTC",
+        )
+        .await
+        .unwrap();
+        let payload = queue.take_pending("mattermost-test").unwrap();
+        AlertPayload::clone(&payload)
+    }
+
+    #[tokio::test]
+    async fn process_log_line_payload_carries_event_fields() {
+        let line = r#"{"_time":"2026-01-09T10:00:00Z","_msg":"upstream error","host":"web-01","nginx.status":"502"}"#;
+        let template = CompiledTemplate {
+            title: "{{ nginx.status }}".to_string(),
+            body: "{{ host }}".to_string(),
+            email_body_html: None,
+            accent_color: None,
+        };
+        let payload = payload_for_line(line, template).await;
+
+        assert_eq!(payload.message.title, "502");
+        let log = &payload.log;
+        assert_eq!(log.get_attr("host").unwrap().as_str(), Some("web-01"));
+        assert_eq!(
+            log.get_attr("_msg").unwrap().as_str(),
+            Some("upstream error")
+        );
+        assert_eq!(
+            log.get_item(&minijinja::Value::from("nginx.status"))
+                .unwrap()
+                .as_str(),
+            Some("502")
+        );
+        let nginx = log.get_attr("nginx").unwrap();
+        assert_eq!(nginx.get_attr("status").unwrap().as_str(), Some("502"));
+        // The synthetic layer 1 keys stay out of `log`.
+        assert!(log.get_attr("rule_name").unwrap().is_undefined());
+        assert!(log.get_attr("vl_source").unwrap().is_undefined());
+    }
+
+    #[tokio::test]
+    async fn process_log_line_payload_keeps_event_fields_on_render_fallback() {
+        let line = r#"{"_time":"2026-01-09T10:00:00Z","_msg":"m","host":"web-01"}"#;
+        let template = CompiledTemplate {
+            title: "{{ host | no_such_filter }}".to_string(),
+            body: "b".to_string(),
+            email_body_html: None,
+            accent_color: None,
+        };
+        let payload = payload_for_line(line, template).await;
+
+        assert_eq!(payload.message.title, "[test_rule] Alert");
+        assert_eq!(
+            payload.log.get_attr("host").unwrap().as_str(),
+            Some("web-01")
+        );
     }
 
     // ===================================================================
