@@ -502,6 +502,13 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
 
         // Create TailClient for this VictoriaLogs source
         let tail_config = TailConfig::from_source(&ctx.vl_source_config, ctx.rule.query.clone());
+        if tail_config.custom_authorization_overrides_basic_auth() {
+            warn!(
+                rule_name = %ctx.rule.name,
+                vl_source = %ctx.vl_source_name,
+                "Custom Authorization header overrides basic_auth for this VictoriaLogs source"
+            );
+        }
 
         let mut tail_client = TailClient::new(tail_config).map_err(RuleError::Stream)?;
 

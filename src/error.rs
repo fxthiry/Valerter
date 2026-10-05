@@ -37,10 +37,6 @@ pub enum ConfigError {
 pub enum StreamError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
-    #[error("invalid UTF-8 in stream: {0}")]
-    Utf8Error(String),
-    #[error("line too large: {0} bytes exceeds maximum of {1} bytes")]
-    LineTooLarge(usize, usize),
 }
 
 /// Errors related to log line parsing (regex and JSON extraction).
@@ -174,15 +170,6 @@ mod tests {
     fn stream_error_display() {
         let err = StreamError::ConnectionFailed("timeout".to_string());
         assert_eq!(err.to_string(), "connection failed: timeout");
-
-        let err = StreamError::Utf8Error("invalid sequence".to_string());
-        assert_eq!(err.to_string(), "invalid UTF-8 in stream: invalid sequence");
-
-        let err = StreamError::LineTooLarge(1048577, 1048576);
-        assert_eq!(
-            err.to_string(),
-            "line too large: 1048577 bytes exceeds maximum of 1048576 bytes"
-        );
     }
 
     #[test]

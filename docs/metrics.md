@@ -30,7 +30,7 @@ metrics:
 | `valerter_alerts_dropped_total` | - | Alerts dropped (queue full, global counter) |
 | `valerter_alerts_failed_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts that permanently failed |
 | `valerter_email_recipient_errors_total` | `rule_name`, `vl_source`, `notifier_name` | Email delivery failures per recipient |
-| `valerter_lines_discarded_total` | `rule_name`, `vl_source`, `reason` | Log lines discarded (e.g., reason=oversized for lines > 1MB) |
+| `valerter_lines_discarded_total` | `rule_name`, `vl_source`, `reason` | Log lines discarded, one unit per line. `reason="oversized"`: line longer than 1 MiB, dropped whole (its remaining bytes are skipped up to the next `\n`); `reason="invalid_utf8"`: line that is not valid UTF-8. In both cases the other lines of the stream are kept |
 | `valerter_logs_matched_total` | `rule_name`, `vl_source` | Logs matched by rule (before throttling) |
 | `valerter_notifier_config_errors_total` | `notifier`, `error_type` | Notifier configuration errors (e.g., env var resolution) |
 | `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Notification send errors |

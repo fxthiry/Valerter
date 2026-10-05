@@ -111,14 +111,17 @@ source is required.
 ```yaml
 victorialogs:
   default:                            # Source name (used as `vl_source`)
-    url: "http://victorialogs:9428"   # REQUIRED
+    url: "http://victorialogs:9428"   # REQUIRED (a trailing "/" is ignored)
 
     # Optional: Basic Authentication (per-source)
     basic_auth:
       username: "${VL_USER}"
       password: "${VL_PASS}"
 
-    # Optional: Custom headers (for tokens, API keys)
+    # Optional: Custom headers (for tokens, API keys).
+    # Sent last: they replace a default or basic_auth header of the same name.
+    # Use either basic_auth or an Authorization header, not both: here the
+    # Bearer token would replace the basic_auth credentials.
     headers:
       Authorization: "Bearer ${VL_TOKEN}"
 
@@ -126,6 +129,25 @@ victorialogs:
     tls:
       verify: true    # Set to false for self-signed certs
 ```
+
+### URL and headers
+
+- `url` is the base URL of VictoriaLogs, optionally with a path prefix
+  (`https://proxy.example.com/vl`). Trailing slashes are dropped before
+  `/select/logsql/tail` is appended, so `http://victorialogs:9428/` and
+  `http://victorialogs:9428` are equivalent.
+- Each request carries `Accept: application/x-ndjson`, `Connection: keep-alive`
+  and, when `basic_auth` is set, a Basic `Authorization` header. Custom
+  `headers` are applied last and **replace** any of these with the same name
+  (case-insensitive) instead of being sent alongside: `accept:
+  "application/json"` yields a single `Accept: application/json`.
+- A custom `Authorization` header therefore takes precedence over
+  `basic_auth`. Valerter logs a warning at the start of each affected
+  (rule, source) task (`Custom Authorization header overrides basic_auth for
+  this VictoriaLogs source`, with `rule_name` and `vl_source` only, never the
+  header value nor the credentials). Headers with another name, such as
+  `X-Tenant` or `Authorization-Token`, are sent together with Basic Auth.
+- Header values and the Basic Auth password are never written to the logs.
 
 ### Multi-source example
 
