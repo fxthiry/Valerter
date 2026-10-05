@@ -7,6 +7,7 @@
 //!   strategy per destination (AD-02)
 //! - HTTP sending with exponential backoff retry (AD-07)
 
+mod notifier_template;
 mod payload;
 mod queue;
 mod registry;

@@ -133,8 +133,9 @@ fn is_value_independent(kind: ErrorKind) -> bool {
 /// The built-in filters of minijinja 2.24 with the `builtins` and `json`
 /// features (keep in sync with `build_builtin_filters` in minijinja's
 /// `defaults.rs`; `builtin_filter_wrappers_still_report_unknown_filters`
-/// guards the list). valerter registers no filter of its own, so wrapping
-/// these keeps the validation environment faithful to production.
+/// guards the list). Wrapped in the validation environment together with
+/// valerter's own filters ([`crate::template::filters::valerter_filters`]),
+/// so the validation environment stays faithful to production.
 fn builtin_filters() -> Vec<(&'static str, Value)> {
     use minijinja::filters as f;
     vec![
@@ -207,14 +208,18 @@ fn filter_substitute(name: &str, pass: Pass) -> Value {
 }
 
 /// Builds the environment of a validation render: lenient undefined values
-/// as in production, every built-in filter wrapped so that a failure caused
-/// by a sentinel argument returns [`filter_substitute`] instead of stopping
-/// the render, and, in the falsy pass, `defined`/`undefined` tests that treat
-/// a sentinel as undefined (so `{% if x is not defined %}` bodies are walked).
+/// as in production, every built-in and valerter filter wrapped so that a
+/// failure caused by a sentinel argument returns [`filter_substitute`]
+/// instead of stopping the render, and, in the falsy pass,
+/// `defined`/`undefined` tests that treat a sentinel as undefined (so
+/// `{% if x is not defined %}` bodies are walked).
 fn validation_env(pass: Pass) -> Environment<'static> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
-    for (name, filter) in builtin_filters() {
+    let filters = builtin_filters()
+        .into_iter()
+        .chain(crate::template::filters::valerter_filters());
+    for (name, filter) in filters {
         env.add_filter(
             name,
             move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
@@ -699,8 +704,9 @@ mod tests {
         }
     }
 
-    /// Guard for minijinja upgrades: every wrapped built-in filter, applied to
-    /// a field, must let the render reach the unknown filter that follows.
+    /// Guard for minijinja upgrades: every wrapped built-in or valerter filter,
+    /// applied to a field, must let the render reach the unknown filter that
+    /// follows.
     #[test]
     fn builtin_filter_wrappers_still_report_unknown_filters() {
         let required_args = |name: &str| match name {
@@ -711,7 +717,10 @@ mod tests {
             "chain" | "zip" => "(y)",
             _ => "",
         };
-        for (name, _) in builtin_filters() {
+        let filters = builtin_filters()
+            .into_iter()
+            .chain(crate::template::filters::valerter_filters());
+        for (name, _) in filters {
             let source = format!(
                 "{{{{ x | {name}{} }}}}{{{{ y | nosuchfilter }}}}",
                 required_args(name)
@@ -720,6 +729,19 @@ mod tests {
                 .expect_err(&format!("{source} should be rejected"));
             assert!(err.contains("nosuchfilter"), "{source}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_template_render_reports_unknown_filter_after_valerter_filter() {
+        let err = validate_template_render("{{ host | md_escape }} {{ host | nosuch }}")
+            .expect_err("unknown filter must be reported");
+        assert!(err.contains("nosuch"), "{err}");
+    }
+
+    #[test]
+    fn validate_notifier_template_accepts_valerter_filters_on_log_fields() {
+        let source = "{{ log.host | mdv2_escape }} {{ log.msg | md_escape | upper }}";
+        assert_eq!(validate_notifier_template("body_template", source), Ok(()));
     }
 
     // ============================================================

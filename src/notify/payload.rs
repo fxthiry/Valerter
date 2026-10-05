@@ -8,7 +8,10 @@ use chrono_tz::Tz;
 ///
 /// Contains all fields needed to send a notification.
 /// Shared between destination queues through `Arc` (queued once, not copied).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand: it shows how many event fields `log`
+/// holds, never their values (they may carry secrets).
+#[derive(Clone)]
 pub struct AlertPayload {
     /// Rendered message content (title, body, accent_color).
     pub message: RenderedMessage,
@@ -31,6 +34,35 @@ pub struct AlertPayload {
     /// Human-readable formatted timestamp (respects configured timezone).
     /// Format: "DD/MM/YYYY HH:MM:SS TZ" (e.g., "15/01/2026 11:49:35 CET")
     pub log_timestamp_formatted: String,
+    /// Fields of the parsed event, dotted keys unflattened (the layer 1
+    /// view, without the synthetic `rule_name` and `vl_source`), exposed as
+    /// `log` to notifier templates. Built once per alert by
+    /// [`AlertPayload::log_from_fields`]; a `minijinja::Value` is immutable
+    /// and reference-counted, so notifiers share it without copying.
+    pub log: minijinja::Value,
+}
+
+impl AlertPayload {
+    /// Builds the [`AlertPayload::log`] value of an event: dotted keys are
+    /// unflattened once (flat keys kept), then the result is converted once.
+    pub fn log_from_fields(fields: &serde_json::Value) -> minijinja::Value {
+        minijinja::Value::from_serialize(crate::parser::unflatten_dotted_keys(fields))
+    }
+}
+
+impl std::fmt::Debug for AlertPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertPayload")
+            .field("message", &self.message)
+            .field("rule_name", &self.rule_name)
+            .field("vl_source", &self.vl_source)
+            .field("destinations", &self.destinations)
+            .field("mattermost_channel", &self.mattermost_channel)
+            .field("log_timestamp", &self.log_timestamp)
+            .field("log_timestamp_formatted", &self.log_timestamp_formatted)
+            .field("log_field_count", &self.log.len().unwrap_or(0))
+            .finish()
+    }
 }
 
 /// Count a permanent delivery failure of `alert` for one notifier.
@@ -98,6 +130,35 @@ pub fn format_log_timestamp(raw_timestamp: &str, timezone: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_shows_field_count_but_no_field_value() {
+        let alert = AlertPayload {
+            message: RenderedMessage {
+                title: "t".to_string(),
+                body: "b".to_string(),
+                email_body_html: None,
+                accent_color: None,
+            },
+            rule_name: "r".to_string(),
+            vl_source: "vlprod".to_string(),
+            destinations: vec![],
+            mattermost_channel: None,
+            log_timestamp: String::new(),
+            log_timestamp_formatted: String::new(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({
+                "_msg": "login password=hunter2",
+                "password": "hunter2",
+                "host": "web-01"
+            })),
+        };
+
+        let debug = format!("{alert:?}");
+
+        assert!(debug.contains("log_field_count: 3"), "{debug}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!debug.contains("web-01"), "{debug}");
+    }
 
     #[test]
     fn format_log_timestamp_utc() {

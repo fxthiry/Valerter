@@ -344,6 +344,32 @@ the top-level template fields (`title`, `body`, `email_body_html`), the
 
 These timestamps are computed **after** the top-level template renders, so they are only accessible in notifier-level templates. If you need a timestamp at the top-level, reference `{{ _time }}` (raw VictoriaLogs field) directly.
 
+#### Rule templates and notifier templates
+
+Templates are rendered at two levels:
+
+| Level | Templates | Event fields | Other variables |
+|-------|-----------|--------------|-----------------|
+| Rule template (level 1) | `title`, `body`, `email_body_html`, `throttle.key` | At the top level: `{{ host }}`, `{{ _msg }}` | `rule_name`, `vl_source` |
+| Notifier template (level 2) | `body_template` (webhook, Telegram, email), `subject_template` (email) | Under `log`: `{{ log.host }}`, `{{ log._msg }}` | `title`, `body` (the rendered rule template), `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted`, plus `accent_color` for email |
+
+`log` holds every field of the parsed event, in the same view as the rule
+template: dotted keys are available both flat and expanded
+(`{{ log["k8s.pod"] }}` and `{{ log.k8s.pod }}`), and a missing field renders
+empty (`{{ log.missing }}`). It does not contain `rule_name` nor `vl_source`:
+use the top-level variables. Because the notifier template is written for one
+channel, it is the place for markup (HTML for Telegram and email, JSON for a
+webhook), each value from `log` being escaped for that channel (see
+[valerter filters](#valerter-filters)). `{{ log | tojson }}` renders the whole
+event as a JSON object, with dotted keys present twice (flat and expanded).
+
+`log` exists only in notifier templates: in a rule template, `{{ log }}` is the
+event field named `log` if there is one (container output collected by
+Fluent Bit, for instance). In a notifier template, a variable that is none of
+the above renders empty: valerter logs the warning
+`Notifier template references unknown variable` at startup and in
+`--validate` (see [Template validation](#template-validation)).
+
 ### Fields with special characters
 
 VictoriaLogs field names may contain characters that are operators in Jinja,
@@ -378,6 +404,39 @@ accepted: it cannot be told apart from a field named `total/count`, so a
 top-level field like `io/username` (no `.`, `-` or `/` in its last part) is not
 detected and must be renamed the same way.
 
+### valerter filters
+
+Besides the built-in filters of minijinja (`default`, `upper`, `lower`,
+`length`, `replace`, `tojson`, `e`...), valerter provides two escaping filters,
+available in every template (rule templates, `throttle.key`, notifier
+templates). Filters that minijinja does not provide, such as `truncate`, are
+unknown and refused by the [test render](#template-validation).
+
+| Filter | Target | Escaped characters |
+|--------|--------|--------------------|
+| `md_escape` | Markdown (CommonMark) read by Mattermost | `` \ ` * _ { } [ ] ( ) # + - . ! > \| ~ `` |
+| `mdv2_escape` | Telegram `parse_mode: MarkdownV2` | `` _ * [ ] ( ) ~ ` > # + - = \| { } . ! `` and `\` |
+
+Both convert their value to a string (`none` and a missing value give an empty
+string) and put a backslash before each character of their set, so the value is
+displayed literally instead of being read as Markdown:
+`{{ host | md_escape }}` renders `web_01` as `web\_01`.
+
+- `md_escape` escapes exactly the characters Mattermost's Markdown engine
+  recognises: other punctuation (`:`, `/`, `=`, `?`, `@`...) is left alone, as
+  Mattermost would show the backslash (`10\:49`). `<` and `&` are not
+  neutralised either: harmless in Mattermost, which does not render HTML, but a
+  CommonMark renderer that does would interpret them.
+- `mdv2_escape` applies to MarkdownV2 text **outside** `pre` and `code`
+  entities; inside them, Telegram only requires `` ` `` and `\` to be escaped.
+- For HTML (Telegram `parse_mode: HTML`, a custom HTML body), use the built-in
+  `| e`: it produces the entities Telegram expects (`&lt;`, `&gt;`, `&amp;`).
+  In an email body template, values are escaped as HTML automatically.
+
+The result of `md_escape` and `mdv2_escape` is an ordinary string: in an
+HTML-escaped template (email body, `email_body_html`), it is still escaped as
+HTML afterwards.
+
 ### Template validation
 
 Templates (`title`, `body`, `email_body_html`, `throttle.key`, and the notifier
@@ -395,11 +454,25 @@ in either pass:
 
 - an unknown filter, test, function or method (`{{ _msg | truncate(50) }}`,
   `{% if host is nosuchtest %}`), reported as `<field> render: ...`, including
-  after a built-in filter applied to a field
+  after a built-in or [valerter filter](#valerter-filters) applied to a field
   (`{{ status | int }}-{{ host | truncat(10) }}`,
   `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch
   or in a loop body (`{% for k, v in m | items %}{{ v | nosuch }}{% endfor %}`);
 - the `/` operator applied to a field path (see above).
+
+In a notifier template (`body_template`, `subject_template`), a top-level
+variable that is not part of its context (see
+[Rule templates and notifier templates](#rule-templates-and-notifier-templates))
+is not refused, since it renders empty, but logs a warning when the notifier is
+built, at startup and in `--validate`:
+
+```
+WARN Notifier template references unknown variable notifier=hook field=body_template variable=host
+```
+
+The usual cause is a log field written `{{ host }}` instead of
+`{{ log.host }}`. Loop and `set` variables and global functions (`range`,
+`namespace`, `dict`) are not reported.
 
 Conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency |
 float) > 1.5 }}`, `{{ ratio | round }}`, `{{ count + 1 }}`) are accepted: their
@@ -662,7 +735,7 @@ valerter --validate -c /etc/valerter/config.yaml
 3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, resolved webhook and Mattermost URLs are checked, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids`, Telegram `parse_mode` and notifier templates (syntax and test render) are checked
 4. **Rule destinations** — every rule destination (enabled or not) names a declared notifier
 5. **Email body** — templates of enabled rules sent to email destinations define `email_body_html`
-6. **Warning** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination (exit code stays 0)
+6. **Warnings** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination, and `Notifier template references unknown variable` when a notifier template reads a variable that does not exist at its level, such as `{{ host }}` instead of `{{ log.host }}` (see [Template validation](#template-validation)); the exit code stays 0
 
 Errors from steps 3 to 5 are all reported in one pass. No daemon, metrics server or network connection is started: VictoriaLogs sources, SMTP servers and webhooks do not need to be reachable.
 

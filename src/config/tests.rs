@@ -1068,6 +1068,38 @@ rules:
 }
 
 #[test]
+fn validate_template_render_in_body_detects_unknown_filter_after_md_escape() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "{{ host | md_escape }} {{ host | nosuch }}"
+rules: []
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config.validate().unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            crate::error::ConfigError::InvalidTemplate { message, .. }
+                if message.contains("body render") && message.contains("nosuch")
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn validate_template_render_in_body_detects_unknown_filter() {
     let yaml = r#"
 victorialogs:

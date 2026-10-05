@@ -786,6 +786,7 @@ mod tests {
             destinations: vec!["hook".to_string()],
             log_timestamp: String::new(),
             log_timestamp_formatted: String::new(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         };
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();

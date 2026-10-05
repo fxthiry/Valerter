@@ -10,9 +10,10 @@ use crate::config::{
 };
 use crate::error::{ConfigError, NotifyError};
 use crate::http_body::read_body_prefix;
+use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
 use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
-use minijinja::{Environment, context};
+use minijinja::context;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -90,23 +91,35 @@ fn truncate_text(text: &str) -> (String, bool) {
     (out, true)
 }
 
-/// Render a body template with alert context.
-fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
-    let mut env = Environment::new();
-    env.add_template("body", source)
-        .map_err(|e| NotifyError::TemplateError(e.to_string()))?;
-    let tmpl = env
-        .get_template("body")
-        .map_err(|e| NotifyError::TemplateError(e.to_string()))?;
-    tmpl.render(context! {
-        title => &alert.message.title,
-        body => &alert.message.body,
-        rule_name => &alert.rule_name,
-        vl_source => &alert.vl_source,
-        log_timestamp => &alert.log_timestamp,
-        log_timestamp_formatted => &alert.log_timestamp_formatted,
+/// Render the compiled body template with alert context.
+fn render_body_template(
+    template: &NotifierTemplate,
+    alert: &AlertPayload,
+) -> Result<String, NotifyError> {
+    template
+        .render(context! {
+            title => &alert.message.title,
+            body => &alert.message.body,
+            rule_name => &alert.rule_name,
+            vl_source => &alert.vl_source,
+            log_timestamp => &alert.log_timestamp,
+            log_timestamp_formatted => &alert.log_timestamp_formatted,
+            log => &alert.log,
+        })
+        .map_err(|e| NotifyError::TemplateError(e.to_string()))
+}
+
+/// Compile the configured `body_template`, or the default one. The source
+/// has already been validated, so an error here is unexpected.
+fn compile_body_template(
+    name: &str,
+    source: Option<&str>,
+) -> Result<NotifierTemplate, ConfigError> {
+    let source = source.unwrap_or(DEFAULT_BODY_TEMPLATE);
+    NotifierTemplate::compile(source.to_string(), false).map_err(|e| ConfigError::InvalidNotifier {
+        name: name.to_string(),
+        message: format!("body_template: {e}"),
     })
-    .map_err(|e| NotifyError::TemplateError(e.to_string()))
 }
 
 /// Strips tags like `<b>`, `<i></i>` from a rendered Telegram HTML body.
@@ -254,7 +267,10 @@ pub struct TelegramNotifier {
     parse_mode: String,
     disable_notification: Option<bool>,
     disable_web_page_preview: Option<bool>,
-    body_template_source: Option<String>,
+    /// Whether `body_template` is configured (else the default is used).
+    has_body_template: bool,
+    /// `body_template` or the default template, compiled once.
+    body_template: NotifierTemplate,
 }
 
 impl TelegramNotifier {
@@ -316,6 +332,9 @@ impl TelegramNotifier {
             }
         };
 
+        let body_template = compile_body_template(name, config.body_template.as_deref())?;
+        body_template.warn_unknown_variables(name, "body_template", &CONTEXT_VARIABLES);
+
         let endpoint = format!("https://api.telegram.org/bot{}/sendMessage", resolved_token);
 
         Ok(Self {
@@ -326,17 +345,14 @@ impl TelegramNotifier {
             parse_mode: parse_mode.to_string(),
             disable_notification: config.disable_notification,
             disable_web_page_preview: config.disable_web_page_preview,
-            body_template_source: config.body_template.clone(),
+            has_body_template: config.body_template.is_some(),
+            body_template,
         })
     }
 
     /// Render and truncate the message text once, before fan-out to chats.
     fn prepare_text(&self, alert: &AlertPayload) -> Result<(String, bool), NotifyError> {
-        let template = self
-            .body_template_source
-            .as_deref()
-            .unwrap_or(DEFAULT_BODY_TEMPLATE);
-        let rendered = render_body_template(template, alert)?;
+        let rendered = render_body_template(&self.body_template, alert)?;
         let guarded = if let Some((fallback, reason)) = fallback_if_empty(&rendered, alert) {
             tracing::warn!(
                 rule_name = %alert.rule_name,
@@ -605,8 +621,16 @@ impl TelegramNotifier {
             parse_mode: DEFAULT_PARSE_MODE.to_string(),
             disable_notification: None,
             disable_web_page_preview: None,
-            body_template_source: None,
+            has_body_template: false,
+            body_template: compile_body_template(name, None).expect("default template compiles"),
         }
+    }
+
+    /// Test-only: replace the body template, bypassing validation.
+    pub(crate) fn set_body_template_for_tests(&mut self, source: Option<&str>) {
+        self.has_body_template = source.is_some();
+        self.body_template =
+            compile_body_template(&self.name, source).expect("test template compiles");
     }
 }
 
@@ -617,7 +641,7 @@ impl std::fmt::Debug for TelegramNotifier {
             .field("name", &self.name)
             .field("chat_count", &self.chat_ids.len())
             .field("parse_mode", &self.parse_mode)
-            .field("has_body_template", &self.body_template_source.is_some())
+            .field("has_body_template", &self.has_body_template)
             .finish()
     }
 }
@@ -641,6 +665,7 @@ mod tests {
             destinations: vec![],
             log_timestamp: "2026-04-14T10:00:00Z".to_string(),
             log_timestamp_formatted: "14/04/2026 10:00:00 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 
@@ -801,17 +826,71 @@ mod tests {
         assert_eq!(notifier.name(), "tg");
         assert_eq!(notifier.notifier_type(), "telegram");
         assert_eq!(notifier.parse_mode, DEFAULT_PARSE_MODE);
-        assert!(notifier.body_template_source.is_none());
+        assert!(!notifier.has_body_template);
     }
 
     #[test]
     fn default_body_template_escapes_html() {
         let alert = sample_alert("<script>", "A & B");
-        let rendered = render_body_template(DEFAULT_BODY_TEMPLATE, &alert).unwrap();
+        let template = compile_body_template("tg", None).unwrap();
+        let rendered = render_body_template(&template, &alert).unwrap();
         assert!(!rendered.contains("<script>"));
         assert!(rendered.contains("&lt;script&gt;"));
         assert!(rendered.contains("A &amp; B"));
         assert!(rendered.starts_with("<b>"));
+    }
+
+    #[test]
+    fn default_body_template_escapes_body() {
+        let template = compile_body_template("tg", None).unwrap();
+        let rendered = render_body_template(&template, &sample_alert("T", "a < b & c")).unwrap();
+        assert_eq!(rendered, "<b>T</b>\na &lt; b &amp; c");
+    }
+
+    #[test]
+    fn body_template_markup_with_escaped_log_fields() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some("<b>{{ title|e }}</b>\n<code>{{ log.host|e }}</code>".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("Disk", "body");
+        alert.log = AlertPayload::log_from_fields(&serde_json::json!({"host": "<web&01>"}));
+
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+
+        assert_eq!(text, "<b>Disk</b>\n<code>&lt;web&amp;01&gt;</code>");
+    }
+
+    #[test]
+    fn body_template_reads_log_fields_flat_and_unflattened() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some(
+            "{{ log.host }}: {{ body }} {{ log[\"k8s.pod\"] }}|{{ log.k8s.pod }}|{{ log.missing }}|{{ log.rule_name }}"
+                .to_string(),
+        );
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("T", "disk full");
+        alert.log = AlertPayload::log_from_fields(
+            &serde_json::json!({"host": "web-01", "k8s.pod": "api-7f"}),
+        );
+
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+
+        assert_eq!(text, "web-01: disk full api-7f|api-7f||");
+    }
+
+    #[test]
+    fn from_config_accepts_valerter_filters_on_log_fields() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template =
+            Some("{{ log.host | mdv2_escape }} {{ log.msg | md_escape | upper }}".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("T", "b");
+        alert.log =
+            AlertPayload::log_from_fields(&serde_json::json!({"host": "a.b", "msg": "x_y"}));
+
+        let (text, _) = notifier.prepare_text(&alert).unwrap();
+
+        assert_eq!(text, r"a\.b X\_Y");
     }
 
     #[test]
@@ -1381,7 +1460,7 @@ mod tests {
                 let server = MockServer::start().await;
                 let mut notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
                 // `<pre>` opened and never closed once the text is cut.
-                notifier.body_template_source = Some("<pre>{{ body }}</pre>".to_string());
+                notifier.set_body_template_for_tests(Some("<pre>{{ body }}</pre>"));
                 let long_body = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 100);
 
                 notifier
@@ -1577,7 +1656,7 @@ mod tests {
                 .await;
             let mut notifier =
                 test_notifier(&server, chat_ids.iter().map(|c| c.to_string()).collect());
-            notifier.body_template_source = body_template.map(str::to_string);
+            notifier.set_body_template_for_tests(body_template);
             let result = notifier.send(&sample_alert("hi", "body")).await;
             (result, server.received_requests().await.unwrap().len())
         });
@@ -1682,6 +1761,8 @@ mod tests {
             matches!(result, Err(NotifyError::TemplateError(_))),
             "unexpected result: {result:?}"
         );
+        let message = result.unwrap_err().to_string();
+        assert!(message.starts_with("template error: "), "{message}");
         assert_eq!(requests, 0, "no sendMessage request may be issued");
         assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 1);
         assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 1);

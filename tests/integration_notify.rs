@@ -35,6 +35,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
         destinations,
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -1203,6 +1204,115 @@ async fn test_webhook_env_var_syntax_in_alert_body_sent_literally() {
 
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, br#"{"text": "path is ${HOME}"}"#);
+}
+
+// ============================================================================
+// `log`: event fields in the webhook body_template
+// ============================================================================
+
+/// Send one alert carrying the event `fields` through a webhook notifier
+/// whose `body_template` is `template`, against a server answering
+/// `statuses` per request (the last one repeats). Returns the request bodies.
+async fn send_with_log_fields(
+    template: &str,
+    fields: serde_json::Value,
+    statuses: &'static [u16],
+) -> Vec<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use valerter::notify::Notifier;
+
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/api/alerts"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(statuses[n.min(statuses.len() - 1)])
+        })
+        .mount(&mock_server)
+        .await;
+    let url = format!("{}/api/alerts", mock_server.uri());
+    let notifier = make_webhook_notifier(
+        "log-webhook",
+        &url,
+        "POST",
+        HashMap::new(),
+        Some(template.to_string()),
+    );
+    let mut payload = make_payload_with_destinations("log_rule", vec!["log-webhook".to_string()]);
+    payload.log = AlertPayload::log_from_fields(&fields);
+
+    notifier.send(&payload).await.unwrap();
+    mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_webhook_body_template_reads_log_fields() {
+    let bodies = send_with_log_fields(
+        r#"{"host": {{ log.host | tojson }}, "pod": {{ log["k8s.pod"] | tojson }}}"#,
+        serde_json::json!({"host": "web-01", "k8s.pod": "api-7f", "_msg": "m"}),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies, vec![r#"{"host": "web-01", "pod": "api-7f"}"#]);
+}
+
+#[tokio::test]
+async fn test_webhook_body_template_whole_log_is_valid_json() {
+    let bodies = send_with_log_fields(
+        r#"{"details": {{ log | tojson }}}"#,
+        serde_json::json!({
+            "_msg": "say \"hi\"\nnext",
+            "_time": "2026-01-15T10:49:35Z",
+            "k8s.pod": "api-7f"
+        }),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let details = &parsed["details"];
+    assert_eq!(details["_msg"], "say \"hi\"\nnext");
+    assert_eq!(details["_time"], "2026-01-15T10:49:35Z");
+    // Flat and unflattened views of a dotted key.
+    assert_eq!(details["k8s.pod"], "api-7f");
+    assert_eq!(details["k8s"]["pod"], "api-7f");
+}
+
+#[tokio::test]
+async fn test_webhook_env_var_syntax_in_log_field_sent_literally() {
+    // `${VAR}` is resolved in the template source when the notifier is built,
+    // never in rendered values: an undefined variable in a field is no error.
+    let bodies = send_with_log_fields(
+        r#"{"key": {{ log.key | tojson }}}"#,
+        serde_json::json!({"key": "${ROUTING_KEY_NEVER_DEFINED}"}),
+        &[200],
+    )
+    .await;
+
+    assert_eq!(bodies, vec![r#"{"key": "${ROUTING_KEY_NEVER_DEFINED}"}"#]);
+}
+
+#[tokio::test]
+async fn test_webhook_log_body_identical_across_retries() {
+    let bodies = send_with_log_fields(
+        r#"{"host": {{ log.host | tojson }}, "msg": {{ log._msg | tojson }}}"#,
+        serde_json::json!({"host": "web-01", "_msg": "boom"}),
+        &[500, 200],
+    )
+    .await;
+
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[0], r#"{"host": "web-01", "msg": "boom"}"#);
 }
 
 // ============================================================================

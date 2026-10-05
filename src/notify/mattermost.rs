@@ -544,6 +544,7 @@ mod tests {
             destinations: vec!["mm".to_string()],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 

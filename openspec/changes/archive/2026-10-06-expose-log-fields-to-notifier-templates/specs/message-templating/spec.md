@@ -53,7 +53,7 @@ Le système SHALL fournir le filtre `md_escape`, qui convertit sa valeur en cha�
 
 #### Scenario: Caractères conservés
 - **WHEN** `{{ v | md_escape }}` est rendu avec `v = https://h:8080/p?a=1&b=<2>`
-- **THEN** le résultat vaut `https://h:8080/p?a=1&b=<2>`
+- **THEN** le résultat vaut `https://h:8080/p?a=1&b=<2\>` : seul `>`, qui appartient au jeu, est échappé
 
 #### Scenario: Caractères multioctets
 - **WHEN** `{{ v | md_escape }}` est rendu avec `v = déjà_vu 🔥`

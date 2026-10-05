@@ -131,6 +131,14 @@ defaults:
 #                                             (notifier-level templates only)
 #      log_timestamp_formatted                human timestamp (defaults.timestamp_timezone)
 #                                             (notifier-level templates only)
+#      log                                    every field of the event, in
+#                                             notifier-level templates only:
+#                                             {{ log.host }}, {{ log["k8s.pod"] }}
+#                                             (in rule templates, fields are
+#                                             top-level: {{ host }})
+#
+#    Escaping filters (any template): `| e` (HTML), `| md_escape` (Markdown
+#    for Mattermost), `| mdv2_escape` (Telegram MarkdownV2).
 #
 # 2. Template OUTPUT KEYS that you define below (left-hand side). These are
 #    the slots valerter fills and hands off to notifiers:
@@ -138,9 +146,12 @@ defaults:
 #      body          Alert body, plain text or Markdown (required)
 #      email_body_html     HTML-enriched version used ONLY by the email notifier
 #                    (Telegram, Mattermost, and webhook all read `body` and
-#                    ignore `email_body_html`). To format a Telegram alert, put
-#                    `<b>`/`<i>`/`<code>` inline in `body` — `parse_mode: HTML`
-#                    is Telegram's default.
+#                    ignore `email_body_html`). Do not put HTML in `body` for
+#                    Telegram: its default body_template escapes `body`, so the
+#                    tags show literally. Write the markup in the Telegram
+#                    `body_template` and escape each value there
+#                    (`<code>{{ log.host|e }}</code>`), see the Telegram
+#                    notifier below and docs/notifiers.md.
 #      accent_color  Hex color for visual indicators (optional, e.g., "#ff0000")
 #
 # Note: `title` and `body` are NOT variables you can reference on the right.
@@ -231,18 +242,26 @@ notifiers:
   #   # Events API v2: the routing key in the body authenticates the event, no
   #   # Authorization header needed. Set PAGERDUTY_ROUTING_KEY in the daemon's
   #   # environment to your integration key.
+  #   # custom_details lists event fields read from `log` (null when absent).
   #   body_template: |
   #     {
   #       "routing_key": "${PAGERDUTY_ROUTING_KEY}",
   #       "event_action": "trigger",
   #       "payload": {
   #         "summary": {{ title | tojson }},
-  #         "source": "valerter",
+  #         "source": {{ log.host | default("valerter") | tojson }},
   #         "severity": "error",
   #         "custom_details": {
-  #           "body": {{ body | tojson }},
-  #           "rule": {{ rule_name | tojson }}
+  #           "rule": {{ rule_name | tojson }},
+  #           "vl_source": {{ vl_source | tojson }},
+  #           "log_time": {{ log._time | tojson }},
+  #           "message": {{ log._msg | tojson }},
+  #           "pod": {{ log["k8s.pod"] | tojson }}
   #         }
+  #         {#- Or send every field of the event (dotted keys appear twice,
+  #             flat and expanded, and secrets in the log line go along):
+  #         "custom_details": {{ log | tojson }}
+  #         #}
   #       }
   #     }
 
@@ -299,8 +318,12 @@ notifiers:
   #   parse_mode: HTML                       # Default: HTML (also: MarkdownV2)
   #   disable_notification: false            # Default: not set (Telegram default = false)
   #   disable_web_page_preview: true         # Default: not set
-  #   body_template: |                       # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}"
+  #   # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}". Write the
+  #   # markup here and escape every inserted value with |e: `body` and the
+  #   # event fields (`log`) may contain <, > or &.
+  #   body_template: |
   #     <b>{{ title|e }}</b>
+  #     Host: <code>{{ log.host|e }}</code>
   #     {{ body|e }}
 
 

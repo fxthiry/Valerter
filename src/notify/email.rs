@@ -14,6 +14,7 @@ use crate::config::{
     validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
+use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
 use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use lettre::message::Mailbox;
@@ -22,7 +23,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::transport::smtp::response::{Code, Severity};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use minijinja::{Environment, context};
+use minijinja::context;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,10 +180,25 @@ pub struct EmailNotifier {
     from: Mailbox,
     /// Recipient email addresses.
     to: Vec<Mailbox>,
-    /// Subject line template source.
-    subject_template_source: String,
-    /// Body template source (always has a value - defaults to embedded template).
-    body_template_source: String,
+    /// Subject line template, compiled once.
+    subject_template: NotifierTemplate,
+    /// Body template (file, inline or embedded default), compiled once with
+    /// HTML auto-escaping.
+    body_template: NotifierTemplate,
+}
+
+/// Variables of the email templates: the common layer 2 context plus
+/// `accent_color`.
+fn email_context_variables() -> Vec<&'static str> {
+    let mut known = CONTEXT_VARIABLES.to_vec();
+    known.push("accent_color");
+    known
+}
+
+/// Compile a validated subject (`html == false`) or body (`html == true`)
+/// template; `field` prefixes the (unexpected) error.
+fn compile_template(field: &str, source: String, html: bool) -> Result<NotifierTemplate, String> {
+    NotifierTemplate::compile(source, html).map_err(|e| format!("{field}: {e}"))
 }
 
 impl EmailNotifier {
@@ -257,13 +273,17 @@ impl EmailNotifier {
             });
         }
 
-        // 5. Validate the subject template (syntax, then render test)
-        validate_notifier_template("subject_template", &config.subject_template).map_err(
-            |message| ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message,
-            },
-        )?;
+        // 5. Validate the subject template (syntax, then render test), then
+        // compile it once
+        let subject_template =
+            validate_notifier_template("subject_template", &config.subject_template)
+                .and_then(|()| {
+                    compile_template("subject_template", config.subject_template.clone(), false)
+                })
+                .map_err(|message| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message,
+                })?;
 
         // 6. Resolve body template (file > inline > embedded default)
         let body_template_source = match resolve_body_template(config, config_dir)? {
@@ -272,21 +292,25 @@ impl EmailNotifier {
         };
 
         // 7. Validate the retained body template (file, inline or embedded):
-        // syntax, then render test
-        validate_notifier_template("body_template", &body_template_source).map_err(|message| {
-            ConfigError::InvalidNotifier {
+        // syntax, then render test, then compile it once (HTML auto-escape)
+        let body_template = validate_notifier_template("body_template", &body_template_source)
+            .and_then(|()| compile_template("body_template", body_template_source, true))
+            .map_err(|message| ConfigError::InvalidNotifier {
                 name: name.to_string(),
                 message,
-            }
-        })?;
+            })?;
+
+        let known = email_context_variables();
+        subject_template.warn_unknown_variables(name, "subject_template", &known);
+        body_template.warn_unknown_variables(name, "body_template", &known);
 
         Ok(Self {
             name: name.to_string(),
             transport: Arc::new(SmtpTransport::new(transport)),
             from,
             to,
-            subject_template_source: config.subject_template.clone(),
-            body_template_source,
+            subject_template,
+            body_template,
         })
     }
 
@@ -332,10 +356,20 @@ impl EmailNotifier {
             transport,
             from,
             to,
-            subject_template_source: subject_template_source.to_string(),
-            body_template_source: body_template_source
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_BODY_TEMPLATE.to_string()),
+            subject_template: compile_template(
+                "subject_template",
+                subject_template_source.to_string(),
+                false,
+            )
+            .expect("test subject template compiles"),
+            body_template: compile_template(
+                "body_template",
+                body_template_source
+                    .unwrap_or(DEFAULT_BODY_TEMPLATE)
+                    .to_string(),
+                true,
+            )
+            .expect("test body template compiles"),
         }
     }
 
@@ -414,24 +448,18 @@ impl EmailNotifier {
 
     /// Render the subject template with alert context.
     fn render_subject(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        let mut env = Environment::new();
-        env.add_template("subject", &self.subject_template_source)
-            .map_err(|e| NotifyError::TemplateError(format!("template error: {}", e)))?;
-
-        let tmpl = env
-            .get_template("subject")
-            .map_err(|e| NotifyError::TemplateError(format!("template error: {}", e)))?;
-
-        tmpl.render(context! {
-            title => &alert.message.title,
-            body => &alert.message.body,
-            rule_name => &alert.rule_name,
-            vl_source => &alert.vl_source,
-            accent_color => &alert.message.accent_color,
-            log_timestamp => &alert.log_timestamp,
-            log_timestamp_formatted => &alert.log_timestamp_formatted,
-        })
-        .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
+        self.subject_template
+            .render(context! {
+                title => &alert.message.title,
+                body => &alert.message.body,
+                rule_name => &alert.rule_name,
+                vl_source => &alert.vl_source,
+                accent_color => &alert.message.accent_color,
+                log_timestamp => &alert.log_timestamp,
+                log_timestamp_formatted => &alert.log_timestamp_formatted,
+                log => &alert.log,
+            })
+            .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
     }
 
     /// Render the body template with alert context.
@@ -439,18 +467,9 @@ impl EmailNotifier {
     /// Uses `email_body_html` from the template engine (already HTML-escaped) if available,
     /// otherwise falls back to `body`. The body is marked as "safe" (pre-escaped) so
     /// the template doesn't need `| safe` filter - this prevents user errors if they
-    /// edit the email template and accidentally remove the filter.
+    /// edit the email template and accidentally remove the filter. Every
+    /// other value, `log` fields included, is HTML-escaped automatically.
     fn render_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        let mut env = Environment::new();
-        // HTML auto-escape for title/rule_name/etc
-        env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
-        env.add_template("body", &self.body_template_source)
-            .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
-
-        let tmpl = env
-            .get_template("body")
-            .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
-
         // Use email_body_html if available (already HTML-escaped), otherwise fall back to body
         let body_content = alert
             .message
@@ -461,16 +480,18 @@ impl EmailNotifier {
         // Mark body as pre-escaped (safe) so template doesn't need | safe filter
         let body_safe = minijinja::Value::from_safe_string(body_content.clone());
 
-        tmpl.render(context! {
-            title => &alert.message.title,
-            body => body_safe,
-            rule_name => &alert.rule_name,
-            vl_source => &alert.vl_source,
-            accent_color => &alert.message.accent_color,
-            log_timestamp => &alert.log_timestamp,
-            log_timestamp_formatted => &alert.log_timestamp_formatted,
-        })
-        .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
+        self.body_template
+            .render(context! {
+                title => &alert.message.title,
+                body => body_safe,
+                rule_name => &alert.rule_name,
+                vl_source => &alert.vl_source,
+                accent_color => &alert.message.accent_color,
+                log_timestamp => &alert.log_timestamp,
+                log_timestamp_formatted => &alert.log_timestamp_formatted,
+                log => &alert.log,
+            })
+            .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
     }
 
     /// Build the email message for a specific recipient.
@@ -822,6 +843,7 @@ mod tests {
             destinations: vec![],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 
@@ -1691,6 +1713,53 @@ Accent Color: {{ accent_color }}"#;
             body,
             "<div class=\"alert\">Test Alert: Something happened</div>"
         );
+    }
+
+    /// Notifier with `subject` and `body` templates and a mock transport.
+    fn notifier_with_templates(subject: &str, body: Option<&str>) -> EmailNotifier {
+        EmailNotifier::with_transport(
+            "log-test",
+            Arc::new(MockEmailTransport::new()),
+            "sender@test.com".parse().unwrap(),
+            vec!["dest@test.com".parse().unwrap()],
+            subject,
+            body,
+        )
+    }
+
+    /// Alert titled `title` whose event carries `fields`.
+    fn alert_with_log(title: &str, fields: serde_json::Value) -> AlertPayload {
+        let mut alert = make_alert_payload("log_rule");
+        alert.message.title = title.to_string();
+        alert.log = AlertPayload::log_from_fields(&fields);
+        alert
+    }
+
+    #[test]
+    fn render_body_escapes_log_fields() {
+        let notifier = notifier_with_templates("s", Some("<td>{{ log.host }}</td>{{ body }}"));
+        let mut alert = alert_with_log("T", serde_json::json!({"host": "<b>x</b>"}));
+        alert.message.email_body_html = Some("<p>ok</p>".to_string());
+
+        let body = notifier.render_body(&alert).unwrap();
+
+        assert_eq!(body, "<td>&lt;b&gt;x&lt;&#x2f;b&gt;</td><p>ok</p>");
+    }
+
+    #[test]
+    fn render_subject_reads_log_fields() {
+        let notifier = notifier_with_templates("[{{ log.severity | upper }}] {{ title }}", None);
+        let alert = alert_with_log("Disk", serde_json::json!({"severity": "crit"}));
+
+        assert_eq!(notifier.render_subject(&alert).unwrap(), "[CRIT] Disk");
+    }
+
+    #[test]
+    fn render_subject_missing_log_field_is_empty() {
+        let notifier = notifier_with_templates("[{{ log.missing }}] {{ title }}", None);
+        let alert = alert_with_log("T", serde_json::json!({"host": "web-01"}));
+
+        assert_eq!(notifier.render_subject(&alert).unwrap(), "[] T");
     }
 
     #[test]

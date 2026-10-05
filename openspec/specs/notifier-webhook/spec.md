@@ -65,7 +65,7 @@ Le système MUST vérifier la syntaxe Jinja du `body_template` à l'instanciatio
 - **THEN** le démarrage échoue avec un message commençant par `invalid notifier '<nom>': body_template: ` suivi de l'erreur de syntaxe
 
 ### Requirement: Rendu du body_template
-Le système SHALL rendre le `body_template` (après résolution des variables d'environnement de sa source) avec les seules variables `title`, `body`, `rule_name`, `vl_source`, `log_timestamp` et `log_timestamp_formatted`, sans échappement automatique des valeurs, une variable inconnue étant rendue comme une chaîne vide, et MUST envoyer le résultat tel quel comme corps de la requête. Le filtre `tojson` MUST être disponible et produire une valeur JSON valide (chaîne entre guillemets, caractères spéciaux échappés), afin qu'un template comme `{"text": {{ body | tojson }}}` produise toujours du JSON valide.
+Le système SHALL rendre le `body_template` (après résolution des variables d'environnement de sa source) avec les seules variables `title`, `body`, `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted` et `log` (champs de l'événement, voir `message-templating`), sans échappement automatique des valeurs, une variable inconnue étant rendue comme une chaîne vide, et MUST envoyer le résultat tel quel comme corps de la requête. Le filtre `tojson` MUST être disponible et produire une valeur JSON valide (chaîne entre guillemets, caractères spéciaux échappés), afin qu'un template comme `{"text": {{ body | tojson }}}` produise toujours du JSON valide.
 
 #### Scenario: Template personnalisé
 - **WHEN** `body_template` vaut `{"title": "{{ title }}", "rule": "{{ rule_name }}"}` pour la règle `test_rule` de titre `Test Alert`
@@ -78,6 +78,14 @@ Le système SHALL rendre le `body_template` (après résolution des variables d'
 #### Scenario: Valeur insérée avec tojson
 - **WHEN** `body_template` vaut `{"text": {{ body | tojson }}}` et que le corps de l'alerte contient un guillemet, une barre oblique inverse et un saut de ligne
 - **THEN** le corps envoyé est un JSON valide dont le champ `text` vaut exactement le corps de l'alerte
+
+#### Scenario: Champs du log dans le corps
+- **WHEN** `body_template` vaut `{"host": {{ log.host | tojson }}, "pod": {{ log["k8s.pod"] | tojson }}}` pour un événement `host=web-01` et `k8s.pod=api-7f`
+- **THEN** le corps envoyé est `{"host": "web-01", "pod": "api-7f"}`
+
+#### Scenario: Pas de substitution d'environnement dans les champs du log
+- **WHEN** un champ de l'événement contient `${ROUTING_KEY}` et que le template insère ce champ via `log`
+- **THEN** le texte `${ROUTING_KEY}` est envoyé littéralement
 
 ### Requirement: Échec de rendu à l'envoi
 Le système MUST, si le rendu du `body_template` échoue au moment de l'envoi, abandonner l'alerte pour ce notifier sans émettre de requête ni de retry, avec l'erreur `failed to send notification: template render error: <détail>`, et MUST compter cet échec définitif en incrémentant une fois `valerter_notify_errors_total` et `valerter_alerts_failed_total` avec les labels `rule_name`, `vl_source`, `notifier_name` et `notifier_type="webhook"`.
