@@ -12,7 +12,7 @@ The [`config.yaml`](config.yaml) file defines 2 sources and 3 rules covering the
 | `staging_deploy_failures`  | `[staging]`          | `(rule, staging)`        | Pin a rule to another backend   |
 | `auth_failures_all_envs`   | (omitted)            | `(rule, prod)` + `(rule, staging)` | Fan out across every source |
 
-Each `(rule, source)` pair runs as an isolated task with its own throttle bucket (default key: `{rule}-{source}:global`) and per-source reconnect with `±10%` jitter. A flapping `staging` backend does not stop alerts on `prod`.
+Each `(rule, source)` pair runs as an isolated task with per-source reconnect with `±10%` jitter. A flapping `staging` backend does not stop alerts on `prod`. The throttle cache is shared by a rule's sources, but the default key `{rule}-{source}:global` contains the source name, so each source still gets its own bucket. A custom `throttle.key` without `{{ vl_source }}` (e.g. `{{ rule_name }}`) dedups the rule's alerts across sources instead.
 
 ## Source Name Constraints
 

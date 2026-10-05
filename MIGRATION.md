@@ -57,6 +57,22 @@ Until 2.0.3, `valerter --validate` stopped after loading and validating the conf
 - **New errors you may now get from `--validate`:** `Notifier configuration error` (`Failed to create notifiers: N errors`), `Destination validation error` (`Destination validation failed: N errors`) and `Email template validation error` (`Email template validation failed: N errors`). All of them are reported in one run, and the daemon now does the same at startup instead of stopping at the first failed stage.
 - **Summary format.** A `  Notifiers: <n> [<name>=<type>, ...]` line is printed after `Templates`, and source URLs are redacted (`http://***@vl.example.com:9428/?***` for a URL carrying credentials or a query string; URLs without such parts are unchanged). Update scripts that parse this output.
 
+### Custom throttle keys are now shared across a rule's sources
+
+Until 2.0.3, each `(rule, source)` task had its own throttle cache, so `throttle.key: "{{ rule_name }}"` did not dedup across sources as documented: the same outage seen by two sources sent two alerts. In 2.1.0 a rule has a single throttle cache shared by all its sources, and every source that renders the same key increments the same counter.
+
+- **Rules without `throttle.key`** (default key `<rule_name>-<vl_source>:global`) or whose key already contains `{{ vl_source }}`: no change, each source keeps its own counter.
+- **Rules targeting several sources with a custom key that does not contain `{{ vl_source }}`** (e.g. `{{ rule_name }}`, `{{ host }}`, also when inherited from `defaults.throttle.key`): the counter is now shared by the rule's sources, so these rules may send fewer alerts. To keep one counter per source, add `{{ vl_source }}` to the key:
+
+  ```yaml
+  throttle:
+    key: "{{ vl_source }}-{{ host }}"   # was "{{ host }}"
+  ```
+
+- **Startup log.** valerter logs at INFO level, once per affected rule, `Throttle key does not reference vl_source: its counter is shared across the rule's sources; add {{ vl_source }} to the key to isolate them`, with the `rule_name`, `source_count` and `throttle_key` fields. Search your logs for it after the upgrade to list the rules concerned.
+- **Reconnection reset.** When a source reconnects after an error, only the counters fed exclusively by that source are reset; counters shared with another source are kept. The throttle cache also survives a task restart after a panic.
+- **Cache bound.** A rule's throttle cache holds up to 10,000 keys per source it targets (previously 10,000 per `(rule, source)` task): same total memory budget.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.
@@ -151,6 +167,8 @@ rules:
       key: "{{ rule_name }}"   # back to v1.x semantics
     # ...
 ```
+
+Cross-source dedup with a custom key is effective since 2.1.0; in 2.0.x each source still counted separately. See [Custom throttle keys are now shared across a rule's sources](#custom-throttle-keys-are-now-shared-across-a-rules-sources).
 
 ### `defaults.max_streams` cap
 

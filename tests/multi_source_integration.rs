@@ -14,6 +14,8 @@
 //! 4. Per-source default throttle buckets are isolated: two sources sending
 //!    identical events both pass through on first delivery rather than the
 //!    second being dropped as a duplicate.
+//! 5. The throttle cache is shared by a rule's sources: a custom key without
+//!    `vl_source` dedups across them, one with `vl_source` keeps them apart.
 //!
 //! The fixture corpus from `tests/fixtures/vl_events/` (chore/vl-fixtures-corpus)
 //! is consumed via `common::vl_events::load_fixture`.
@@ -28,8 +30,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use valerter::config::{
-    CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, JsonParserConfig,
-    MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    CompiledParser, CompiledRule, CompiledTemplate, CompiledThrottle, DefaultsConfig,
+    JsonParserConfig, MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
 };
 use valerter::notify::{AlertPayload, NotificationQueue};
 use valerter::{RuleEngine, TemplateEngine};
@@ -260,8 +262,9 @@ async fn multi_source_rule_without_vl_sources_fans_out_across_all() {
 async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
     // The same event delivered twice on two different sources must not be
     // deduped as a single bucket when the rule uses the default throttle
-    // (no custom key). The default key is `{rule}-{source}:global`, so
-    // each source has its own bucket and both alerts should land.
+    // (no custom key). The throttle cache is shared by the rule's sources,
+    // but the default key `{rule}-{source}:global` differs per source, so
+    // each source counts in its own bucket and both alerts should land.
     let vlprod = MockServer::start().await;
     let vldev = MockServer::start().await;
 
@@ -274,8 +277,8 @@ async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
     sources.insert("vlprod".to_string(), vl_source(&vlprod.uri()));
     sources.insert("vldev".to_string(), vl_source(&vldev.uri()));
 
-    // Tight throttle count=1: if buckets were shared the second source
-    // would be blocked.
+    // Tight throttle count=1: if both sources rendered the same key the
+    // second one would be blocked.
     let mut cfg = runtime(sources, vec![rule("isolate", Vec::new())]);
     cfg.defaults.throttle.count = 1;
 
@@ -288,8 +291,8 @@ async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
     let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
 
     // Drain for a fixed window long enough for both sources' first stream
-    // to land. With throttle count=1 each (rule, source) bucket allows only
-    // one alert through, but both buckets are independent so both deliver.
+    // to land. With throttle count=1 each per-source key allows only one
+    // alert through, but the two keys are distinct so both sources deliver.
     // Use a high `max` so we don't exit early before both sources land.
     let alerts = drain_from(&mut rx, 100, Duration::from_secs(2)).await;
     cancel.cancel();
@@ -302,6 +305,76 @@ async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
         sources_seen.contains("vlprod") && sources_seen.contains("vldev"),
         "per-source default throttle buckets must be isolated; saw: {:?} (alerts: {})",
         sources_seen,
+        alerts.len()
+    );
+}
+
+/// Run a fan-out rule with the given throttle key and `count: 1` against two
+/// sources serving the same event, and return the alerts drained.
+async fn run_shared_event_with_throttle_key(rule_name: &str, key: &str) -> Vec<AlertPayload> {
+    let vlprod = MockServer::start().await;
+    let vldev = MockServer::start().await;
+
+    let ev = load_fixture("nginx_http_500.json");
+    mount_ndjson(&vlprod, &[&ev]).await;
+    mount_ndjson(&vldev, &[&ev]).await;
+
+    let mut sources = BTreeMap::new();
+    sources.insert("vlprod".to_string(), vl_source(&vlprod.uri()));
+    sources.insert("vldev".to_string(), vl_source(&vldev.uri()));
+
+    // Long window: the mocks re-serve the event on every reconnection, all
+    // of which must land in the same window.
+    let mut r = rule(rule_name, Vec::new());
+    r.throttle = Some(CompiledThrottle {
+        key_template: Some(key.to_string()),
+        count: 1,
+        window: Duration::from_secs(3600),
+    });
+    let cfg = runtime(sources, vec![r]);
+
+    let queue = NotificationQueue::new(64);
+    let mut rx = queue.subscribe();
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
+
+    // Fixed drain window with a high `max`: we must observe that no extra
+    // alert arrives, not just that the first one did.
+    let alerts = drain_from(&mut rx, 100, Duration::from_secs(2)).await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    alerts
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_source_rule_name_key_dedups_across_sources() {
+    // `{{ rule_name }}` renders the same key on both sources, and the rule's
+    // throttle cache is shared: only the first event of either source passes.
+    let alerts = run_shared_event_with_throttle_key("dedup", "{{ rule_name }}").await;
+
+    let sources: Vec<&str> = alerts.iter().map(|a| a.vl_source.as_str()).collect();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "a key shared across sources must dedup to one alert; got sources {:?}",
+        sources
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_source_vl_source_key_isolates_sources() {
+    // Adding `{{ vl_source }}` to the key gives each source its own counter.
+    let alerts =
+        run_shared_event_with_throttle_key("isolate_key", "{{ vl_source }}-{{ _msg }}").await;
+
+    let count = |source: &str| alerts.iter().filter(|a| a.vl_source == source).count();
+    assert_eq!(
+        (count("vlprod"), count("vldev")),
+        (1, 1),
+        "a key with vl_source must let exactly one alert per source through (alerts: {})",
         alerts.len()
     );
 }
