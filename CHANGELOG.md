@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An invalid header name or value now fails the (rule, source) task at startup** with an error naming the header (never its value), instead of an endless reconnection loop that never sent a request. Such headers are meant to be refused when the configuration is loaded; this is a defensive guard for the runtime path.
 - **The cause of a connection failure is logged before the backoff wait.** `Connection failed` / `Stream read error` used to be logged after the sleep (up to 60 s late); they now precede `Connection failed, retrying`.
 - **The first empty stream end is followed by a ~1 s delay instead of 2 s.** Consecutive empty EOFs now back off 1 s, 2 s, 4 s... up to 60 s.
+- **`throttle.key: "{{ rule_name }}"` now really dedups across sources.** Each `(rule, source)` task had its own throttle cache, so sources never shared a counter and the same outage seen by `vlprod` and `vldev` sent two alerts, contrary to MIGRATION.md and docs/configuration.md. A rule now has one throttle cache shared by all its sources. **Behavior change for multi-source rules with a custom key that does not contain `{{ vl_source }}`** (e.g. `{{ host }}`): their counter is now shared by the rule's sources; add `{{ vl_source }}` to the key to keep one counter per source. The default key `<rule_name>-<vl_source>:global` still isolates sources. The reset on reconnection after an error now only drops the counters fed exclusively by the reconnecting source, and the throttle cache survives a task restart after a panic. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
+- **docs/architecture.md described the throttle as a sliding window.** It is a fixed window, anchored on the first event of a key.
 
 ### Changed
 
@@ -28,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--validate` now runs every startup check.** Besides loading and validating the configuration, it compiles it, builds every notifier (resolving `${VAR}` placeholders in notifier secrets, reading `body_template_file`), checks that every rule destination exists and that templates sent to email destinations define `email_body_html`, and emits the `mattermost_channel ignored` warning, with the same messages and exit code 1 as the daemon. It still starts nothing and makes no network call. **Breaking for CI pipelines that validated without secrets:** environment variables referenced by notifiers must now be defined when running `--validate`. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
 - **The `--validate` summary gains a `Notifiers: <n> [<name>=<type>, ...]` line** after `Templates`.
 - **Startup now reports every notifier, destination and email template error in one pass** instead of stopping at the first failed stage (same messages and exit code). A notifier that fails to build is no longer also reported as an unknown destination.
+- **The throttle cache bound is now 10,000 keys per source of a rule**, for the rule's shared cache (previously 10,000 per `(rule, source)` task): same total memory budget, still not configurable.
+
+### Added
+
+- **Startup INFO log for throttle keys shared across sources.** Once per rule targeting at least two sources whose custom throttle key does not reference `vl_source`: `Throttle key does not reference vl_source: its counter is shared across the rule's sources; add {{ vl_source }} to the key to isolate them`, with `rule_name`, `source_count` and `throttle_key` fields. The key is analysed statically (no test render).
 
 ### Security
 

@@ -193,7 +193,8 @@ victorialogs:
 The default throttle key also changed from `{rule}:global` to
 `{rule}-{source}:global` so multi-source buckets are isolated by default. To
 preserve v1.x cross-source dedup, set `throttle.key: "{{ rule_name }}"`
-explicitly on the rules that need it.
+explicitly on the rules that need it (effective since v2.1.0, see
+[Throttling](#throttling)).
 
 ### Reverse Proxy Configuration
 
@@ -416,6 +417,60 @@ throttle:
   count: 3
   window: 5m
 ```
+
+The window is fixed: a key's counter starts with its first alert and expires
+`window` later. Without `key`, all alerts of the rule share one counter per
+source (default key `{rule}-{source}:global`).
+
+#### Throttling across sources
+
+A rule keeps one throttle cache shared by all its sources (all configured
+sources, or those listed in `vl_sources`). Every source that renders the same
+key increments the same counter:
+
+- **Default key**: it contains the source name, so each source has its own
+  counter. Nothing to configure.
+- **Custom key without `{{ vl_source }}`** (e.g. `{{ rule_name }}`,
+  `{{ host }}`): the counter is shared by the rule's sources. The same outage
+  seen by `vlprod` and `vldev` produces a single alert.
+- **Custom key with `{{ vl_source }}`**: each source has its own counter.
+
+```yaml
+rules:
+  # One alert per host across all sources
+  - name: "switch_down"
+    query: '_stream:{app="network"} AND "link down"'
+    parser:
+      regex: '(?P<host>SW-\d+)'
+    throttle:
+      key: "{{ host }}"
+      count: 1
+      window: 10m
+    notify:
+      template: "default_alert"
+      destinations: ["mattermost-ops"]
+
+  # One alert per host and per source
+  - name: "switch_down_per_source"
+    query: '_stream:{app="network"} AND "link down"'
+    parser:
+      regex: '(?P<host>SW-\d+)'
+    throttle:
+      key: "{{ vl_source }}-{{ host }}"
+      count: 1
+      window: 10m
+    notify:
+      template: "default_alert"
+      destinations: ["mattermost-ops"]
+```
+
+At startup, valerter logs at INFO level, once per rule, every rule targeting
+at least two sources whose custom key does not reference `vl_source`, to make
+the shared counter visible. Two rules never share a counter, even when their
+keys render the same value.
+
+When a source reconnects after an error, only the counters fed exclusively by
+that source are reset; counters another source has contributed to are kept.
 
 ## Secrets Management
 

@@ -92,8 +92,9 @@ rules:
 
   # ── Rule 3: fan-out across all sources (no vl_sources) ────────────────────
   # Spawns one task per source: (auth_failures_all_envs, prod) and
-  # (auth_failures_all_envs, staging). Each task carries its own throttle
-  # bucket via the default `{rule}-{source}:global` key.
+  # (auth_failures_all_envs, staging). The rule's throttle cache is shared by
+  # both tasks, but the default `{rule}-{source}:global` key gives each source
+  # its own bucket. Set `throttle.key: "{{ rule_name }}"` to dedup across them.
   - name: auth_failures_all_envs
     query: '_msg:"authentication failed"'
     parser:

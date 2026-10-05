@@ -48,7 +48,9 @@ use crate::notify::{AlertPayload, NotificationQueue};
 use crate::parser::{RuleParser, record_log_matched, record_parse_error};
 use crate::tail::{ReconnectCallback, TailClient, TailConfig};
 use crate::template::TemplateEngine;
-use crate::throttle::{ThrottleResult, Throttler};
+use crate::throttle::{
+    DEFAULT_MAX_CAPACITY, ThrottleResult, ThrottleStore, Throttler, key_references_vl_source,
+};
 
 /// Delay before restarting a rule after panic (AD-07 inspired).
 const PANIC_RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -89,8 +91,50 @@ pub(crate) struct RuleSpawnContext {
     queue: NotificationQueue,
     template_engine: Arc<TemplateEngine>,
     default_throttle: CompiledThrottle,
+    /// Throttle state of the rule, shared by all its sources. Kept across a
+    /// respawn after panic.
+    throttle_store: Arc<ThrottleStore>,
     /// Timezone for formatting log timestamps.
     timestamp_timezone: String,
+}
+
+impl RuleSpawnContext {
+    /// Throttle config in effect for the rule (`rule.throttle` or defaults).
+    fn throttle_config(&self) -> &CompiledThrottle {
+        self.rule
+            .throttle
+            .as_ref()
+            .unwrap_or(&self.default_throttle)
+    }
+
+    /// Build this task's view on the rule's shared throttle store.
+    fn throttler(&self) -> Throttler {
+        Throttler::with_store(
+            Arc::clone(&self.throttle_store),
+            Some(self.throttle_config()),
+            &self.rule.name,
+            &self.vl_source_name,
+        )
+    }
+}
+
+/// Custom throttle key of a rule whose counter is shared across its sources.
+///
+/// Returns the key template when the rule targets at least two sources and
+/// its effective throttle key does not reference `vl_source`. The default key
+/// embeds the source, and a key that does not compile is left to config
+/// validation: both return `None`.
+fn shared_throttle_key<'a>(
+    rule: &'a CompiledRule,
+    default_throttle: &'a CompiledThrottle,
+    source_count: usize,
+) -> Option<&'a str> {
+    if source_count < 2 {
+        return None;
+    }
+    let throttle = rule.throttle.as_ref().unwrap_or(default_throttle);
+    let key = throttle.key_template.as_deref()?;
+    (key_references_vl_source(key) == Some(false)).then_some(key)
 }
 
 /// Future returned by a [`RuleRunner`] for one `(rule, source)` task.
@@ -235,6 +279,23 @@ impl RuleEngine {
                 continue;
             }
 
+            if let Some(key) = shared_throttle_key(rule, &default_throttle, resolved.len()) {
+                info!(
+                    rule_name = %rule.name,
+                    source_count = resolved.len(),
+                    throttle_key = %key,
+                    "Throttle key does not reference vl_source: its counter is shared across the rule's sources; add {{{{ vl_source }}}} to the key to isolate them"
+                );
+            }
+
+            // One throttle store per rule, shared by its (rule, source) tasks
+            // and kept in their spawn context across a respawn after panic.
+            let throttle_window = rule.throttle.as_ref().unwrap_or(&default_throttle).window;
+            let throttle_store = Arc::new(ThrottleStore::new(
+                throttle_window,
+                DEFAULT_MAX_CAPACITY * resolved.len() as u64,
+            ));
+
             for (source_name, source_cfg) in resolved {
                 trace!(
                     rule_name = %rule.name,
@@ -249,6 +310,7 @@ impl RuleEngine {
                     queue: self.queue.clone(),
                     template_engine: Arc::clone(&template_engine),
                     default_throttle: default_throttle.clone(),
+                    throttle_store: Arc::clone(&throttle_store),
                     timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
                 };
 
@@ -432,10 +494,9 @@ impl ThrottleResetCallback {
 
 impl ReconnectCallback for ThrottleResetCallback {
     fn on_reconnect(&self, _rule_name: &str, _vl_source: &str) {
-        // Each (rule, source) task owns its own Throttler instance, so a
-        // reset here is already scoped to the source that just recovered.
-        // The vl_source parameter is accepted for trait conformance and
-        // future use (e.g. selective reset across shared throttle stores).
+        // The throttle store is shared by the rule's sources, but this
+        // task's Throttler is bound to its own source: the reset only drops
+        // keys fed exclusively by the source that just recovered.
         self.throttler.reset();
     }
 }
@@ -445,7 +506,7 @@ impl ReconnectCallback for ThrottleResetCallback {
 /// This function implements the complete rule processing loop:
 /// 1. Connect to VictoriaLogs with reconnection handling
 /// 2. Parse each log line
-/// 3. Check throttle
+/// 3. Check throttle (on the rule's store, shared with its other sources)
 /// 4. Render template
 /// 5. Send to notification queue
 ///
@@ -469,16 +530,11 @@ async fn run_rule(ctx: RuleSpawnContext, cancel: CancellationToken) -> Result<()
             "Parser initialized"
         );
 
-        // Create throttler for this (rule, source) pair. Each task owns its
-        // throttler: when no custom key_template is set, the default key path
-        // uses (rule_name, vl_source) so buckets are naturally isolated per
-        // source without cross-contamination.
-        let throttle_config = ctx.rule.throttle.as_ref().unwrap_or(&ctx.default_throttle);
-        let throttler = Arc::new(Throttler::new(
-            Some(throttle_config),
-            &ctx.rule.name,
-            &ctx.vl_source_name,
-        ));
+        // Create this task's throttler on the rule's shared store. Keys are
+        // counted across the rule's sources; the default key embeds
+        // vl_source, so default buckets stay isolated per source.
+        let throttle_config = ctx.throttle_config();
+        let throttler = Arc::new(ctx.throttler());
         debug!(
             throttle_count = throttle_config.count,
             throttle_window_secs = throttle_config.window.as_secs(),
@@ -1248,6 +1304,159 @@ mod tests {
 
         // Should pass again after reset
         assert_eq!(throttler.check(&fields), ThrottleResult::Pass);
+    }
+
+    #[test]
+    fn throttle_reset_callback_keeps_keys_opened_by_another_source() {
+        let throttle_config = CompiledThrottle {
+            key_template: Some("{{ rule_name }}".to_string()),
+            count: 1,
+            window: Duration::from_secs(60),
+        };
+        let store = Arc::new(ThrottleStore::new(throttle_config.window, 20_000));
+        let prod = Arc::new(Throttler::with_store(
+            Arc::clone(&store),
+            Some(&throttle_config),
+            "test_rule",
+            "vlprod",
+        ));
+        let dev = Arc::new(Throttler::with_store(
+            store,
+            Some(&throttle_config),
+            "test_rule",
+            "vldev",
+        ));
+        let prod_callback = ThrottleResetCallback::new(Arc::clone(&prod));
+        let _dev_callback = ThrottleResetCallback::new(Arc::clone(&dev));
+
+        // vldev opens the shared key, then vlprod reconnects.
+        let fields = serde_json::json!({"test": "value"});
+        assert_eq!(dev.check(&fields), ThrottleResult::Pass);
+        prod_callback.on_reconnect("test_rule", "vlprod");
+
+        assert_eq!(prod.check(&fields), ThrottleResult::Throttled);
+    }
+
+    /// Spawn the engine's tasks with an idle runner and return their spawn
+    /// contexts, ordered by source name. Must run inside a Tokio runtime.
+    fn spawned_contexts(config: RuntimeConfig) -> Vec<RuleSpawnContext> {
+        let queue = make_test_queue();
+        let idle: RuleRunner = Arc::new(|_ctx, cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Ok(())
+            })
+        });
+        let engine = RuleEngine::new(config, make_test_client(), queue).with_runner(idle);
+        let mut tasks = JoinSet::new();
+        let mut handle_to_context = HashMap::new();
+        engine.spawn_rule_tasks(&mut tasks, &mut handle_to_context, CancellationToken::new());
+        tasks.abort_all();
+
+        let mut contexts: Vec<RuleSpawnContext> = handle_to_context
+            .into_values()
+            .map(|(_, _, ctx)| ctx)
+            .collect();
+        contexts.sort_by(|a, b| a.vl_source_name.cmp(&b.vl_source_name));
+        contexts
+    }
+
+    #[tokio::test]
+    async fn rule_tasks_share_one_throttle_store() {
+        let mut config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        config.victorialogs = sources_map(&["vldev", "vlprod"]);
+
+        let contexts = spawned_contexts(config);
+
+        assert_eq!(contexts.len(), 2);
+        assert!(Arc::ptr_eq(
+            &contexts[0].throttle_store,
+            &contexts[1].throttle_store
+        ));
+    }
+
+    #[tokio::test]
+    async fn respawned_task_keeps_the_rule_throttle_counters() {
+        let mut config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        config.defaults.throttle.count = 1;
+
+        let contexts = spawned_contexts(config);
+        let ctx = &contexts[0];
+
+        let fields = serde_json::json!({"test": "value"});
+        let first = ctx.throttler();
+        assert_eq!(first.check(&fields), ThrottleResult::Pass);
+        drop(first);
+
+        // A respawn after panic rebuilds the throttler from the stored context.
+        let respawned = ctx.clone().throttler();
+        assert_eq!(respawned.check(&fields), ThrottleResult::Throttled);
+    }
+
+    #[tokio::test]
+    async fn throttle_store_capacity_scales_with_source_count() {
+        let mut config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        config.victorialogs = sources_map(&["vldev", "vlprod", "vlstaging"]);
+        let contexts = spawned_contexts(config);
+        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts[0].throttle_store.max_capacity(), Some(30_000));
+
+        let config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        let contexts = spawned_contexts(config);
+        assert_eq!(contexts[0].throttle_store.max_capacity(), Some(10_000));
+    }
+
+    // ===================================================================
+    // Startup INFO log for a throttle key shared across sources
+    // ===================================================================
+
+    fn throttle_with_key(key: Option<&str>) -> CompiledThrottle {
+        CompiledThrottle {
+            key_template: key.map(String::from),
+            count: 1,
+            window: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn shared_throttle_key_flags_rule_name_key_on_two_sources() {
+        let mut rule = make_test_rule("VM_OFF", true);
+        rule.throttle = Some(throttle_with_key(Some("{{ rule_name }}")));
+        let defaults = throttle_with_key(None);
+
+        assert_eq!(
+            shared_throttle_key(&rule, &defaults, 2),
+            Some("{{ rule_name }}")
+        );
+    }
+
+    #[test]
+    fn shared_throttle_key_flags_key_inherited_from_defaults() {
+        let rule = make_test_rule("VM_OFF", true);
+        let defaults = throttle_with_key(Some("{{ host }}"));
+
+        assert_eq!(shared_throttle_key(&rule, &defaults, 2), Some("{{ host }}"));
+    }
+
+    #[test]
+    fn shared_throttle_key_ignores_isolated_default_or_single_source_keys() {
+        let defaults = throttle_with_key(None);
+
+        let mut with_source = make_test_rule("r", true);
+        with_source.throttle = Some(throttle_with_key(Some("{{ vl_source }}-{{ host }}")));
+        assert_eq!(shared_throttle_key(&with_source, &defaults, 2), None);
+
+        let mut default_key = make_test_rule("r", true);
+        default_key.throttle = Some(throttle_with_key(None));
+        assert_eq!(shared_throttle_key(&default_key, &defaults, 2), None);
+        assert_eq!(
+            shared_throttle_key(&make_test_rule("r", true), &defaults, 2),
+            None
+        );
+
+        let mut single = make_test_rule("r", true);
+        single.throttle = Some(throttle_with_key(Some("{{ rule_name }}")));
+        assert_eq!(shared_throttle_key(&single, &defaults, 1), None);
     }
 
     #[test]

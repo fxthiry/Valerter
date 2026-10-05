@@ -66,11 +66,13 @@ If parsing fails, the error is logged and the line is skipped (no crash).
 
 ### 3. Throttle
 
-Prevents alert spam using a sliding window algorithm:
+Prevents alert spam using a fixed window per key:
 
 - **Per-key grouping:** Throttle by extracted field (e.g., `{{ host }}`)
 - **Configurable limits:** `count` alerts per `window` duration
-- **Cache reset:** On VictoriaLogs reconnection, throttle cache is cleared
+- **Fixed window:** a key's counter starts with its first event and expires `window` later, whatever happened in between (it does not slide with later events)
+- **Per-rule cache:** one cache per rule, shared by all its sources. Sources rendering the same key share its counter (`{{ rule_name }}` dedups across sources); the default key `<rule>-<source>:global` contains the source, so default buckets stay per source
+- **Cache reset:** On VictoriaLogs reconnection after an error, only the keys fed exclusively by the reconnecting source are cleared; keys another source has contributed to are kept
 
 ### 4. Template
 
@@ -106,12 +108,17 @@ main.rs
                     ├── rule_task("rule-1", "vldev")  ──► tail → parse → throttle → template → queue
                     ├── rule_task("rule-2", "vlprod") ──► tail → parse → throttle → template → queue
                     └── rule_task("rule-N", "<source>") ──► ...
+
+        rule_task("rule-1", "vlprod") ─┐
+                                       ├──► ThrottleStore("rule-1")  (one per rule, shared by its sources)
+        rule_task("rule-1", "vldev")  ─┘
 ```
 
 **Key properties:**
 
 - **1 task per `(rule, source)` pair:** rules and sources are both fully isolated via `JoinSet`. A rule with `vl_sources: [a, b]` against a config defining sources `{a, b, c}` spawns 2 tasks; a rule with no `vl_sources` spawns N (one per configured source).
 - **Error isolation:** one task's failure doesn't affect others — neither sibling sources of the same rule, nor sibling rules of the same source.
+- **Shared throttle state:** each task has its own parser and stream connection, but the throttle cache belongs to the rule and is shared by its tasks. It survives a task respawn after panic, so a panic does not let a burst of duplicates through.
 - **Panic recovery:** panicked tasks are respawned after 5s delay (`PANIC_RESTART_DELAY`), keyed by `(rule, source)` so the right cancellation token and source config are restored.
 - **Graceful shutdown:** all tasks respect the `CancellationToken`
 - **No silent exit:** the engine returns `Ok` only after a shutdown request (SIGINT/SIGTERM). If no task can be spawned (`No enabled rules found, engine will exit`) or every task ends without a shutdown request (`All rule tasks completed unexpectedly`), it logs at ERROR and returns an error. `main` then cancels the shared token right away (worker, metrics server and uptime updater stop at once instead of waiting for their timeouts) and the process exits with code 1, so the shipped systemd unit (`Restart=on-failure`) restarts it and `systemctl status` shows it as failed. Exit code 0 means a requested shutdown and is never restarted.
@@ -125,7 +132,7 @@ When VictoriaLogs connection fails:
 2. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max), with ±10% jitter
 3. **Metric update:** `valerter_victorialogs_up` set to 0 (restored to 1 on successful reconnection)
 4. **Reconnection metric:** `valerter_reconnections_total` incremented
-5. **On success:** Throttle cache is reset (prevents stale state)
+5. **On success:** the throttle keys fed only by this source are reset (prevents stale state); keys shared with the rule's other sources are kept
 
 When the server ends the response cleanly (EOF without error), this is not a failure: the throttle cache is kept and the tail is reopened after ~1s if the connection received data. If the server keeps closing the stream without sending anything, the delay grows with the number of consecutive empty EOFs: ~1s, then 2s, 4s, ... up to 60s, and drops back to ~1s as soon as a connection receives data.
 
