@@ -3,7 +3,8 @@
 //! This module implements a modular notification system with:
 //! - Abstract `Notifier` trait for different notification channels
 //! - `NotifierRegistry` for managing named notifiers
-//! - Bounded notification queue with Drop Oldest strategy (AD-02)
+//! - One bounded queue and delivery task per notifier, with Drop Oldest
+//!   strategy per destination (AD-02)
 //! - HTTP sending with exponential backoff retry (AD-07)
 
 mod payload;

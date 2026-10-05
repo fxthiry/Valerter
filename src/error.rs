@@ -70,7 +70,7 @@ pub enum TemplateError {
 }
 
 /// Errors related to notification queue operations.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
     #[error("notification queue closed")]
     Closed,

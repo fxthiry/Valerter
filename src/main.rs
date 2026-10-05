@@ -194,14 +194,14 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     // Create shared HTTP client for connection pooling (AD-03)
     let http_client = build_http_client()?;
 
-    // Create notification queue (FR32: capacity 100)
-    let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
-
     // Build notifiers and check rule destinations and email templates
     // (same checks as --validate, every error reported before exiting)
     let report = run_preflight(&runtime_config, http_client.clone())?;
 
     let registry = Arc::new(report.registry);
+
+    // Create one notification queue per notifier (FR32: capacity 100 each)
+    let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY, &registry);
 
     // Create notification worker with registry
     let mut worker = NotificationWorker::new(&queue, registry.clone());
@@ -243,6 +243,18 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
         })
         .collect();
     let notifier_names: Vec<&str> = registry.names().collect();
+    let destination_types: Vec<(&str, String)> = notifier_names
+        .iter()
+        .filter_map(|name| {
+            registry
+                .get(name)
+                .map(|n| (*name, n.notifier_type().to_string()))
+        })
+        .collect();
+    let destinations: Vec<(&str, &str)> = destination_types
+        .iter()
+        .map(|(name, kind)| (*name, kind.as_str()))
+        .collect();
 
     // Start metrics server if enabled (FR37)
     let metrics_handle = if runtime_config.metrics.enabled {
@@ -270,6 +282,7 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
 
         // Initialize all known metrics to zero now that recorder is ready
         valerter::initialize_metrics(&rule_source_pairs, &source_names, &notifier_names);
+        valerter::initialize_destination_metrics(&destinations);
 
         Some(handle)
     } else {
@@ -318,7 +331,7 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     // letting the timeouts below expire. Idempotent after a signal.
     cancel.cancel();
 
-    // Wait for worker to finish
+    // Wait for the destination workers to finish their in-flight sends
     info!("Waiting for notification worker to drain queue...");
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
 

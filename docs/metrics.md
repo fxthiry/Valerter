@@ -27,13 +27,14 @@ metrics:
 | `valerter_alerts_sent_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts sent successfully |
 | `valerter_alerts_throttled_total` | `rule_name`, `vl_source` | Alerts blocked by throttling |
 | `valerter_alerts_passed_total` | `rule_name`, `vl_source` | Alerts that passed throttling |
-| `valerter_alerts_dropped_total` | - | Alerts dropped (queue full, global counter) |
-| `valerter_alerts_failed_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts that permanently failed |
+| `valerter_alerts_dropped_total` | - | Deliveries dropped because a destination queue was full, summed over every destination (an alert dropped for two destinations counts twice) |
+| `valerter_alerts_failed_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Alerts that permanently failed (including a notifier panic during the send) |
+| `valerter_destination_alerts_dropped_total` | `notifier_name`, `notifier_type` | Alerts dropped because the queue of this destination was full (oldest alert dropped). Initialized to 0 for every notifier |
 | `valerter_email_recipient_errors_total` | `rule_name`, `vl_source`, `notifier_name` | Email delivery failures per recipient |
 | `valerter_lines_discarded_total` | `rule_name`, `vl_source`, `reason` | Log lines discarded, one unit per line. `reason="oversized"`: line longer than 1 MiB, dropped whole (its remaining bytes are skipped up to the next `\n`); `reason="invalid_utf8"`: line that is not valid UTF-8. In both cases the other lines of the stream are kept |
 | `valerter_logs_matched_total` | `rule_name`, `vl_source` | Logs matched by rule (before throttling) |
 | `valerter_notifier_config_errors_total` | `notifier`, `error_type` | Notifier configuration errors (e.g., env var resolution) |
-| `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Notification send errors |
+| `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Notification send errors (including a notifier panic during the send, and `notifier_type="unknown"` for a destination missing from the registry) |
 | `valerter_parse_errors_total` | `rule_name`, `vl_source`, `error_type` | Parsing errors |
 | `valerter_reconnections_total` | `rule_name`, `vl_source` | VictoriaLogs reconnections |
 | `valerter_rule_panics_total` | `rule_name`, `vl_source` | Rule task panics (auto-restarted) |
@@ -43,7 +44,8 @@ metrics:
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `valerter_queue_size` | - | Current notification queue size (shared queue, not per-source) |
+| `valerter_queue_size` | - | Pending deliveries summed over every destination queue (an alert waiting for two destinations counts twice). Each destination queue holds at most 100 alerts, so this sum can reach 100 × number of notifiers |
+| `valerter_destination_queue_size` | `notifier_name`, `notifier_type` | Alerts pending in the queue of this destination (0 to 100). Initialized to 0 for every notifier |
 | `valerter_last_query_timestamp` | `rule_name`, `vl_source` | Unix timestamp of last successful query chunk |
 | `valerter_vl_source_up` | `vl_source` | Per-source VictoriaLogs reachability (1=connected, 0=disconnected). Replaces v1.x `valerter_victorialogs_up{rule_name}`. |
 | `valerter_uptime_seconds` | - | Time since valerter started |
@@ -121,15 +123,26 @@ groups:
           summary: "High throttle rate on rule {{ $labels.rule_name }}"
           description: "Consider adjusting throttle settings if this is unexpected"
 
-      # Queue filling up
+      # A destination queue filling up (each queue holds at most 100 alerts).
+      # Do not put an absolute threshold on valerter_queue_size: it is a sum
+      # over every destination and can reach 100 x number of notifiers.
       - alert: ValerterQueueBacklog
-        expr: valerter_queue_size > 50
+        expr: max by (notifier_name) (valerter_destination_queue_size) > 50
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Valerter notification queue backlog"
-          description: "Queue size is {{ $value }}, notifications may be delayed"
+          summary: "Valerter queue backlog for {{ $labels.notifier_name }}"
+          description: "{{ $value }} alerts pending for {{ $labels.notifier_name }}, its notifications are delayed"
+
+      # A destination dropping alerts (queue full)
+      - alert: ValerterAlertsDropped
+        expr: rate(valerter_destination_alerts_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valerter dropping alerts for {{ $labels.notifier_name }}"
+          description: "The queue of {{ $labels.notifier_name }} is full: its oldest alerts are dropped"
 
       # Rule panics (indicates bugs)
       - alert: ValerterRulePanic
@@ -150,7 +163,7 @@ groups:
 
 ### Performance
 
-- `valerter_queue_size` - Notification backlog
+- `valerter_destination_queue_size` - Notification backlog per destination (`valerter_queue_size` for the total)
 - `valerter_query_duration_seconds` - Query latency
 
 ### Alerting Effectiveness

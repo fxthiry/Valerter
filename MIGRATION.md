@@ -73,6 +73,25 @@ Until 2.0.3, each `(rule, source)` task had its own throttle cache, so `throttle
 - **Reconnection reset.** When a source reconnects after an error, only the counters fed exclusively by that source are reset; counters shared with another source are kept. The throttle cache also survives a task restart after a panic.
 - **Cache bound.** A rule's throttle cache holds up to 10,000 keys per source it targets (previously 10,000 per `(rule, source)` task): same total memory budget.
 
+### One notification queue per destination
+
+Until 2.0.3, every alert went through a single queue consumed by a single worker, so one unresponsive notifier delayed all the others. In 2.1.0 each notifier has its own queue and its own delivery task. No configuration change is needed; the visible changes are:
+
+- **Order is guaranteed per destination.** Alerts reach each notifier in the order they were produced, but there is no ordering between destinations anymore: a healthy channel can receive an alert before a slow one receives an older alert.
+- **Capacity is exactly 100 alerts per destination** (the old single queue held 128). When a destination queue is full, its oldest alert is dropped, for that destination only. The `Queue full, dropping N oldest alerts` warning now carries a `notifier` field.
+- **`valerter_queue_size` and `valerter_alerts_dropped_total` count deliveries summed over every destination.** They keep their names and have no label, so existing selectors still work, but an alert pending (or dropped) for two destinations counts twice.
+- **New series:** `valerter_destination_queue_size{notifier_name, notifier_type}` and `valerter_destination_alerts_dropped_total{notifier_name, notifier_type}`, exposed at 0 for every notifier from startup.
+- **Review PromQL alerts with an absolute threshold on `valerter_queue_size`.** As a sum over destinations it can now reach 100 × number of notifiers, so `valerter_queue_size > 50` no longer means "queue half full": it can fire while no queue is half full, or stay silent while one destination overflows if the threshold was tuned for 128. Rewrite it on the per-destination gauge:
+
+  ```yaml
+  # before
+  expr: valerter_queue_size > 50
+  # after
+  expr: max(valerter_destination_queue_size) > 50
+  ```
+
+  Alerts based on `rate(valerter_alerts_dropped_total[...])` keep their meaning and need no change; use `valerter_destination_alerts_dropped_total` to see which destination drops.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

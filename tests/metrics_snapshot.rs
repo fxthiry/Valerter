@@ -17,22 +17,24 @@
 //! recorder for its run and does not race with `src/metrics.rs` unit tests
 //! or other integration suites.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use valerter::config::{
     CompiledParser, CompiledRule, CompiledTemplate, DEFAULT_MAX_STREAMS, DefaultsConfig,
     JsonParserConfig, MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
 };
-use valerter::notify::{AlertPayload, NotificationQueue};
 use valerter::{MetricsServer, RuleEngine};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::recording::RecordingDelivery;
 
 /// Re-serialize a JSON value into NDJSON (one event + trailing newline).
 fn ndjson_body(events: &[&Value]) -> Vec<u8> {
@@ -121,19 +123,6 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
         notifiers: None,
         config_dir: std::path::PathBuf::from("."),
     }
-}
-
-async fn drain(rx: &mut broadcast::Receiver<AlertPayload>, max: usize, deadline: Duration) {
-    let mut got = 0;
-    let _ = tokio::time::timeout(deadline, async {
-        while got < max {
-            match rx.recv().await {
-                Ok(_) => got += 1,
-                Err(_) => break,
-            }
-        }
-    })
-    .await;
 }
 
 /// Parse a Prometheus exposition body and return the set of `name{labelkeys}`
@@ -235,16 +224,18 @@ async fn metrics_snapshot_two_sources_one_rule() {
     // are seeded and the snapshot can assert their presence.
     let notifier_names: Vec<&str> = vec!["sentinel"];
     valerter::initialize_metrics(&rule_source_pairs, &source_names, &notifier_names);
+    // Per-destination queue series, seeded for every notifier. `idle` never
+    // receives an alert, so its series must stay at their initial zero.
+    valerter::initialize_destination_metrics(&[("dest", "recording"), ("idle", "recording")]);
 
     // 4) Run the engine briefly so each metric path fires at least once.
-    let queue = NotificationQueue::new(64);
-    let mut rx = queue.subscribe();
-    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
+    let mut delivery = RecordingDelivery::start(&["dest", "idle"]);
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
     let cancel_for_engine = cancel.clone();
     let engine_handle = tokio::spawn(async move { engine.run(cancel_for_engine).await });
 
     // Drain a few alerts to make sure the throttle/passed/sent paths run.
-    drain(&mut rx, 5, Duration::from_secs(2)).await;
+    delivery.drain(5, Duration::from_secs(2)).await;
 
     // 5) Scrape /metrics.
     let url = format!("http://127.0.0.1:{}/metrics", port);
@@ -261,6 +252,7 @@ async fn metrics_snapshot_two_sources_one_rule() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), engine_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), metrics_handle).await;
+    delivery.shutdown().await;
 
     // 7) Assert the snapshot. We check that *every expected* metric series
     //    (name + label-key set) is present. The actual output may carry
@@ -297,6 +289,9 @@ async fn metrics_snapshot_two_sources_one_rule() {
         // Global / shared counters & gauges.
         "valerter_alerts_dropped_total",
         "valerter_queue_size",
+        // Per-destination queue series seeded by initialize_destination_metrics.
+        "valerter_destination_alerts_dropped_total{notifier_name,notifier_type}",
+        "valerter_destination_queue_size{notifier_name,notifier_type}",
         "valerter_uptime_seconds",
         // Per-source reachability gauge (replaces the old per-rule
         // valerter_victorialogs_up).
@@ -318,6 +313,20 @@ async fn metrics_snapshot_two_sources_one_rule() {
         actual,
         body
     );
+
+    // The per-destination series exist at 0 for a notifier that never
+    // received anything.
+    for series in [
+        "valerter_destination_queue_size{notifier_name=\"idle\",notifier_type=\"recording\"} 0",
+        "valerter_destination_alerts_dropped_total{notifier_name=\"idle\",notifier_type=\"recording\"} 0",
+    ] {
+        assert!(
+            body.lines().any(|l| l == series),
+            "missing `{}` in /metrics:\n{}",
+            series,
+            body
+        );
+    }
 
     // Hard regression: the v1.x per-rule gauge MUST be gone in v2.0.0.
     assert!(
