@@ -174,17 +174,6 @@ Le système SHALL, pour chaque envoi, incrémenter `valerter_alerts_sent_total` 
 - **WHEN** le notifier `mm-ops` délivre une alerte de la règle `cpu` issue de la source `vlprod`
 - **THEN** `valerter_alerts_sent_total{rule_name="cpu",vl_source="vlprod",notifier_name="mm-ops",notifier_type="mattermost"}` augmente de 1
 
-### Requirement: Arrêt sans vidage de la file
-Le système SHALL, à la réception de SIGTERM ou SIGINT, arrêter le worker dès qu'il n'est plus en train de traiter une alerte, MUST laisser se terminer l'alerte en cours de traitement, et ne vide pas les alertes restant en file, qui sont perdues ; le processus attend la fin du worker au plus 5 s.
-
-#### Scenario: Alertes en attente à l'arrêt
-- **WHEN** SIGTERM est reçu alors que trois alertes attendent dans la file et qu'aucune n'est en cours d'envoi
-- **THEN** le worker s'arrête sans envoyer ces trois alertes
-
-#### Scenario: Envoi en cours à l'arrêt
-- **WHEN** SIGTERM est reçu pendant l'envoi d'une alerte
-- **THEN** l'envoi se poursuit et le processus l'attend au plus 5 s avant de terminer
-
 ### Requirement: Livraison isolée par destination
 Le système SHALL associer à chaque notifier du registre un worker de livraison dédié qui traite les alertes de sa file une par une dans leur ordre d'arrivée, l'alerte suivante n'étant prise qu'une fois terminé l'envoi (retries compris) de l'alerte courante, et MUST faire progresser les workers des différentes destinations indépendamment les uns des autres.
 
@@ -208,3 +197,37 @@ Le système MUST intercepter une panique survenant pendant l'envoi d'une alerte 
 - **THEN** l'erreur `Notifier panicked while sending alert` est journalisée et comptée pour `webhook-x`
 - **AND** l'alerte suivante de `webhook-x` est envoyée normalement
 - **AND** les autres destinations continuent de recevoir leurs alertes
+
+### Requirement: Vidage borné de la file à l'arrêt
+Le système SHALL, lors d'un arrêt gracieux et une fois les tâches de règles arrêtées, laisser se terminer les envois en cours puis envoyer toutes les alertes restant en file, dans leur ordre d'arrivée pour une même destination et avec le contrat habituel de retry, jusqu'à ce que la file soit vide, MUST borner ce vidage à 20 secondes (délai fixe, non configurable) et SHALL terminer le vidage sans attendre dès que la file est vide.
+
+#### Scenario: Alertes en attente à l'arrêt
+- **WHEN** SIGTERM est reçu alors que trois alertes attendent dans la file et que leurs destinations répondent normalement
+- **THEN** les trois alertes sont envoyées, dans leur ordre d'arrivée pour chaque destination, avant la fin du processus
+
+#### Scenario: Envoi en cours à l'arrêt
+- **WHEN** SIGTERM est reçu pendant l'envoi d'une alerte
+- **THEN** cet envoi se poursuit, retries compris, dans la limite du délai de vidage
+
+#### Scenario: File vide à l'arrêt
+- **WHEN** SIGTERM est reçu alors qu'aucune alerte n'est en file ni en cours d'envoi
+- **THEN** le vidage se termine immédiatement, sans attendre le délai de 20 secondes
+
+#### Scenario: Aucune nouvelle alerte pendant le vidage
+- **WHEN** le vidage de la file a commencé
+- **THEN** plus aucune tâche de règle ne dépose d'alerte dans la file
+
+#### Scenario: Destination muette pendant le vidage
+- **WHEN** une alerte en file cible un endpoint qui ne répond jamais et que d'autres alertes la suivent
+- **THEN** le vidage est interrompu au bout de 20 secondes et le processus poursuit son arrêt
+
+### Requirement: Journalisation de l'issue du vidage
+Le système SHALL journaliser au début du vidage le nombre d'alertes en file (`Waiting for notification worker to drain queue...`, champ `queued`), puis soit `Notification queue drained` (niveau info) lorsque la file a été entièrement traitée, soit, à l'expiration du délai, l'avertissement `Shutdown drain timeout reached, alerts not delivered` avec le champ `undelivered` égal au nombre d'alertes encore en file (toutes destinations confondues), les envois interrompus n'y étant pas comptés.
+
+#### Scenario: Vidage complet
+- **WHEN** toutes les alertes en file ont été traitées avant le délai
+- **THEN** le log `Notification queue drained` est émis
+
+#### Scenario: Délai dépassé
+- **WHEN** le délai de 20 secondes expire alors que quatre alertes sont encore en file
+- **THEN** le log WARN `Shutdown drain timeout reached, alerts not delivered` est émis avec `undelivered = 4`

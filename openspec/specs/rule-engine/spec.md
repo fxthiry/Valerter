@@ -170,7 +170,7 @@ Chaque tâche (règle, source) SHALL posséder son propre parser et sa propre co
 - **THEN** la tâche (règle, `vldev`) continue de recevoir et de traiter ses lignes avec son propre parser
 
 ### Requirement: Arrêt gracieux sur signal
-Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIGINT (sous Unix ; Ctrl+C uniquement sur les autres plateformes), en annulant toutes les tâches de règles, puis en laissant au worker de notifications au plus 5 secondes et au serveur de métriques au plus 2 secondes pour se terminer, avant de quitter avec le code 0.
+Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIGINT (sous Unix ; Ctrl+C uniquement sur les autres plateformes), en annulant toutes les tâches de règles, puis, une fois toutes ces tâches arrêtées, en laissant au worker de notifications au plus 20 secondes pour vider la file et au serveur de métriques au plus 2 secondes pour se terminer, avant de quitter avec le code 0. Un second SIGTERM ou SIGINT reçu pendant l'arrêt MUST provoquer la sortie immédiate du processus avec le code 1.
 
 #### Scenario: Réception de SIGTERM
 - **WHEN** le démon reçoit SIGTERM
@@ -183,11 +183,13 @@ Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIG
 
 #### Scenario: Alertes en file à l'arrêt
 - **WHEN** l'arrêt est demandé alors que des alertes attendent dans la file
-- **THEN** le worker termine au plus l'alerte en cours d'envoi, dans la limite de 5 secondes, et les alertes restantes dans la file ne sont pas envoyées
+- **THEN** le vidage de la file ne commence qu'après « All rule tasks stopped »
+- **AND** le worker termine l'alerte en cours et envoie les alertes restantes dans la limite de 20 secondes, et le processus se termine avec le code 0 même si ce délai expire
 
 #### Scenario: Second signal
-- **WHEN** un second SIGTERM ou SIGINT est reçu pendant l'arrêt
-- **THEN** il n'a aucun effet supplémentaire sur la séquence d'arrêt en cours
+- **WHEN** un second SIGTERM ou SIGINT est reçu pendant l'arrêt, quelle qu'en soit la phase (arrêt des tâches, vidage de la file ou attente du serveur de métriques)
+- **THEN** le log WARN « Second shutdown signal received, forcing immediate exit » est émis
+- **AND** le processus se termine immédiatement avec le code 1, sans attendre la fin des envois en cours ni le vidage de la file
 
 ### Requirement: Unité systemd fournie
 Le projet SHALL fournir l'unité `systemd/valerter.service`, installée dans `/lib/systemd/system/`, qui lance `/usr/bin/valerter -c /etc/valerter/config.yaml` en service `Type=simple` sous l'utilisateur et le groupe `valerter`, avec `Restart=on-failure`, `RestartSec=5`, `KillMode=mixed`, `KillSignal=SIGTERM`, `TimeoutStopSec=30`, les durcissements `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, un démarrage après `network.target` et une installation dans `multi-user.target`.
