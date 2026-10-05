@@ -317,7 +317,7 @@ Alert rules define what logs to monitor and how to process them.
 ```yaml
 rules:
   - name: "high_cpu_alert"           # REQUIRED: unique name
-    enabled: true                     # Default: true
+    enabled: true                     # Default: true (at least one rule must be enabled)
     query: '_stream:{host="server1"} | json | cpu > 90'    # REQUIRED: LogsQL
 
     parser:                           # At least one recommended

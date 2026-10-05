@@ -33,6 +33,8 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,7 +82,7 @@ pub(crate) fn resolve_sources(
 /// Context needed to spawn a single `(rule, source)` task.
 /// Stored to allow respawning after panic.
 #[derive(Clone)]
-struct RuleSpawnContext {
+pub(crate) struct RuleSpawnContext {
     rule: CompiledRule,
     vl_source_name: String,
     vl_source_config: VlSourceConfig,
@@ -89,6 +91,21 @@ struct RuleSpawnContext {
     default_throttle: CompiledThrottle,
     /// Timezone for formatting log timestamps.
     timestamp_timezone: String,
+}
+
+/// Future returned by a [`RuleRunner`] for one `(rule, source)` task.
+pub(crate) type RuleTaskFuture = Pin<Box<dyn Future<Output = Result<(), RuleError>> + Send>>;
+
+/// Factory that builds the future run by each `(rule, source)` task.
+///
+/// `run_rule` is the production implementation; tests substitute a scripted
+/// runner to exercise task endings (fatal error, completion) without network.
+pub(crate) type RuleRunner =
+    Arc<dyn Fn(RuleSpawnContext, CancellationToken) -> RuleTaskFuture + Send + Sync>;
+
+/// Default [`RuleRunner`]: the full streaming pipeline.
+fn default_rule_runner() -> RuleRunner {
+    Arc::new(|ctx, cancel| Box::pin(run_rule(ctx, cancel)))
 }
 
 /// Rule engine that orchestrates all alert rules.
@@ -104,6 +121,8 @@ pub struct RuleEngine {
     runtime_config: RuntimeConfig,
     /// Notification queue for sending alerts.
     queue: NotificationQueue,
+    /// Factory for the per-`(rule, source)` task future.
+    runner: RuleRunner,
 }
 
 impl RuleEngine {
@@ -122,7 +141,15 @@ impl RuleEngine {
         Self {
             runtime_config,
             queue,
+            runner: default_rule_runner(),
         }
+    }
+
+    /// Replace the task factory (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_runner(mut self, runner: RuleRunner) -> Self {
+        self.runner = runner;
+        self
     }
 
     /// Run the engine until cancelled.
@@ -140,7 +167,11 @@ impl RuleEngine {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` when cancelled, or propagates fatal errors.
+    /// Returns `Ok(())` only when cancelled. Returns
+    /// [`RuleError::NoEnabledRules`] when no task could be spawned and
+    /// [`RuleError::AllTasksStopped`] when every task ended without a
+    /// cancellation, so the daemon exits non-zero instead of silently
+    /// watching nothing.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), RuleError> {
         let mut tasks: JoinSet<(String, String, Result<(), RuleError>)> = JoinSet::new();
         // Map AbortHandle ID to (rule_name, vl_source_name, spawn_context) for
@@ -153,8 +184,8 @@ impl RuleEngine {
             self.spawn_rule_tasks(&mut tasks, &mut handle_to_context, cancel.clone());
 
         if spawned_count == 0 {
-            warn!("No enabled rules found, engine will exit");
-            return Ok(());
+            error!("No enabled rules found, engine will exit");
+            return Err(RuleError::NoEnabledRules);
         }
 
         info!(
@@ -221,7 +252,13 @@ impl RuleEngine {
                     timestamp_timezone: self.runtime_config.defaults.timestamp_timezone.clone(),
                 };
 
-                Self::spawn_single_rule(tasks, handle_to_context, &ctx, cancel.clone());
+                Self::spawn_single_rule(
+                    tasks,
+                    handle_to_context,
+                    &self.runner,
+                    &ctx,
+                    cancel.clone(),
+                );
                 count += 1;
             }
         }
@@ -233,17 +270,21 @@ impl RuleEngine {
     fn spawn_single_rule(
         tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
         handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
+        runner: &RuleRunner,
         ctx: &RuleSpawnContext,
         cancel: CancellationToken,
     ) {
         let rule_name_owned = ctx.rule.name.clone();
         let vl_source_owned = ctx.vl_source_name.clone();
         let ctx_clone = ctx.clone();
+        let runner = Arc::clone(runner);
 
         let abort_handle = tasks.spawn(async move {
             let rule_name_for_return = ctx_clone.rule.name.clone();
             let vl_source_for_return = ctx_clone.vl_source_name.clone();
-            let result = run_rule(ctx_clone, cancel).await;
+            // Build the future inside the task so a panic in the factory is
+            // caught by the JoinSet like any other task panic.
+            let result = runner(ctx_clone, cancel).await;
             (rule_name_for_return, vl_source_for_return, result)
         });
 
@@ -315,6 +356,7 @@ impl RuleEngine {
                                         Self::spawn_single_rule(
                                             tasks,
                                             handle_to_context,
+                                            &self.runner,
                                             &ctx,
                                             cancel.clone(),
                                         );
@@ -342,8 +384,8 @@ impl RuleEngine {
                     }
 
                     if tasks.is_empty() && !cancel.is_cancelled() {
-                        warn!("All rule tasks completed unexpectedly");
-                        return Ok(());
+                        error!("All rule tasks completed unexpectedly");
+                        return Err(RuleError::AllTasksStopped);
                     }
                 }
                 _ = cancel.cancelled() => {
@@ -845,8 +887,9 @@ mod tests {
         let result = engine.run(cancel).await;
 
         assert!(
-            result.is_ok(),
-            "Engine should return Ok with no enabled rules"
+            matches!(result, Err(RuleError::NoEnabledRules)),
+            "Engine should return NoEnabledRules with no enabled rules, got {:?}",
+            result
         );
     }
 
@@ -889,9 +932,101 @@ mod tests {
 
         let result = engine.run(cancel).await;
         assert!(
-            result.is_ok(),
-            "Engine should handle empty rules gracefully"
+            matches!(result, Err(RuleError::NoEnabledRules)),
+            "Engine should return NoEnabledRules with empty rules, got {:?}",
+            result
         );
+    }
+
+    /// Runner whose tasks all fail fatally right away.
+    fn failing_runner() -> RuleRunner {
+        Arc::new(|_ctx, _cancel| {
+            Box::pin(async {
+                Err(RuleError::Stream(
+                    crate::error::StreamError::ConnectionFailed("scripted failure".to_string()),
+                ))
+            })
+        })
+    }
+
+    #[test]
+    fn engine_run_all_tasks_failed_returns_all_tasks_stopped() {
+        // Two sources so the engine supervises several tasks that all fail.
+        let mut config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        config.victorialogs.insert(
+            "other".to_string(),
+            VlSourceConfig {
+                url: "http://localhost:9429".to_string(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+        );
+        let queue = make_test_queue();
+        let _rx = queue.subscribe();
+        let engine =
+            RuleEngine::new(config, make_test_client(), queue).with_runner(failing_runner());
+        let cancel = CancellationToken::new();
+
+        // Local recorder + current-thread runtime: the supervision loop runs
+        // on this thread, so its counter increments land in this recorder.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), engine.run(cancel.clone())).await
+            })
+        });
+
+        let result = result.expect("engine should return promptly once all tasks stopped");
+        assert!(
+            matches!(result, Err(RuleError::AllTasksStopped)),
+            "expected AllTasksStopped, got {:?}",
+            result
+        );
+        assert!(!cancel.is_cancelled());
+
+        let rendered = handle.render();
+        for source in ["default", "other"] {
+            let series = format!(
+                "valerter_rule_errors_total{{rule_name=\"rule1\",vl_source=\"{source}\"}} 1"
+            );
+            assert!(
+                rendered.contains(&series),
+                "missing {series} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_run_with_custom_runner_stops_on_cancel() {
+        // A runner that waits for cancellation behaves like the real pipeline.
+        let runner: RuleRunner = Arc::new(|_ctx, cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Ok(())
+            })
+        });
+        let config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        let queue = make_test_queue();
+        let _rx = queue.subscribe();
+        let engine = RuleEngine::new(config, make_test_client(), queue).with_runner(runner);
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("engine should stop within 1 second")
+            .unwrap();
+        assert!(result.is_ok(), "cancelled engine should return Ok");
     }
 
     // ===================================================================

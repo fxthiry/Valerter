@@ -1,6 +1,42 @@
 # Migration Guide
 
-This guide covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.
+This guide covers the breaking and operationally visible changes between releases, newest first.
+
+## Upgrading to 2.1.0
+
+### A configuration with all rules disabled is now refused
+
+Until 2.0.3, a configuration whose rules were all `enabled: false` passed validation; the daemon then started, found nothing to watch and exited with code 0. It is now a validation error, reported by `valerter --validate` and at startup (exit code 1):
+
+```
+all rules are disabled: enable at least one rule in config.yaml or rules.d/
+```
+
+To pause alerting, stop and disable the service rather than disabling every rule:
+
+```bash
+sudo systemctl disable --now valerter
+```
+
+Run `valerter --validate -c /etc/valerter/config.yaml` before upgrading to catch this case.
+
+### Exit codes and systemd restarts
+
+- Exit code **0** now only follows a requested shutdown (SIGINT/SIGTERM). systemd does not restart the unit.
+- Exit code **1** covers every failure: invalid configuration (as before), all rules disabled (new), and the engine losing all its tasks at runtime (new, previously exit code 0).
+- Under the shipped unit (`Restart=on-failure`, `RestartSec=5`), any exit code 1 makes systemd restart valerter every 5 seconds for as long as the cause persists. This restart loop already existed for invalid configurations; it now also applies to a configuration with all rules disabled. A dedicated exit code for configuration errors (to stop the loop with `RestartPreventExitStatus`) is out of scope for this release.
+- You can now alert on the unit state (`failed`, or repeated restarts) or on the process exit code: a valerter that stops watching no longer looks like a clean stop.
+
+### Automatic restart on `.deb` upgrade
+
+`dpkg -i` of a new version now restarts the service when it is active or enabled; the manual `systemctl restart valerter` is no longer needed. If the service is not active two seconds after the restart (typically an invalid configuration), a warning pointing to `journalctl -u valerter` is printed and the upgrade still succeeds.
+
+- An enabled service that you stopped on purpose is started again by the upgrade. Disable it (`systemctl disable valerter`) if it must stay stopped.
+- When upgrading from 2.0.3 or earlier, the old package stops the service before the new one is installed. An enabled service is restarted; a service started by hand without being enabled stays stopped: run `sudo systemctl start valerter` after the upgrade.
+
+## Upgrading from v1.x to v2.0.0
+
+This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.
 
 If you only need a one-line summary: **the `victorialogs` section is now a map of named sources, every per-rule Prometheus metric gained a `vl_source` label, and `valerter_victorialogs_up` was renamed.**
 
