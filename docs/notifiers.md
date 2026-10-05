@@ -30,24 +30,27 @@ notifiers:
     type: webhook
     url: "https://events.pagerduty.com/v2/enqueue"
     method: POST                    # Optional, default: POST
-    headers:
-      Authorization: "Token token=${PAGERDUTY_TOKEN}"
-      Content-Type: "application/json"
     body_template: |
       {
-        "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+        "routing_key": "<your-integration-key>",
         "event_action": "trigger",
         "payload": {
-          "summary": "{{ title }}",
+          "summary": {{ title | tojson }},
           "source": "valerter",
           "severity": "error",
           "custom_details": {
-            "body": "{{ body }}",
-            "rule": "{{ rule_name }}"
+            "body": {{ body | tojson }},
+            "rule": {{ rule_name | tojson }}
           }
         }
       }
 ```
+
+The PagerDuty Events API v2 authenticates with the `routing_key` in the body, so no
+`Authorization` header is needed. Replace `<your-integration-key>` with the integration
+key of your PagerDuty service: the key is then stored in clear text in the configuration
+file, so restrict its permissions accordingly. `${VAR}` references are **not** resolved
+inside `body_template` (they are sent literally).
 
 ### Fields
 
@@ -57,6 +60,13 @@ notifiers:
 | `method` | No | HTTP method (default: `POST`) |
 | `headers` | No | Custom headers (supports `${VAR}` substitution) |
 | `body_template` | No | Custom JSON body (Jinja2 template) |
+
+### Content-Type
+
+Requests carry `Content-Type: application/json` unless `headers` defines a
+`Content-Type` (header names are case-insensitive). A configured `Content-Type`
+always wins and is sent once, as is; set it explicitly if your endpoint expects
+something other than JSON (`text/plain`, form data, ...).
 
 ### Default Payload
 
@@ -98,6 +108,30 @@ When using `body_template`, these variables are available:
 same collision policy: an event field literally named `vl_source` is masked
 by the synthetic source name.
 
+### Writing JSON bodies: the `tojson` filter
+
+Values are inserted **without any escaping**. Writing `"{{ body }}"` between quotes
+produces invalid JSON as soon as a title or body contains a double quote, a
+backslash or a line break, which is common in log lines. Insert every value with
+the `tojson` filter and **without surrounding quotes**:
+
+```yaml
+body_template: |
+  {"text": {{ body | tojson }}, "rule": {{ rule_name | tojson }}}
+```
+
+`tojson` renders a complete JSON string (quotes included) and escapes special
+characters (`"`, `\`, control characters, and also `<`, `>`, `&`, `'` as
+`\u00XX`, which is still valid JSON). To build a string from several values,
+concatenate them with `~` before applying the filter:
+`{{ ("*" ~ title ~ "*\n" ~ body) | tojson }}`.
+
+When the effective `Content-Type` is JSON (`application/json` or any `+json`
+type) and the rendered body is not valid JSON, valerter logs the warning
+`Webhook body is not valid JSON` (with the notifier and rule names, never the
+body itself) and **still sends the request**. Fix the template with `tojson`
+to silence it.
+
 ### Examples
 
 **Slack:**
@@ -109,7 +143,7 @@ notifiers:
     url: "${SLACK_WEBHOOK_URL}"
     body_template: |
       {
-        "text": "*{{ title }}*\n{{ body }}",
+        "text": {{ ("*" ~ title ~ "*\n" ~ body) | tojson }},
         "username": "Valerter"
       }
 ```
@@ -123,7 +157,7 @@ notifiers:
     url: "${DISCORD_WEBHOOK_URL}"
     body_template: |
       {
-        "content": "**{{ title }}**\n{{ body }}"
+        "content": {{ ("**" ~ title ~ "**\n" ~ body) | tojson }}
       }
 ```
 
@@ -139,7 +173,7 @@ notifiers:
       Authorization: "Bearer ${API_TOKEN}"
       X-Source: "valerter"
     body_template: |
-      {"alert": "{{ title }}", "details": "{{ body }}", "rule": "{{ rule_name }}"}
+      {"alert": {{ title | tojson }}, "details": {{ body | tojson }}, "rule": {{ rule_name | tojson }}}
 ```
 
 ## Email (SMTP)
@@ -204,6 +238,18 @@ templates:
 ```
 
 Valerter validates this at startup and in `valerter --validate`, and fails if missing.
+
+### Retries and SMTP errors
+
+Each recipient is sent separately and retried independently, based on the SMTP reply code (the error text is never used):
+
+| Failure | Retried? |
+|---------|----------|
+| `5xx` reply (permanent: `535` authentication failed, `550` mailbox unavailable, `503` bad sequence...) | No: the recipient fails immediately with `permanent error for <recipient>: <error>` |
+| `4xx` reply (transient: `421`, `451`, `454`...) | Yes |
+| No SMTP reply: network, TLS or timeout error | Yes |
+
+Retries use exponential backoff with a 1 s base and a 30 s cap, up to 3 attempts per recipient (see [Retry Behavior](#retry-behavior)).
 
 ### Custom Email Templates
 
@@ -271,10 +317,16 @@ templates:
 
 ### Timestamp in Footer
 
-Mattermost notifications automatically include the original log timestamp in the footer, formatted according to the `timestamp_timezone` setting:
+Mattermost notifications automatically include a footer with the rule name, the VictoriaLogs source and the original log timestamp, formatted according to the `timestamp_timezone` setting:
 
 ```
-Log time: 15/01/2026 11:00:00 CET
+valerter | <rule_name> | <vl_source> | <log_timestamp_formatted>
+```
+
+For example:
+
+```
+valerter | high_cpu_alert | vlprod | 15/01/2026 11:00:00 CET
 ```
 
 This helps operators quickly locate the original log entry in VictoriaLogs.
@@ -335,13 +387,23 @@ If at least one chat succeeds, the alert is counted as delivered (`Ok`). Per-cha
 
 Telegram's hard limit is **4096 Unicode codepoints** per message. Longer messages are truncated to 4095 codepoints + `…` (one Unicode codepoint). Each truncation increments `valerter_alerts_truncated_total{notifier_type="telegram"}` **once per alert** (not per chat) and emits a `warn` log.
 
+The cut is a plain codepoint cut: with `parse_mode: HTML` it can split a tag (`<pre>` left open, `</b` cut in half) or an entity (`&am`). Telegram then rejects the message with a 400, and the plain-text fallback below delivers it.
+
+### Plain-text fallback on HTML rejection
+
+When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat, the same text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text: the alert is delivered, with its HTML tags and entities shown literally. A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
+
+The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2`: those fail immediately.
+
+Frequent fallback warnings mean the template produces invalid HTML: escape every inserted value with `|e` (see below).
+
 ### Rate limits and retries
 
 Telegram returns HTTP 429 with a `Retry-After` header when you hit a rate limit. The notifier honors it (clamped to `[1s, 60s]`) and the retry counts against the same 3-attempt pool as 5xx and network errors.
 
 ### HTML escaping
 
-With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`, or `&`. The default `body_template` uses the `|e` Jinja filter to escape these automatically. If you provide a custom `body_template`, make sure to escape user-controlled fields (`title`, `body`) the same way, or your messages will be rejected with a 400.
+With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`, or `&`. The default `body_template` uses the `|e` Jinja filter to escape these automatically. If you provide a custom `body_template`, make sure to escape user-controlled fields (`title`, `body`, `rule_name`...) the same way (`{{ body|e }}`, not `{{ body }}`): otherwise a log line containing `a < b` makes Telegram reject the message with a 400, and it is only delivered through the plain-text fallback, without formatting.
 
 ### Example: two destinations, silent delivery
 
@@ -380,11 +442,14 @@ Alerts are sent to all destinations **in parallel**. Each destination's success/
 
 ## Retry Behavior
 
-All notifiers implement exponential backoff retry:
+All notifiers implement exponential backoff retry, up to **3 attempts** per send:
 
-- **Base delay:** 500ms
-- **Max delay:** 5s
-- **Max retries:** 3
+| Notifier | Base delay | Max delay |
+|----------|------------|-----------|
+| `webhook`, `mattermost`, `telegram` | 500ms | 5s |
+| `email` | 1s | 30s |
+
+What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) for its single exception); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
 
 After all retries are exhausted, the alert is marked as failed and logged.
 

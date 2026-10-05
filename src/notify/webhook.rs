@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use minijinja::{Environment, context};
 use reqwest::Method;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::Duration;
@@ -129,6 +129,35 @@ fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, No
     .map_err(|e| NotifyError::SendFailed(format!("template render error: {}", e)))
 }
 
+/// Whether a Content-Type header value denotes JSON.
+///
+/// Matches `application/json` and any `+json` structured suffix, ignoring case
+/// and media type parameters (e.g. `; charset=utf-8`).
+fn is_json_content_type(value: &str) -> bool {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
+}
+
+/// Check a rendered body against the effective Content-Type.
+///
+/// Returns the JSON parse error when the Content-Type is JSON and the body is
+/// not a valid JSON document, `None` otherwise.
+fn json_body_error(headers: &HeaderMap, body: &str) -> Option<serde_json::Error> {
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_json_content_type);
+    if !is_json {
+        return None;
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(body).err()
+}
+
 impl WebhookNotifier {
     /// Create a new WebhookNotifier from configuration.
     ///
@@ -195,6 +224,12 @@ impl WebhookNotifier {
             headers.insert(header_name, header_value);
         }
 
+        // Default to JSON unless the operator configured a Content-Type
+        // (HeaderMap lookups are case-insensitive).
+        if !headers.contains_key(CONTENT_TYPE) {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+
         // Validate body template if provided
         let body_template_source = match &config.body_template {
             Some(template_str) => {
@@ -229,6 +264,12 @@ impl WebhookNotifier {
         &self.method
     }
 
+    /// Get the resolved headers (for testing).
+    #[cfg(test)]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     /// Check if a body template is configured (for testing).
     #[cfg(test)]
     pub fn has_body_template(&self) -> bool {
@@ -256,7 +297,19 @@ impl Notifier for WebhookNotifier {
         async {
             // Build request body
             let body = match &self.body_template_source {
-                Some(template_source) => render_body_template(template_source, alert)?,
+                Some(template_source) => {
+                    let rendered = render_body_template(template_source, alert)?;
+                    // Safety net: warn (without the body, which may hold secrets or
+                    // log data) but still send, as some endpoints tolerate it.
+                    if let Some(e) = json_body_error(&self.headers, &rendered) {
+                        tracing::warn!(
+                            line = e.line(),
+                            column = e.column(),
+                            "Webhook body is not valid JSON"
+                        );
+                    }
+                    rendered
+                }
                 None => {
                     let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
                     serde_json::to_string(&payload).map_err(|e| {
@@ -903,5 +956,171 @@ mod tests {
             }
             _ => panic!("Expected InvalidNotifier, got {:?}", err),
         }
+    }
+
+    // ===================================================================
+    // Content-Type default and JSON body checks
+    // ===================================================================
+
+    fn config_with_headers(headers: &[(&str, &str)]) -> WebhookNotifierConfig {
+        WebhookNotifierConfig {
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
+            method: "POST".to_string(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), SecretString::new(v.to_string())))
+                .collect(),
+            body_template: None,
+        }
+    }
+
+    fn make_alert_with_body(body: &str) -> AlertPayload {
+        let mut alert = make_alert_payload("test_rule");
+        alert.message.body = body.to_string();
+        alert
+    }
+
+    #[test]
+    fn from_config_defaults_content_type_to_json() {
+        let config = config_with_headers(&[]);
+        let notifier =
+            WebhookNotifier::from_config("ct-default", &config, reqwest::Client::new()).unwrap();
+
+        let values: Vec<_> = notifier.headers().get_all(CONTENT_TYPE).iter().collect();
+        assert_eq!(values, vec![HeaderValue::from_static("application/json")]);
+    }
+
+    #[test]
+    fn from_config_keeps_configured_content_type() {
+        let config = config_with_headers(&[("content-type", "text/plain")]);
+        let notifier =
+            WebhookNotifier::from_config("ct-custom", &config, reqwest::Client::new()).unwrap();
+
+        let values: Vec<_> = notifier.headers().get_all(CONTENT_TYPE).iter().collect();
+        assert_eq!(values, vec![HeaderValue::from_static("text/plain")]);
+    }
+
+    #[test]
+    fn is_json_content_type_matches_json_media_types() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/vnd.api+json"));
+        assert!(is_json_content_type("application/problem+JSON;q=1"));
+        assert!(!is_json_content_type("text/plain"));
+        assert!(!is_json_content_type("application/x-www-form-urlencoded"));
+        assert!(!is_json_content_type("application/jsonl"));
+    }
+
+    #[test]
+    fn json_body_error_detects_unescaped_quote() {
+        let config = config_with_headers(&[]);
+        let notifier =
+            WebhookNotifier::from_config("json-check", &config, reqwest::Client::new()).unwrap();
+        let alert = make_alert_with_body(r#"say "hi""#);
+        let body = render_body_template(r#"{"text": "{{ body }}"}"#, &alert).unwrap();
+
+        assert!(json_body_error(notifier.headers(), &body).is_some());
+    }
+
+    #[test]
+    fn json_body_error_ignores_non_json_content_type() {
+        let config = config_with_headers(&[("Content-Type", "text/plain")]);
+        let notifier =
+            WebhookNotifier::from_config("plain-check", &config, reqwest::Client::new()).unwrap();
+
+        assert!(json_body_error(notifier.headers(), "not json at all").is_none());
+    }
+
+    #[test]
+    fn json_body_error_accepts_valid_json() {
+        let config = config_with_headers(&[]);
+        let notifier =
+            WebhookNotifier::from_config("valid-check", &config, reqwest::Client::new()).unwrap();
+
+        assert!(json_body_error(notifier.headers(), r#"{"a": [1, 2, null]}"#).is_none());
+    }
+
+    #[test]
+    fn tojson_filter_produces_valid_json() {
+        let original = "say \"hi\"\npath C:\\tmp <b>&'";
+        let alert = make_alert_with_body(original);
+        let body = render_body_template(r#"{"text": {{ body | tojson }}}"#, &alert).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["text"], original);
+    }
+
+    #[test]
+    fn body_template_env_var_syntax_is_sent_literally() {
+        let alert = make_alert_payload("test_rule");
+        let body = render_body_template(r#"{"routing_key": "${ROUTING_KEY}"}"#, &alert).unwrap();
+
+        assert_eq!(body, r#"{"routing_key": "${ROUTING_KEY}"}"#);
+    }
+
+    /// Body templates of the examples in docs/notifiers.md and
+    /// config/config.example.yaml (kept in sync by hand).
+    const DOC_EXAMPLE_TEMPLATES: &[(&str, &str)] = &[
+        (
+            "pagerduty",
+            r#"{
+  "routing_key": "<your-integration-key>",
+  "event_action": "trigger",
+  "payload": {
+    "summary": {{ title | tojson }},
+    "source": "valerter",
+    "severity": "error",
+    "custom_details": {
+      "body": {{ body | tojson }},
+      "rule": {{ rule_name | tojson }}
+    }
+  }
+}
+"#,
+        ),
+        (
+            "slack",
+            r#"{
+  "text": {{ ("*" ~ title ~ "*\n" ~ body) | tojson }},
+  "username": "Valerter"
+}
+"#,
+        ),
+        (
+            "discord",
+            r#"{
+  "content": {{ ("**" ~ title ~ "**\n" ~ body) | tojson }}
+}
+"#,
+        ),
+        (
+            "custom-api",
+            r#"{"alert": {{ title | tojson }}, "details": {{ body | tojson }}, "rule": {{ rule_name | tojson }}}
+"#,
+        ),
+    ];
+
+    #[test]
+    fn doc_example_templates_render_valid_json() {
+        let mut alert = make_alert_with_body("line 1 \"quoted\"\nline 2 C:\\path <x> & y");
+        alert.message.title = "Disk \"full\" on db-1".to_string();
+
+        for (name, source) in DOC_EXAMPLE_TEMPLATES {
+            validate_body_template(source).unwrap();
+            let body = render_body_template(source, &alert).unwrap();
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
+            assert!(
+                parsed.is_ok(),
+                "{name} example rendered invalid JSON: {body}"
+            );
+        }
+
+        let slack = render_body_template(DOC_EXAMPLE_TEMPLATES[1].1, &alert).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&slack).unwrap();
+        assert_eq!(
+            parsed["text"],
+            format!("*{}*\n{}", alert.message.title, alert.message.body)
+        );
     }
 }
