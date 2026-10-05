@@ -32,7 +32,7 @@ Le système SHALL envoyer chaque alerte par une requête HTTP `POST` vers `webho
 - **THEN** une requête `POST` JSON est reçue sur l'URL du webhook
 
 ### Requirement: Champs de surcharge optionnels
-Le système SHALL inclure au premier niveau du JSON les champs `channel`, `username` et `icon_url` uniquement lorsqu'ils sont configurés, et MUST les omettre entièrement sinon.
+Le système SHALL inclure au premier niveau du JSON les champs `channel`, `username` et `icon_url` uniquement lorsqu'ils sont configurés (pour `channel`, au niveau de la règle ou du notifier, hors renvoi de repli sans canal), et MUST les omettre entièrement sinon.
 
 #### Scenario: Surcharges configurées
 - **WHEN** `channel: alerts` et `username: bot` sont configurés mais pas `icon_url`
@@ -71,10 +71,10 @@ Le système SHALL considérer l'envoi réussi dès qu'une réponse de statut 2xx
 - **THEN** une seule requête est émise et l'alerte est comptée comme envoyée
 
 ### Requirement: Pas de retry sur erreur client
-Le système MUST abandonner immédiatement, sans nouvelle tentative, sur une réponse 4xx autre que 429, en journalisant `Mattermost returned client error, not retrying`, en incrémentant `valerter_notify_errors_total` et `valerter_alerts_failed_total`, et en renvoyant l'erreur `failed to send notification: client error: <statut>`.
+Le système MUST abandonner immédiatement, sans nouvelle tentative, sur une réponse 4xx autre que 429, en journalisant `Mattermost returned client error, not retrying`, en incrémentant `valerter_notify_errors_total` et `valerter_alerts_failed_total`, et en renvoyant l'erreur `failed to send notification: client error: <statut>`, à la seule exception du renvoi unique sans canal décrit par « Repli sans canal sur rejet de l'override de règle ».
 
 #### Scenario: Webhook invalide
-- **WHEN** le webhook répond 400
+- **WHEN** le webhook répond 400 à un envoi qui ne porte pas de canal issu de la règle
 - **THEN** une seule requête est émise et l'erreur `client error: 400 Bad Request` est remontée
 
 ### Requirement: Retry sur erreur serveur, 429 et erreur réseau
@@ -98,17 +98,6 @@ Le système MUST traiter `webhook_url` comme un secret : elle n'apparaît ni dan
 - **WHEN** une tentative échoue faute de connexion
 - **THEN** l'avertissement `Failed to send to Mattermost, retrying` ne contient pas l'URL du webhook
 
-### Requirement: Canal par règle non appliqué
-Le système SHALL accepter la clé `notify.mattermost_channel` d'une règle sans l'appliquer au message envoyé (seul le `channel` du notifier est utilisé), et MUST journaliser au démarrage l'avertissement `mattermost_channel ignored - no mattermost notifier in destinations` pour toute règle activée qui la définit sans avoir de destination de type `mattermost`.
-
-#### Scenario: Règle sans destination Mattermost
-- **WHEN** une règle activée définit `mattermost_channel: alerts` et n'a qu'une destination webhook
-- **THEN** l'avertissement est journalisé au démarrage
-
-#### Scenario: Règle avec destination Mattermost
-- **WHEN** une règle définit `mattermost_channel: alerts` et route vers un notifier Mattermost sans `channel`
-- **THEN** le JSON envoyé ne contient pas de clé `channel`
-
 ### Requirement: Validation de webhook_url résolue
 Le système MUST, à l'instanciation du notifier et après substitution des variables `${NOM}`, vérifier que `webhook_url` est une URL analysable au schéma `http` ou `https`, et refuser de démarrer sinon avec `invalid notifier '<nom>': webhook_url: invalid URL: <détail>`, sans répéter l'URL.
 
@@ -119,3 +108,37 @@ Le système MUST, à l'instanciation du notifier et après substitution des vari
 #### Scenario: Variable résolue valide
 - **WHEN** `webhook_url: "${MM_URL}"` et `MM_URL=https://mm.example.com/hooks/abc`
 - **THEN** le notifier est créé et envoie vers cette URL
+
+### Requirement: Canal par règle
+Le système SHALL renseigner le champ `channel` du JSON envoyé avec `notify.mattermost_channel` de la règle lorsqu'il est défini, à défaut avec le `channel` du notifier, et MUST omettre `channel` si aucun des deux n'est défini ; il MUST journaliser au démarrage `mattermost_channel ignored - no mattermost notifier in destinations` pour toute règle activée qui définit `mattermost_channel` sans destination de type `mattermost`.
+
+#### Scenario: Canal de la règle prioritaire
+- **WHEN** une règle définit `mattermost_channel: alerts` et route vers un notifier Mattermost configuré avec `channel: ops`
+- **THEN** le JSON envoyé contient `"channel":"alerts"`
+
+#### Scenario: Canal du notifier par défaut
+- **WHEN** une règle sans `mattermost_channel` route vers un notifier Mattermost configuré avec `channel: ops`
+- **THEN** le JSON envoyé contient `"channel":"ops"`
+
+#### Scenario: Aucun canal
+- **WHEN** ni la règle ni le notifier ne définissent de canal
+- **THEN** le JSON envoyé ne contient pas de clé `channel`
+
+#### Scenario: Règle sans destination Mattermost
+- **WHEN** une règle activée définit `mattermost_channel: alerts` et n'a qu'une destination webhook
+- **THEN** l'avertissement est journalisé au démarrage et aucun autre notifier n'utilise ce canal
+
+### Requirement: Repli sans canal sur rejet de l'override de règle
+Le système SHALL, lorsqu'un envoi dont le champ `channel` provient de `notify.mattermost_channel` de la règle reçoit une réponse 4xx autre que 429, journaliser l'avertissement `Mattermost rejected channel override, resending without channel` avec le nom du notifier, le nom de la règle, le canal demandé et le statut (sans l'URL du webhook), puis renvoyer une seule fois le même message sans le champ `channel`. Ce renvoi MUST suivre la même politique de relance que tout envoi (5xx, 429 et erreurs réseau, au plus 3 tentatives) ; une réponse 4xx au renvoi MUST être traitée comme un échec définitif. Aucun repli n'a lieu lorsque le canal provient du `channel` du notifier ou qu'aucun canal n'est envoyé.
+
+#### Scenario: Webhook verrouillé sur un canal
+- **WHEN** une règle définit `mattermost_channel: alerts` et que le webhook répond 400 puis 200
+- **THEN** deux requêtes sont émises, la seconde sans clé `channel`, l'alerte est comptée comme envoyée et l'avertissement mentionne la règle et `alerts`
+
+#### Scenario: Repli également rejeté
+- **WHEN** une règle définit `mattermost_channel: alerts` et que le webhook répond 400 puis 400
+- **THEN** exactement deux requêtes sont émises et l'erreur `client error: 400 Bad Request` est remontée
+
+#### Scenario: Pas de repli pour le canal du notifier
+- **WHEN** une règle sans `mattermost_channel` route vers un notifier configuré avec `channel: ops` et que le webhook répond 400
+- **THEN** une seule requête est émise
