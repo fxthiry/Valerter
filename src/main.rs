@@ -6,16 +6,16 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use valerter::cli::{Cli, LogFormat};
 use valerter::config::{Config, RuntimeConfig, redact_url};
 use valerter::{
     DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, RuleEngine,
-    build_http_client, run_preflight,
+    SHUTDOWN_DRAIN_TIMEOUT, await_worker_drain, build_http_client, run_preflight,
 };
 
 /// Initialize the tracing subscriber with the specified log format.
@@ -46,33 +46,96 @@ fn init_logging(format: LogFormat) {
     }
 }
 
-/// Wait for a shutdown signal (SIGINT or SIGTERM on Unix, ctrl_c on other platforms).
-///
-/// On Unix systems, listens for both SIGINT (Ctrl+C) and SIGTERM (systemd stop).
-/// On other platforms, only listens for ctrl_c.
-#[cfg(unix)]
-async fn shutdown_signal() {
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+/// Shutdown signal received by the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignal {
+    /// SIGINT (Ctrl+C); Ctrl+C on non-Unix platforms.
+    Interrupt,
+    /// SIGTERM (systemd stop).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Terminate,
+}
 
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!("Received SIGINT (Ctrl+C)");
-        }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM");
+/// Source of shutdown signals, abstracted so that the two-stage handler can
+/// be tested without sending real signals.
+trait SignalSource {
+    /// Wait for the next signal. `None` means no further signal can be
+    /// received.
+    async fn next(&mut self) -> Option<ShutdownSignal>;
+}
+
+/// SIGINT and SIGTERM handlers, created once for the daemon lifetime so
+/// that no signal is lost between two waits.
+#[cfg(unix)]
+struct UnixSignals {
+    sigint: Signal,
+    sigterm: Signal,
+}
+
+#[cfg(unix)]
+impl UnixSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl SignalSource for UnixSignals {
+    async fn next(&mut self) -> Option<ShutdownSignal> {
+        tokio::select! {
+            s = self.sigint.recv() => s.map(|()| ShutdownSignal::Interrupt),
+            s = self.sigterm.recv() => s.map(|()| ShutdownSignal::Terminate),
         }
     }
 }
 
-/// Wait for a shutdown signal (ctrl_c only on non-Unix platforms).
+/// Ctrl+C listener used on non-Unix platforms.
 #[cfg(not(unix))]
-async fn shutdown_signal() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        error!(error = %e, "Failed to listen for ctrl-c signal");
-        return;
+struct CtrlCSignals;
+
+#[cfg(not(unix))]
+impl SignalSource for CtrlCSignals {
+    async fn next(&mut self) -> Option<ShutdownSignal> {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => Some(ShutdownSignal::Interrupt),
+            Err(e) => {
+                error!(error = %e, "Failed to listen for ctrl-c signal");
+                None
+            }
+        }
     }
-    info!("Received shutdown signal (Ctrl+C)");
+}
+
+/// Two-stage shutdown signal handler (FR46).
+///
+/// The first signal starts the graceful shutdown by cancelling `cancel`. A
+/// second signal (SIGINT or SIGTERM, in any order) calls `exit(1)` to force
+/// an immediate exit, whatever the shutdown phase.
+async fn handle_shutdown_signals(
+    mut signals: impl SignalSource,
+    cancel: CancellationToken,
+    exit: impl FnOnce(i32),
+) {
+    let Some(first) = signals.next().await else {
+        return;
+    };
+    match first {
+        #[cfg(unix)]
+        ShutdownSignal::Interrupt => info!("Received SIGINT (Ctrl+C)"),
+        #[cfg(not(unix))]
+        ShutdownSignal::Interrupt => info!("Received shutdown signal (Ctrl+C)"),
+        ShutdownSignal::Terminate => info!("Received SIGTERM"),
+    }
+    info!("Initiating graceful shutdown");
+    cancel.cancel();
+
+    if signals.next().await.is_some() {
+        warn!("Second shutdown signal received, forcing immediate exit");
+        exit(1);
+    }
 }
 
 fn main() -> Result<()> {
@@ -206,8 +269,12 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     // Create notification worker with registry
     let mut worker = NotificationWorker::new(&queue, registry.clone());
 
-    // Create cancellation token for graceful shutdown
+    // Create cancellation token for graceful shutdown: it stops the rule
+    // tasks, the metrics server and the uptime updater.
     let cancel = CancellationToken::new();
+    // Separate token for the notification worker, cancelled only once every
+    // rule task has stopped, so that it drains queues that can no longer grow.
+    let drain = CancellationToken::new();
 
     // Collect rule-source pairs and source names for metric initialization.
     //
@@ -308,18 +375,20 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     // Create rule engine
     let engine = RuleEngine::new(runtime_config, http_client, queue.clone());
 
-    // Setup signal handler for graceful shutdown (FR46: SIGTERM support for systemd)
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("Initiating graceful shutdown");
-        cancel_clone.cancel();
-    });
+    // Setup signal handler for graceful shutdown (FR46: SIGTERM support for
+    // systemd); a second signal forces an immediate exit.
+    #[cfg(unix)]
+    let signals = UnixSignals::new()?;
+    #[cfg(not(unix))]
+    let signals = CtrlCSignals;
+    tokio::spawn(handle_shutdown_signals(signals, cancel.clone(), |code| {
+        std::process::exit(code)
+    }));
 
     // Spawn notification worker
-    let worker_cancel = cancel.clone();
+    let worker_drain = drain.clone();
     let worker_handle = tokio::spawn(async move {
-        worker.run(worker_cancel).await;
+        worker.run(worker_drain).await;
     });
 
     // Run the engine until cancelled
@@ -327,13 +396,14 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     let engine_result = engine.run(engine_cancel).await;
 
     // Whatever made the engine return (signal, no task, all tasks stopped),
-    // stop the worker, metrics server and uptime updater now instead of
-    // letting the timeouts below expire. Idempotent after a signal.
+    // stop the metrics server and uptime updater now instead of letting the
+    // timeout below expire. Idempotent after a signal.
     cancel.cancel();
 
-    // Wait for the destination workers to finish their in-flight sends
-    info!("Waiting for notification worker to drain queue...");
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    // Every rule task has stopped: no alert can be queued anymore. Drain the
+    // queues, within the bounded shutdown budget.
+    drain.cancel();
+    await_worker_drain(worker_handle, &queue, SHUTDOWN_DRAIN_TIMEOUT).await;
 
     // Wait for metrics server to finish
     if let Some(handle) = metrics_handle {
@@ -394,27 +464,96 @@ mod tests {
         assert!(cancel3.is_cancelled());
     }
 
-    /// Test that SIGTERM signal handler is properly configured.
-    /// This test validates the signal handler setup by verifying that
-    /// tokio::signal::unix::signal can create handlers for both SIGINT and SIGTERM.
+    /// Test that the SIGINT and SIGTERM handlers used by the daemon can be
+    /// created.
     #[cfg(unix)]
     #[tokio::test]
     async fn signal_handlers_can_be_created() {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        // Verify we can create SIGTERM handler (same as shutdown_signal uses)
-        let sigterm_result = signal(SignalKind::terminate());
         assert!(
-            sigterm_result.is_ok(),
-            "Should be able to create SIGTERM handler"
+            UnixSignals::new().is_ok(),
+            "Should be able to create SIGINT and SIGTERM handlers"
         );
+    }
 
-        // Verify we can create SIGINT handler (same as shutdown_signal uses)
-        let sigint_result = signal(SignalKind::interrupt());
+    /// Simulated signal source: one channel message per signal.
+    impl SignalSource for tokio::sync::mpsc::UnboundedReceiver<ShutdownSignal> {
+        async fn next(&mut self) -> Option<ShutdownSignal> {
+            self.recv().await
+        }
+    }
+
+    /// Spawn the two-stage handler on a simulated source. Returns the signal
+    /// sender, the shutdown token, the exit-code receiver and the task.
+    fn spawn_signal_handler() -> (
+        tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+        CancellationToken,
+        tokio::sync::mpsc::UnboundedReceiver<i32>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(handle_shutdown_signals(
+            signal_rx,
+            cancel.clone(),
+            move |code| {
+                let _ = exit_tx.send(code);
+            },
+        ));
+        (signal_tx, cancel, exit_rx, handle)
+    }
+
+    #[tokio::test]
+    async fn first_signal_cancels_without_exiting() {
+        let (signals, cancel, mut exit, handle) = spawn_signal_handler();
+
+        signals.send(ShutdownSignal::Terminate).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("first signal must start the graceful shutdown");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(exit.try_recv().is_err(), "first signal must not exit");
         assert!(
-            sigint_result.is_ok(),
-            "Should be able to create SIGINT handler"
+            !handle.is_finished(),
+            "handler keeps waiting for a second signal"
         );
+    }
+
+    #[tokio::test]
+    async fn second_signal_forces_exit_with_code_1() {
+        for (first, second) in [
+            (ShutdownSignal::Terminate, ShutdownSignal::Terminate),
+            (ShutdownSignal::Interrupt, ShutdownSignal::Terminate),
+            (ShutdownSignal::Terminate, ShutdownSignal::Interrupt),
+        ] {
+            let (signals, cancel, mut exit, handle) = spawn_signal_handler();
+
+            signals.send(first).unwrap();
+            signals.send(second).unwrap();
+
+            let code = tokio::time::timeout(Duration::from_secs(1), exit.recv())
+                .await
+                .expect("second signal must force the exit");
+            assert_eq!(code, Some(1));
+            assert!(cancel.is_cancelled());
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_signal_source_stops_handler_without_exiting() {
+        let (signals, cancel, mut exit, handle) = spawn_signal_handler();
+
+        signals.send(ShutdownSignal::Interrupt).unwrap();
+        drop(signals);
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("handler stops when no signal can be received")
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        assert!(exit.try_recv().is_err());
     }
 
     /// Test the full shutdown flow with cancellation token integration.

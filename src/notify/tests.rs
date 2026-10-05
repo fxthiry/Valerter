@@ -853,12 +853,107 @@ async fn worker_delivers_each_destination_in_fifo_order() {
     );
 }
 
-#[tokio::test]
-async fn worker_stops_on_cancel_without_sending_pending_alerts() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+/// `RecordingTestNotifier` that waits on the returned gate after recording
+/// each alert, keeping that send in flight until a permit is added.
+fn gated_notifier(
+    name: &str,
+    tx: mpsc::UnboundedSender<String>,
+) -> (RecordingTestNotifier, Arc<tokio::sync::Semaphore>) {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut notifier = RecordingTestNotifier::new("mm-ops", tx);
+    let mut notifier = RecordingTestNotifier::new(name, tx);
     notifier.gate = Some(Arc::clone(&gate));
+    (notifier, gate)
+}
+
+fn drain_rx(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+#[tokio::test]
+async fn drain_sends_pending_alerts_in_fifo_order() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![RecordingTestNotifier::new("mm-ops", tx)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    // Shutdown requested while the three alerts are still queued.
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker.run(drain))
+        .await
+        .expect("worker should stop once its queue is drained");
+
+    assert_eq!(drain_rx(&mut rx), vec!["rule_0", "rule_1", "rule_2"]);
+    assert!(queue.is_empty());
+    assert_eq!(
+        queue.send(to("after", &["mm-ops"])),
+        Err(crate::error::QueueError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn drain_of_a_destination_is_not_held_by_a_blocked_one() {
+    let (tx_blocked, mut rx_blocked) = mpsc::unbounded_channel();
+    let (tx_ok, mut rx_ok) = mpsc::unbounded_channel();
+    let (blocked, gate) = gated_notifier("blocked", tx_blocked);
+    let registry = registry_of(vec![blocked, RecordingTestNotifier::new("ok", tx_ok)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..3 {
+        queue
+            .send(to(&format!("rule_{i}"), &["blocked", "ok"]))
+            .unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    let run = tokio::spawn(async move { worker.run(drain).await });
+
+    assert_eq!(
+        recv_n(&mut rx_ok, 3).await,
+        vec!["rule_0", "rule_1", "rule_2"]
+    );
+    assert_eq!(recv_n(&mut rx_blocked, 1).await, vec!["rule_0"]);
+    assert_eq!(queue.destination_len("ok"), Some(0));
+    assert_eq!(queue.destination_len("blocked"), Some(2));
+    assert!(!run.is_finished(), "blocked destination is still draining");
+
+    gate.add_permits(10);
+    tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .expect("worker should stop once every queue is drained")
+        .unwrap();
+    assert_eq!(drain_rx(&mut rx_blocked), vec!["rule_1", "rule_2"]);
+    assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn drain_of_empty_queues_returns_immediately() {
+    let registry = Arc::new(make_ok_registry(&["a", "b"]));
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let run = tokio::spawn(async move { worker.run(run_drain).await });
+    tokio::task::yield_now().await;
+    drain.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), run)
+        .await
+        .expect("an empty queue must not delay the shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drain_requested_during_send_finishes_it_then_sends_the_rest() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (notifier, gate) = gated_notifier("mm-ops", tx);
     let registry = registry_of(vec![notifier]);
     let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
@@ -867,25 +962,76 @@ async fn worker_stops_on_cancel_without_sending_pending_alerts() {
         queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
     }
 
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let run_cancel = cancel.clone();
-    let run = tokio::spawn(async move { worker.run(run_cancel).await });
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let run = tokio::spawn(async move { worker.run(run_drain).await });
 
     // First alert in flight, then shutdown is requested.
     assert_eq!(recv_n(&mut rx, 1).await, vec!["rule_0"]);
-    cancel.cancel();
+    drain.cancel();
     gate.add_permits(10);
     tokio::time::timeout(std::time::Duration::from_secs(2), run)
         .await
-        .expect("worker should stop after its in-flight send")
+        .expect("worker should stop once its queue is drained")
         .unwrap();
 
-    assert!(rx.try_recv().is_err(), "pending alerts must not be sent");
-    assert_eq!(queue.len(), 2);
+    assert_eq!(drain_rx(&mut rx), vec!["rule_1", "rule_2"]);
+    assert!(queue.is_empty());
     assert_eq!(
         queue.send(to("after", &["mm-ops"])),
         Err(crate::error::QueueError::Closed)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn await_worker_drain_reports_drained_worker() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![RecordingTestNotifier::new("mm-ops", tx)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    let handle = tokio::spawn(async move { worker.run(drain).await });
+    let start = tokio::time::Instant::now();
+
+    let outcome = await_worker_drain(handle, &queue, SHUTDOWN_DRAIN_TIMEOUT).await;
+
+    assert_eq!(outcome, DrainOutcome::Drained);
+    assert!(start.elapsed() < SHUTDOWN_DRAIN_TIMEOUT);
+    assert_eq!(drain_rx(&mut rx).len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn await_worker_drain_aborts_worker_after_timeout() {
+    assert_eq!(SHUTDOWN_DRAIN_TIMEOUT, std::time::Duration::from_secs(20));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    // The gate never gets a permit: the first send blocks forever.
+    let (notifier, _gate) = gated_notifier("mm-ops", tx);
+    let registry = registry_of(vec![notifier]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let handle = tokio::spawn(async move { worker.run(run_drain).await });
+    let abort_handle = handle.abort_handle();
+    assert_eq!(recv_n(&mut rx, 1).await, vec!["rule_0"]);
+    drain.cancel();
+    let start = tokio::time::Instant::now();
+
+    let outcome = await_worker_drain(handle, &queue, SHUTDOWN_DRAIN_TIMEOUT).await;
+
+    assert_eq!(outcome, DrainOutcome::TimedOut { undelivered: 2 });
+    assert_eq!(start.elapsed(), SHUTDOWN_DRAIN_TIMEOUT);
+    assert!(abort_handle.is_finished(), "worker task must be aborted");
 }
 
 #[test]
