@@ -6,10 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::Once;
 use std::time::{Duration, Instant};
-
-static BUILD_ONCE: Once = Once::new();
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -19,21 +16,8 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn valerter_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("valerter")
-}
-
-/// Build the binary once for all tests.
-fn ensure_binary_built() {
-    BUILD_ONCE.call_once(|| {
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "valerter"])
-            .status()
-            .expect("Failed to build valerter");
-        assert!(status.success(), "Failed to build valerter");
-    });
+    // Built by cargo for integration tests (also under tarpaulin), no manual build needed.
+    PathBuf::from(env!("CARGO_BIN_EXE_valerter"))
 }
 
 /// Run valerter with `args`, killing it if it outlives `timeout`.
@@ -66,7 +50,6 @@ fn run_with_timeout(args: &[&str], timeout: Duration) -> Output {
 
 #[test]
 fn validate_all_rules_disabled_exits_failure() {
-    ensure_binary_built();
     let config = fixture_path("config_all_rules_disabled.yaml");
 
     let output = run_with_timeout(
@@ -90,7 +73,6 @@ fn validate_all_rules_disabled_exits_failure() {
 
 #[test]
 fn daemon_all_rules_disabled_exits_failure_without_starting_engine() {
-    ensure_binary_built();
     let config = fixture_path("config_all_rules_disabled.yaml");
 
     let output = run_with_timeout(&["-c", config.to_str().unwrap()], Duration::from_secs(10));
