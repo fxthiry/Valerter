@@ -57,6 +57,27 @@ Until 2.0.3, `valerter --validate` stopped after loading and validating the conf
 - **New errors you may now get from `--validate`:** `Notifier configuration error` (`Failed to create notifiers: N errors`), `Destination validation error` (`Destination validation failed: N errors`) and `Email template validation error` (`Email template validation failed: N errors`). All of them are reported in one run, and the daemon now does the same at startup instead of stopping at the first failed stage.
 - **Summary format.** A `  Notifiers: <n> [<name>=<type>, ...]` line is printed after `Templates`, and source URLs are redacted (`http://***@vl.example.com:9428/?***` for a URL carrying credentials or a query string; URLs without such parts are unchanged). Update scripts that parse this output.
 
+### Stricter configuration validation
+
+valerter 2.1.0 refuses, when the configuration is loaded or when notifiers are built, several mistakes that 2.0.3 accepted and that only showed up at runtime (silently suppressed alerts, a single throttle counter, every send failing, an endless reconnection loop). **The upgraded service refuses to start if your configuration has one of them.** Before installing the new package, validate the production configuration with the new binary, with the environment variables of the notifiers defined (dummy values are fine), and fix every reported error:
+
+```bash
+valerter --validate -c /etc/valerter/config.yaml
+```
+
+| 2.0.3 behavior | 2.1.0 error | Fix |
+|---|---|---|
+| `defaults.throttle.count: 0` accepted with a runtime warning: every rule without its own `throttle` sent at most its first alert | `defaults.throttle.count must be >= 1 (0 would suppress every alert)` | Set `count` to 1 or more |
+| `defaults.throttle.window: 0s` accepted with a runtime warning: throttling silently disabled | `defaults.throttle.window must be > 0 (0s disables throttling)` | Set a positive `window` (e.g. `60s`) |
+| Unknown filter, test or function in `throttle.key` (rule or `defaults`): every event of the rule fell back to the single key `<rule>:error` | `invalid template in rule '<rule>': throttle.key render: ...` / `defaults.throttle.key render: ...` | Fix or remove the filter; syntax errors in `defaults.throttle.key` are now reported too (`defaults.throttle.key: ...`) |
+| Unknown filter, test or function in a webhook, Telegram or email `body_template` (inline, `body_template_file` or default): every send failed | `Notifier configuration error` with `invalid notifier '<name>': body_template render: ...` | Fix the template; the error names the filter |
+| Invalid header name (space, `:`...) or value (line break) in `victorialogs.<source>.headers`: endless reconnection loop | `victorialogs.<source>.headers: invalid header name '<name>'` / `invalid value for header '<name>'` (the value is never printed) | Fix the header name, or the value or variable it resolves to |
+| Telegram `parse_mode` other than `HTML`, `MarkdownV2` or `Markdown` (e.g. `Markdown2`, `markdown_v2`): HTTP 400 for every alert | `invalid notifier '<name>': parse_mode '<value>' is not supported (expected HTML, MarkdownV2 or Markdown)` | Use one of the three values; the case no longer matters (`html` is sent as `HTML`) |
+| VictoriaLogs source `url` resolving to a value still containing `${`: accepted without any check | `victorialogs.<source>.url: invalid URL: ...` | Give the variable an `http(s)://` URL |
+| Webhook `url` or Mattermost `webhook_url` built from a `${VAR}` that resolves to a wrong scheme or a non-URL: every send failed | `invalid notifier '<name>': url: invalid URL: ...` / `webhook_url: invalid URL: ...` (the URL is never printed) | Fix the variable's value |
+
+The test render of templates is also more accurate: conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency | float) > 1.5 }}`, `{{ count + 1 }}`), wrongly refused until 2.0.3, are now accepted in templates, `throttle.key`, `subject_template` and `body_template`.
+
 ### Custom throttle keys are now shared across a rule's sources
 
 Until 2.0.3, each `(rule, source)` task had its own throttle cache, so `throttle.key: "{{ rule_name }}"` did not dedup across sources as documented: the same outage seen by two sources sent two alerts. In 2.1.0 a rule has a single throttle cache shared by all its sources, and every source that renders the same key increments the same counter.

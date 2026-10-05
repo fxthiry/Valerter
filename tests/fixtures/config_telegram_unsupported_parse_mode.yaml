@@ -1,0 +1,34 @@
+# Fixture: a Telegram notifier declares an unsupported parse_mode.
+# Passes Config::validate(); rejected by the preflight (Notifier configuration error).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  tg:
+    type: telegram
+    bot_token: "123456:dummy"
+    chat_ids: ["-100"]
+    parse_mode: Markdown2
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "tg"

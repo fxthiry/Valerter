@@ -9,7 +9,10 @@
 //! - Production: Uses `AsyncSmtpTransport<Tokio1Executor>`
 //! - Testing: Uses `MockEmailTransport` for unit tests without SMTP server
 
-use crate::config::{EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars};
+use crate::config::{
+    EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars,
+    validate_notifier_template,
+};
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
@@ -254,21 +257,13 @@ impl EmailNotifier {
             });
         }
 
-        // 5. Validate the subject template (syntax)
-        Self::validate_template(&config.subject_template).map_err(|e| {
-            ConfigError::InvalidNotifier {
+        // 5. Validate the subject template (syntax, then render test)
+        validate_notifier_template("subject_template", &config.subject_template).map_err(
+            |message| ConfigError::InvalidNotifier {
                 name: name.to_string(),
-                message: format!("subject_template: {}", e),
-            }
-        })?;
-
-        // 5b. Validate the subject template (render test for unknown filters)
-        crate::config::validate_template_render(&config.subject_template).map_err(|e| {
-            ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("subject_template render: {}", e),
-            }
-        })?;
+                message,
+            },
+        )?;
 
         // 6. Resolve body template (file > inline > embedded default)
         let body_template_source = match resolve_body_template(config, config_dir)? {
@@ -276,11 +271,12 @@ impl EmailNotifier {
             None => DEFAULT_BODY_TEMPLATE.to_string(),
         };
 
-        // 7. Validate the body template
-        Self::validate_template(&body_template_source).map_err(|e| {
+        // 7. Validate the retained body template (file, inline or embedded):
+        // syntax, then render test
+        validate_notifier_template("body_template", &body_template_source).map_err(|message| {
             ConfigError::InvalidNotifier {
                 name: name.to_string(),
-                message: format!("body_template: {}", e),
+                message,
             }
         })?;
 
@@ -414,14 +410,6 @@ impl EmailNotifier {
         };
 
         Ok(builder.build())
-    }
-
-    /// Validate a minijinja template syntax.
-    fn validate_template(source: &str) -> Result<(), String> {
-        let mut env = Environment::new();
-        env.add_template("_validate", source)
-            .map_err(|e| e.to_string())?;
-        Ok(())
     }
 
     /// Render the subject template with alert context.
@@ -1745,6 +1733,66 @@ Accent Color: {{ accent_color }}"#;
             }
             _ => panic!("Expected InvalidNotifier, got {:?}", err),
         }
+    }
+
+    fn email_config_with_body(
+        body_template: Option<&str>,
+        body_template_file: Option<&str>,
+    ) -> EmailNotifierConfig {
+        EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: body_template.map(str::to_string),
+            body_template_file: body_template_file.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn body_template_file_with_unknown_filter_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("body.html"),
+            "<p>{{ body | nosuchfilter }}</p>",
+        )
+        .unwrap();
+        let config = email_config_with_body(None, Some("body.html"));
+        let msg = EmailNotifier::from_config("mail", &config, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'mail': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn inline_body_template_with_unknown_filter_is_rejected() {
+        let config = email_config_with_body(Some("<p>{{ title | nosuchfilter }}</p>"), None);
+        let msg = EmailNotifier::from_config("mail", &config, &test_config_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'mail': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn embedded_body_template_passes_render_test() {
+        crate::config::validate_template_render(DEFAULT_BODY_TEMPLATE).unwrap();
+        let config = email_config_with_body(None, None);
+        assert!(EmailNotifier::from_config("mail", &config, &test_config_dir()).is_ok());
     }
 
     #[tokio::test]

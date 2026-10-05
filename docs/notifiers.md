@@ -56,10 +56,23 @@ inside `body_template` (they are sent literally).
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `url` | Yes | Endpoint URL |
+| `url` | Yes | Endpoint URL (`http` or `https`, supports `${VAR}` substitution) |
 | `method` | No | HTTP method (default: `POST`) |
 | `headers` | No | Custom headers (supports `${VAR}` substitution) |
 | `body_template` | No | Custom JSON body (Jinja2 template) |
+
+### Checks at startup and in `--validate`
+
+The notifier is built at daemon startup and by `valerter --validate`, which
+refuse the configuration (`invalid notifier '<name>': ...`, logged under
+`Notifier configuration error`) when:
+
+- `url`, once `${VAR}` placeholders are resolved, does not parse or does not use
+  `http`/`https` (`url: invalid URL: ...`). The URL itself is never printed.
+- `body_template` has a syntax error (`body_template: ...`) or uses an unknown
+  filter, test, function or method (`body_template render: ...`). The template is
+  test-rendered with placeholder values, so value-dependent errors such as
+  `{{ status | int }}` are not reported at this stage.
 
 ### Content-Type
 
@@ -257,6 +270,13 @@ See [templates/README.md](../templates/README.md) for detailed template document
 
 **Priority:** `body_template_file` > `body_template` > default template
 
+The retained body template (file, inline or default) is checked when the
+notifier is built, at daemon startup and by `valerter --validate`: a syntax
+error is reported as `invalid notifier '<name>': body_template: ...`, an unknown
+filter, test, function or method as `invalid notifier '<name>': body_template
+render: ...`. `subject_template` gets the same checks (`subject_template: ...`,
+`subject_template render: ...`).
+
 ### Example: Minimal (internal network)
 
 ```yaml
@@ -298,10 +318,15 @@ notifiers:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `webhook_url` | Yes | Mattermost incoming webhook URL |
+| `webhook_url` | Yes | Mattermost incoming webhook URL (`http` or `https`, supports `${VAR}` substitution) |
 | `channel` | No | Override default channel |
 | `username` | No | Bot username |
 | `icon_url` | No | Bot avatar URL |
+
+`webhook_url` is checked again once `${VAR}` placeholders are resolved, at
+daemon startup and by `valerter --validate`: a value that does not parse or does
+not use `http`/`https` is refused with `invalid notifier '<name>': webhook_url:
+invalid URL: ...`, without printing the URL (it carries the hook token).
 
 ### accent_color
 
@@ -372,10 +397,10 @@ notifiers:
 |-------|----------|-------------|
 | `bot_token` | Yes | Bot API token from @BotFather. Stored as a secret; never logged. |
 | `chat_ids` | Yes | List of target chat IDs. Must be non-empty; each element must be non-empty. |
-| `parse_mode` | No | `HTML` (default) or `MarkdownV2`. Passed through to the Bot API. |
+| `parse_mode` | No | `HTML` (default), `MarkdownV2` or `Markdown`, case-insensitive (`html` is sent as `HTML`). Any other value is refused at startup and by `--validate`: `parse_mode '<value>' is not supported (expected HTML, MarkdownV2 or Markdown)`. |
 | `disable_notification` | No | When `true`, Telegram delivers silently (no push sound). |
 | `disable_web_page_preview` | No | When `true`, Telegram does not expand link previews. |
-| `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. |
+| `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. Checked at startup and by `--validate`: a syntax error (`body_template: ...`) or an unknown filter, test, function or method (`body_template render: ...`) is refused. |
 
 ### Multi-chat delivery
 
@@ -393,7 +418,7 @@ The cut is a plain codepoint cut: with `parse_mode: HTML` it can split a tag (`<
 
 When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat, the same text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text: the alert is delivered, with its HTML tags and entities shown literally. A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
 
-The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2`: those fail immediately.
+The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2` or `Markdown`: those fail immediately.
 
 Frequent fallback warnings mean the template produces invalid HTML: escape every inserted value with `|e` (see below).
 

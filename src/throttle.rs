@@ -208,7 +208,10 @@ impl Throttler {
             None => (None, u32::MAX),
         };
 
-        // M1: Validate configuration - log warning for edge cases
+        // M1: `Config::validate()` rejects `count == 0` and a zero `window`, for
+        // rule throttles and `defaults.throttle` alike, so these warnings are
+        // unreachable from a loaded configuration. They stay as a guard for
+        // programmatic callers that build a `CompiledThrottle` directly.
         if let Some(t) = config {
             if t.count == 0 {
                 tracing::warn!(
@@ -835,11 +838,13 @@ mod tests {
 
     #[test]
     fn template_error_uses_fallback_key() {
-        // Invalid template syntax that minijinja can't render
-        let config = make_config(Some("{{ nonexistent_filter | bad_filter }}"), 3, 60);
+        // Unknown filters are rejected at load time; only errors that depend
+        // on the event's values reach the fallback, e.g. arithmetic on a
+        // string field.
+        let config = make_config(Some("{{ port + 1 }}"), 3, 60);
         let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
-        let fields = json!({"host": "SW-01"});
+        let fields = json!({"host": "SW-01", "port": "Gi0/1"});
         let key = throttler.render_key(&fields);
 
         // Should use error fallback

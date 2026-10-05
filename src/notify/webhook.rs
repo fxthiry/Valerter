@@ -3,7 +3,10 @@
 //! Implements the `Notifier` trait for sending alerts to arbitrary HTTP endpoints
 //! with customizable body templates and headers.
 
-use crate::config::{SecretString, WebhookNotifierConfig, resolve_env_vars};
+use crate::config::{
+    SecretString, WebhookNotifierConfig, resolve_env_vars, validate_notifier_template,
+    validate_resolved_url,
+};
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
@@ -94,17 +97,6 @@ pub struct WebhookNotifier {
     body_template_source: Option<String>,
 }
 
-/// Validate a body template at configuration time.
-fn validate_body_template(source: &str) -> Result<(), ConfigError> {
-    let mut env = Environment::new();
-    env.add_template("_validate", source)
-        .map_err(|e| ConfigError::InvalidTemplate {
-            rule: "webhook.body_template".to_string(),
-            message: e.to_string(),
-        })?;
-    Ok(())
-}
-
 /// Render a body template with alert context.
 ///
 /// Generic webhook templates have access to standard fields (title, body, rule_name)
@@ -182,6 +174,12 @@ impl WebhookNotifier {
                 name: name.to_string(),
                 message: format!("url: {}", e),
             })?;
+        // `Config::validate()` skips URLs holding a `${VAR}`: re-check the
+        // resolved value (never echoed, it may carry a token).
+        validate_resolved_url(&resolved_url).map_err(|e| ConfigError::InvalidNotifier {
+            name: name.to_string(),
+            message: format!("url: {}", e),
+        })?;
 
         // Parse and validate HTTP method (AC6: only POST and PUT supported)
         let method_upper = config.method.to_uppercase();
@@ -230,12 +228,14 @@ impl WebhookNotifier {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
 
-        // Validate body template if provided
+        // Validate body template if provided (syntax, then render test)
         let body_template_source = match &config.body_template {
             Some(template_str) => {
-                validate_body_template(template_str).map_err(|e| ConfigError::InvalidNotifier {
-                    name: name.to_string(),
-                    message: format!("body_template: {}", e),
+                validate_notifier_template("body_template", template_str).map_err(|message| {
+                    ConfigError::InvalidNotifier {
+                        name: name.to_string(),
+                        message,
+                    }
                 })?;
                 Some(template_str.clone())
             }
@@ -879,16 +879,83 @@ mod tests {
         assert!(result.contains("\"log_time\": \"15/01/2026 10:00:00 UTC\""));
     }
 
-    #[test]
-    fn validate_body_template_accepts_valid_template() {
-        let result = validate_body_template(r#"{"msg": "{{ title }}"}"#);
-        assert!(result.is_ok());
+    fn body_template_config(template: &str) -> WebhookNotifierConfig {
+        WebhookNotifierConfig {
+            url: SecretString::new("https://api.example.com/alerts".to_string()),
+            method: "POST".to_string(),
+            headers: HashMap::new(),
+            body_template: Some(template.to_string()),
+        }
+    }
+
+    fn from_config_error(config: &WebhookNotifierConfig) -> String {
+        WebhookNotifier::from_config("wh", config, reqwest::Client::new())
+            .unwrap_err()
+            .to_string()
     }
 
     #[test]
-    fn validate_body_template_rejects_invalid_template() {
-        let result = validate_body_template("{% if unclosed");
-        assert!(result.is_err());
+    fn from_config_rejects_unknown_filter_in_body_template() {
+        let err = from_config_error(&body_template_config(
+            r#"{"alert": "{{ title | nosuchfilter }}"}"#,
+        ));
+        assert!(
+            err.contains("invalid notifier 'wh': body_template render: "),
+            "{err}"
+        );
+        assert!(err.contains("nosuchfilter"), "{err}");
+    }
+
+    #[test]
+    fn from_config_syntax_error_keeps_body_template_prefix() {
+        let err = from_config_error(&body_template_config("{% if unclosed"));
+        assert!(
+            err.contains("invalid notifier 'wh': body_template: "),
+            "{err}"
+        );
+        assert!(!err.contains("body_template render"), "{err}");
+    }
+
+    #[test]
+    fn from_config_accepts_builtin_filters_in_body_template() {
+        let config = body_template_config(
+            r#"{"alert": {{ title | tojson }}, "rule": "{{ rule_name | upper }}", "b": "{{ body | e }}"}"#,
+        );
+        assert!(WebhookNotifier::from_config("wh", &config, reqwest::Client::new()).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn from_config_rejects_resolved_url_with_bad_scheme_without_echoing_it() {
+        temp_env::with_var(
+            "HCV_WEBHOOK_URL",
+            Some("ftp://hooks.example.com/SECRET"),
+            || {
+                let mut config = body_template_config("{{ title }}");
+                config.url = SecretString::new("${HCV_WEBHOOK_URL}".to_string());
+                let err = from_config_error(&config);
+                assert!(
+                    err.contains("url: invalid URL: unsupported scheme 'ftp'"),
+                    "{err}"
+                );
+                assert!(!err.contains("SECRET"), "{err}");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_config_rejects_resolved_url_that_does_not_parse() {
+        temp_env::with_var("HCV_WEBHOOK_URL", Some("not a url SECRET"), || {
+            let mut config = body_template_config("{{ title }}");
+            config.url = SecretString::new("${HCV_WEBHOOK_URL}".to_string());
+            let err = from_config_error(&config);
+            assert!(
+                err.contains("invalid notifier 'wh': url: invalid URL:"),
+                "{err}"
+            );
+            assert!(!err.contains("SECRET"), "{err}");
+        });
     }
 
     // ===================================================================
@@ -1107,7 +1174,7 @@ mod tests {
         alert.message.title = "Disk \"full\" on db-1".to_string();
 
         for (name, source) in DOC_EXAMPLE_TEMPLATES {
-            validate_body_template(source).unwrap();
+            validate_notifier_template("body_template", source).unwrap();
             let body = render_body_template(source, &alert).unwrap();
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
             assert!(

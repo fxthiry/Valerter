@@ -1,0 +1,7 @@
+m_rule:
+  query: "_msg:m"
+  parser:
+    regex: "(?P<m>.*)"
+  notify:
+    template: default_alert
+    destinations: [test]

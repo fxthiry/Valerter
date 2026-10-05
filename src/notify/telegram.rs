@@ -5,7 +5,9 @@
 //! so batching would not help. The notifier returns `Ok(())` as soon as at
 //! least one chat succeeds (partial success); `Err` only when all fail.
 
-use crate::config::{SecretString, TelegramNotifierConfig, resolve_env_vars};
+use crate::config::{
+    SecretString, TelegramNotifierConfig, resolve_env_vars, validate_notifier_template,
+};
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::{AlertPayload, Notifier, backoff_delay};
 use async_trait::async_trait;
@@ -47,6 +49,17 @@ const DEFAULT_BODY_TEMPLATE: &str = "<b>{{ title|e }}</b>\n{{ body|e }}";
 /// Default `parse_mode` sent to Telegram when none is configured.
 const DEFAULT_PARSE_MODE: &str = "HTML";
 
+/// `parse_mode` values accepted by the Bot API, in canonical form.
+const SUPPORTED_PARSE_MODES: [&str; 3] = ["HTML", "MarkdownV2", "Markdown"];
+
+/// Returns the canonical form of a `parse_mode` (`html` → `HTML`), compared
+/// case-insensitively, or `None` when the Bot API does not support it.
+fn normalize_parse_mode(value: &str) -> Option<&'static str> {
+    SUPPORTED_PARSE_MODES
+        .into_iter()
+        .find(|mode| mode.eq_ignore_ascii_case(value))
+}
+
 /// Payload serialized as the body of a `sendMessage` request.
 #[derive(Debug, Serialize)]
 struct TelegramPayload<'a> {
@@ -74,18 +87,6 @@ fn truncate_text(text: &str) -> (String, bool) {
         .collect();
     out.push('…');
     (out, true)
-}
-
-/// Validate a `body_template` at configuration time so startup fails fast on
-/// malformed Jinja.
-fn validate_body_template(source: &str) -> Result<(), ConfigError> {
-    let mut env = Environment::new();
-    env.add_template("_validate", source)
-        .map_err(|e| ConfigError::InvalidTemplate {
-            rule: "telegram.body_template".to_string(),
-            message: e.to_string(),
-        })?;
-    Ok(())
 }
 
 /// Render a body template with alert context.
@@ -272,11 +273,25 @@ impl TelegramNotifier {
         }
 
         if let Some(template) = &config.body_template {
-            validate_body_template(template).map_err(|e| ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("body_template: {}", e),
+            validate_notifier_template("body_template", template).map_err(|message| {
+                ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message,
+                }
             })?;
         }
+
+        let parse_mode = match config.parse_mode.as_deref() {
+            None => DEFAULT_PARSE_MODE,
+            Some(value) => {
+                normalize_parse_mode(value).ok_or_else(|| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message: format!(
+                        "parse_mode '{value}' is not supported (expected HTML, MarkdownV2 or Markdown)"
+                    ),
+                })?
+            }
+        };
 
         let endpoint = format!("https://api.telegram.org/bot{}/sendMessage", resolved_token);
 
@@ -285,10 +300,7 @@ impl TelegramNotifier {
             endpoint: SecretString::new(endpoint),
             client,
             chat_ids: config.chat_ids.clone(),
-            parse_mode: config
-                .parse_mode
-                .clone()
-                .unwrap_or_else(|| DEFAULT_PARSE_MODE.to_string()),
+            parse_mode: parse_mode.to_string(),
             disable_notification: config.disable_notification,
             disable_web_page_preview: config.disable_web_page_preview,
             body_template_source: config.body_template.clone(),
@@ -668,7 +680,72 @@ mod tests {
         cfg.body_template = Some("{% broken %}".to_string());
         let err = TelegramNotifier::from_config("tg", &cfg, client).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidNotifier { .. }));
-        assert!(err.to_string().contains("body_template"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid notifier 'tg': body_template: "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_filter_in_body_template() {
+        let client = reqwest::Client::new();
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some("<b>{{ title | nosuchfilter }}</b>".to_string());
+        let msg = TelegramNotifier::from_config("tg", &cfg, client)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'tg': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn from_config_accepts_escaping_body_template() {
+        let client = reqwest::Client::new();
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template =
+            Some("<b>{{ title | e }}</b>\n{{ body | e }} {{ title | tojson }}".to_string());
+        assert!(TelegramNotifier::from_config("tg", &cfg, client).is_ok());
+    }
+
+    #[test]
+    fn normalize_parse_mode_returns_canonical_form() {
+        assert_eq!(normalize_parse_mode("html"), Some("HTML"));
+        assert_eq!(normalize_parse_mode("HTML"), Some("HTML"));
+        assert_eq!(normalize_parse_mode("markdownv2"), Some("MarkdownV2"));
+        assert_eq!(normalize_parse_mode("MARKDOWN"), Some("Markdown"));
+        assert_eq!(normalize_parse_mode("Markdown2"), None);
+        assert_eq!(normalize_parse_mode("markdown_v2"), None);
+        assert_eq!(normalize_parse_mode(""), None);
+    }
+
+    #[test]
+    fn from_config_stores_canonical_parse_mode() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.parse_mode = Some("markdownv2".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(notifier.parse_mode, "MarkdownV2");
+        cfg.parse_mode = Some("html".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(notifier.parse_mode, "HTML");
+    }
+
+    #[test]
+    fn from_config_rejects_unsupported_parse_mode() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.parse_mode = Some("Markdown2".to_string());
+        let msg = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(
+                "invalid notifier 'tg': parse_mode 'Markdown2' is not supported (expected HTML, MarkdownV2 or Markdown)"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -828,6 +905,36 @@ mod tests {
         // Use alphanumeric-only path so reqwest doesn't percent-encode anything.
         let endpoint = format!("{}/botTESTTOKEN/sendMessage", server.uri());
         TelegramNotifier::new_for_tests("tg-test", endpoint, chat_ids, reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_lowercase_parse_mode_is_sent_in_canonical_form() {
+        // `from_config` targets api.telegram.org: build the notifier from the
+        // configuration, then point it at wiremock (the Bot API endpoint is
+        // not configurable, so this cannot live in tests/integration_notify.rs).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/botTESTTOKEN/sendMessage"))
+            .and(body_partial_json(
+                serde_json::json!({ "parse_mode": "HTML" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_with(vec!["-100A".to_string()]);
+        cfg.parse_mode = Some("html".to_string());
+        let mut notifier =
+            TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        notifier.endpoint = SecretString::new(format!("{}/botTESTTOKEN/sendMessage", server.uri()));
+
+        notifier
+            .send(&sample_alert("hi", "body"))
+            .await
+            .expect("should succeed");
+        server.verify().await;
     }
 
     #[tokio::test]

@@ -77,7 +77,10 @@ infra-team:
 ### Rules
 
 - **Files processed:** `*.yaml` and `*.yml` only
-- **Order:** Alphabetical (deterministic)
+- **Order:** Files are read in alphabetical order of their path. Rules keep a
+  stable order on every load: the rules of `config.yaml` in their declared order,
+  then the rules of `rules.d/` sorted by file path, then by rule name within a
+  file (not by declaration order in the file)
 - **Hidden files:** Files starting with `.` are ignored
 - **Empty files:** Silently skipped
 - **Name uniqueness:** Names must be unique across `config.yaml` and all `.d/` files
@@ -90,6 +93,11 @@ If the same name is defined in multiple files, Valerter fails at startup with an
 ```
 Error: duplicate rule name 'my_rule': defined in 'config.yaml' and 'rules.d/extra.yaml'
 ```
+
+The message has the same form for templates and notifiers (`duplicate template
+name '...'`, `duplicate notifier name '...'`), whether the collision is between
+`config.yaml` and a `.d/` file or between two files of the same `.d/` directory
+(the first file in alphabetical order is cited first).
 
 ## Structure Overview
 
@@ -148,6 +156,19 @@ victorialogs:
   header value nor the credentials). Headers with another name, such as
   `X-Tenant` or `Authorization-Token`, are sent together with Basic Auth.
 - Header values and the Basic Auth password are never written to the logs.
+
+The configuration is refused at load time (and by `valerter --validate`) when,
+after `${VAR}` substitution:
+
+- `url` does not parse or does not use `http`/`https`:
+  `victorialogs.<source>.url: invalid URL: ...`. A value that still contains
+  `${` after substitution is checked like any other URL. The URL is never
+  printed.
+- a `headers` name is not a valid HTTP header name:
+  `victorialogs.<source>.headers: invalid header name '<name>'`.
+- a `headers` value is not a valid HTTP header value (line break, control
+  character): `victorialogs.<source>.headers: invalid value for header
+  '<name>'`. The value is never printed.
 
 ### Multi-source example
 
@@ -236,11 +257,19 @@ Default values applied to all rules unless overridden.
 ```yaml
 defaults:
   throttle:
-    count: 5         # Max alerts per window
-    window: 60s      # Time window (e.g., 60s, 5m, 1h)
+    count: 5         # Max alerts per window (>= 1)
+    window: 60s      # Time window (e.g., 60s, 5m, 1h; > 0)
+    # key: "{{ host }}"  # Optional: grouping key template
   # timestamp_timezone: "Europe/Paris"  # Optional: timezone for formatted timestamps (default: UTC)
   # max_streams: 50                     # Optional: hard cap on total VictoriaLogs streams (default: 50)
 ```
+
+`defaults.throttle` applies to every rule without its own `throttle` block and
+gets the same checks as a rule throttle (see [Throttling](#throttling)):
+`count: 0` (`defaults.throttle.count must be >= 1 (0 would suppress every alert)`),
+`window: 0s` (`defaults.throttle.window must be > 0 (0s disables throttling)`),
+a `key` with a syntax error (`defaults.throttle.key: ...`) or an unknown filter,
+test or function (`defaults.throttle.key render: ...`) are refused at load time.
 
 ### `max_streams` — fan-out guardrail
 
@@ -328,6 +357,35 @@ with bracket notation:
 ```
 
 `valerter --validate` detects this pattern and prints the rewritten expression.
+
+A **top-level** field whose name contains `/` (e.g. `io/username`, with no dot
+before it) has no parent object to index, so it cannot be referenced from a
+template. Rename it in the rule query with the LogsQL `rename` pipe, then use
+the new name:
+
+```yaml
+query: '_stream:{app="oauth"} | rename "io/username" as io_username'
+# template: {{ io_username }}
+```
+
+`valerter --validate` suggests this rename for `{{ io/username }}`.
+
+### Template validation
+
+Templates (`title`, `body`, `email_body_html`, `throttle.key`, and the notifier
+`subject_template`/`body_template`) are checked for syntax, then test-rendered
+with placeholder values where every field is defined and every condition is
+true. The test render refuses only errors that do not depend on the event's
+values:
+
+- an unknown filter, test, function or method (`{{ _msg | truncate(50) }}`,
+  `{% if host is nosuchtest %}`), reported as `<field> render: ...`;
+- the `/` operator applied to a field path (see above).
+
+Conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency |
+float) > 1.5 }}`, `{{ ratio | round }}`, `{{ count + 1 }}`) are accepted: their
+outcome depends on the real values. An error of that kind at runtime falls back
+to a generic message (templates) or to the `<rule>:error` key (throttle).
 
 ### email_body_html Requirement
 
@@ -417,6 +475,14 @@ throttle:
   count: 3
   window: 5m
 ```
+
+`count` must be >= 1 and `window` > 0. `key` is checked at load time like the
+templates (syntax, then [test render](#template-validation)): a syntax error is
+reported as `invalid template in rule '<name>': throttle.key: ...`, an unknown
+filter, test or function as `invalid template in rule '<name>': throttle.key
+render: ...`, for enabled and disabled rules alike. A key whose rendering fails
+at runtime because of the event's values (e.g. `{{ port + 1 }}` with a string
+`port`) uses the fallback key `<rule>:error`.
 
 The window is fixed: a key's counter starts with its first alert and expires
 `window` later. Without `key`, all alerts of the rule share one counter per
@@ -546,8 +612,8 @@ valerter --validate -c /etc/valerter/config.yaml
 `--validate` runs every blocking check of the daemon startup, with the same error messages and exit code 1 on failure:
 
 1. **Loading** — YAML syntax, unknown fields, `config.d/` merge, `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
-2. **Validation** — required fields, regexes, template syntax, source names, `max_streams` cap, at least one enabled rule
-3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids` and notifier templates are checked
+2. **Validation** — required fields, regexes, template syntax and [test render](#template-validation) (including `throttle.key`), source names, URLs and headers, `defaults.throttle`, `max_streams` cap, at least one enabled rule
+3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, resolved webhook and Mattermost URLs are checked, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids`, Telegram `parse_mode` and notifier templates (syntax and test render) are checked
 4. **Rule destinations** — every rule destination (enabled or not) names a declared notifier
 5. **Email body** — templates of enabled rules sent to email destinations define `email_body_html`
 6. **Warning** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination (exit code stays 0)

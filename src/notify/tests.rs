@@ -1451,3 +1451,61 @@ fn registry_from_config_propagates_telegram_validation_errors() {
     let errs = result.unwrap_err();
     assert!(errs.iter().any(|e| e.to_string().contains("chat_ids")));
 }
+
+fn mattermost_registry_errors(env_value: &str) -> String {
+    temp_env::with_var("HCV_MM_WEBHOOK", Some(env_value), || {
+        let mut notifiers_config = HashMap::new();
+        notifiers_config.insert(
+            "mm".to_string(),
+            NotifierConfig::Mattermost(MattermostNotifierConfig {
+                webhook_url: SecretString::new("${HCV_MM_WEBHOOK}".to_string()),
+                channel: None,
+                username: None,
+                icon_url: None,
+            }),
+        );
+        match NotifierRegistry::from_config(
+            &notifiers_config,
+            reqwest::Client::new(),
+            &test_config_dir(),
+        ) {
+            Ok(_) => String::new(),
+            Err(errors) => errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    })
+}
+
+#[test]
+#[serial]
+fn registry_rejects_resolved_mattermost_url_with_bad_scheme() {
+    let msg = mattermost_registry_errors("htps://mm.example.com/hooks/SECRET");
+    assert!(
+        msg.contains("invalid notifier 'mm': webhook_url: invalid URL:"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+#[serial]
+fn registry_rejects_resolved_mattermost_url_that_does_not_parse() {
+    let msg = mattermost_registry_errors("not a url SECRET");
+    assert!(
+        msg.contains("invalid notifier 'mm': webhook_url: invalid URL:"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+#[serial]
+fn registry_accepts_resolved_mattermost_url() {
+    assert_eq!(
+        mattermost_registry_errors("https://mm.example.com/hooks/abc"),
+        ""
+    );
+}

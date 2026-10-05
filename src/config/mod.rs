@@ -25,7 +25,7 @@ pub use types::{
     JsonParserConfig, MetricsConfig, NotifyConfig, ParserConfig, RuleConfig, TemplateConfig,
     ThrottleConfig, TlsConfig, VlSourceConfig,
 };
-pub use validation::validate_template_render;
+pub use validation::{validate_notifier_template, validate_resolved_url, validate_template_render};
 
 #[cfg(test)]
 mod tests;
