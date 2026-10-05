@@ -18,7 +18,7 @@ Le démon SHALL exécuter le démarrage dans cet ordre : lecture des arguments, 
 - **THEN** le démarrage attend que l'exporteur Prometheus soit installé et que les séries connues soient initialisées avant de lancer le moteur de règles
 
 ### Requirement: Échec de démarrage avec code de sortie non nul
-Le démon MUST se terminer avec le code de sortie 1, sans lancer aucune tâche de règle, si une étape de démarrage échoue : chargement ou validation de la configuration, compilation, création des notifiers, validation des destinations, validation des templates e-mail ou installation de l'exporteur de métriques.
+Le démon MUST se terminer avec le code de sortie 1, sans lancer aucune tâche de règle, si une étape de démarrage échoue : chargement ou validation de la configuration, compilation, création des notifiers, validation des destinations, validation des templates e-mail ou installation de l'exporteur de métriques. Toute erreur fatale, au démarrage comme à l'exécution et en mode `--validate`, MUST être journalisée une seule fois au niveau ERROR par le système de logs, dans le format choisi (`--log-format`), et le processus MUST NOT écrire de ligne non structurée `Error: ...` sur la sortie d'erreur.
 
 #### Scenario: Configuration invalide
 - **WHEN** la validation de la configuration renvoie des erreurs
@@ -39,6 +39,11 @@ Le démon MUST se terminer avec le code de sortie 1, sans lancer aucune tâche d
 - **WHEN** l'exporteur Prometheus ne peut pas être installé (par exemple port déjà occupé)
 - **THEN** le message « Metrics recorder failed to initialize » est journalisé
 - **AND** le processus se termine avec le code 1
+
+#### Scenario: Erreur fatale au format JSON
+- **WHEN** valerter est lancé avec `--log-format json` (démon ou `--validate`) sur une configuration dont un notifier référence une variable d'environnement non définie
+- **THEN** chaque ligne de la sortie d'erreur est un objet JSON, dont une ligne de niveau ERROR contenant `Failed to create notifiers: 1 errors`
+- **AND** aucune ligne ne commence par `Error:` et le code de sortie est 1
 
 ### Requirement: Une tâche par couple (règle, source)
 Le moteur SHALL lancer une tâche indépendante pour chaque couple (règle activée, source résolue), où une règle sans `vl_sources` (ou avec une liste vide) cible toutes les sources déclarées et une règle avec `vl_sources` ne cible que les sources nommées, dans l'ordre alphabétique des noms de sources.
@@ -98,12 +103,12 @@ Le moteur SHALL confiner toute erreur fatale d'une tâche au seul couple (règle
 - **THEN** la ligne est abandonnée, un log DEBUG « Failed to process log line, continuing » est émis et la tâche poursuit avec la ligne suivante
 
 ### Requirement: Fin inattendue de toutes les tâches
-Le moteur SHALL se terminer en erreur lorsque toutes les tâches se sont arrêtées sans qu'un arrêt ait été demandé ; le démon SHALL alors annuler le jeton d'arrêt et s'arrêter avec le code 1, sans attendre l'expiration des délais d'attente du worker et du serveur de métriques.
+Le moteur SHALL se terminer en erreur lorsque toutes les tâches se sont arrêtées sans qu'un arrêt ait été demandé ; le démon SHALL alors annuler le jeton d'arrêt, laisser le worker de notifications vider les files dans la limite du délai de vidage (20 secondes au plus, sans attente si les files sont vides), puis s'arrêter avec le code 1.
 
 #### Scenario: Plus aucune tâche active
 - **WHEN** la dernière tâche active se termine (normalement ou en erreur fatale) hors arrêt demandé
 - **THEN** le message ERROR « All rule tasks completed unexpectedly » est journalisé
-- **AND** le processus se termine avec le code 1, en moins d'une seconde après ce message
+- **AND** le processus se termine avec le code 1, sans attente supplémentaire si les files sont vides et au plus 20 secondes après ce message sinon (plus l'arrêt borné du runtime)
 
 #### Scenario: Relance par systemd
 - **WHEN** le démon tourne sous l'unité systemd fournie et se termine parce que toutes ses tâches se sont arrêtées
@@ -149,7 +154,7 @@ Chaque tâche (règle, source) SHALL posséder son propre parser et sa propre co
 - **THEN** la tâche (règle, `vldev`) continue de recevoir et de traiter ses lignes avec son propre parser
 
 ### Requirement: Arrêt gracieux sur signal
-Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIGINT (sous Unix ; Ctrl+C uniquement sur les autres plateformes), en annulant toutes les tâches de règles, puis, une fois toutes ces tâches arrêtées, en laissant au worker de notifications au plus 20 secondes pour vider la file et au serveur de métriques au plus 2 secondes pour se terminer, avant de quitter avec le code 0. Un second SIGTERM ou SIGINT reçu pendant l'arrêt MUST provoquer la sortie immédiate du processus avec le code 1.
+Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIGINT (sous Unix ; Ctrl+C uniquement sur les autres plateformes), en annulant toutes les tâches de règles, puis, une fois toutes ces tâches arrêtées, en laissant au worker de notifications au plus 20 secondes pour vider la file et au serveur de métriques au plus 2 secondes pour se terminer, avant de quitter avec le code 0. Un second SIGTERM ou SIGINT reçu pendant l'arrêt MUST provoquer la sortie immédiate du processus avec le code 1. La destruction du runtime asynchrone en fin de processus (arrêt gracieux ou erreur) MUST NOT attendre plus de 2 secondes les tâches bloquantes encore en cours, comme une résolution DNS bloquée.
 
 #### Scenario: Réception de SIGTERM
 - **WHEN** le démon reçoit SIGTERM
@@ -169,6 +174,10 @@ Le démon SHALL déclencher l'arrêt gracieux à la réception de SIGTERM ou SIG
 - **WHEN** un second SIGTERM ou SIGINT est reçu pendant l'arrêt, quelle qu'en soit la phase (arrêt des tâches, vidage de la file ou attente du serveur de métriques)
 - **THEN** le log WARN « Second shutdown signal received, forcing immediate exit » est émis
 - **AND** le processus se termine immédiatement avec le code 1, sans attendre la fin des envois en cours ni le vidage de la file
+
+#### Scenario: Résolution DNS bloquée à l'arrêt
+- **WHEN** l'arrêt est demandé alors qu'une résolution DNS d'une tâche est bloquée dans le pool de tâches bloquantes
+- **THEN** le processus se termine au plus 2 secondes après la fin de la séquence d'arrêt, dans le `TimeoutStopSec=30` de l'unité fournie
 
 ### Requirement: Unité systemd fournie
 Le projet SHALL fournir l'unité `systemd/valerter.service`, installée dans `/lib/systemd/system/`, qui lance `/usr/bin/valerter -c /etc/valerter/config.yaml` en service `Type=simple` sous l'utilisateur et le groupe `valerter`, avec `Restart=on-failure`, `RestartSec=5`, `KillMode=mixed`, `KillSignal=SIGTERM`, `TimeoutStopSec=30`, les durcissements `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, un démarrage après `network.target` et une installation dans `multi-user.target`.
@@ -190,14 +199,14 @@ Le projet SHALL fournir l'unité `systemd/valerter.service`, installée dans `/l
 - **THEN** ses logs, écrits sur la sortie d'erreur, sont consultables via `journalctl -u valerter`
 
 ### Requirement: Paquet Debian
-Le paquet Debian SHALL installer le binaire dans `/usr/bin/valerter`, la configuration d'exemple dans `/etc/valerter/config.yaml` (déclarée comme conffile, donc préservée lors des mises à jour) et le template `default-email.html.j2` dans `/etc/valerter/templates/`, et ses scripts de maintenance SHALL gérer l'utilisateur système, les permissions et le service comme décrit ci-dessous.
+Le paquet Debian SHALL installer le binaire dans `/usr/bin/valerter`, la configuration d'exemple dans `/etc/valerter/config.yaml` (déclarée comme conffile, donc préservée lors des mises à jour) et le template `default-email.html.j2` dans `/etc/valerter/templates/`, et ses scripts de maintenance SHALL gérer l'utilisateur système, les permissions et le service comme décrit ci-dessous. Les actions sur le service MUST n'être exécutées que si systemd est le gestionnaire actif du système (répertoire `/run/systemd/system` présent).
 
 #### Scenario: Installation (configure)
 - **WHEN** le paquet est configuré
 - **THEN** le groupe système `valerter` et l'utilisateur système `valerter` (sans home, shell `/usr/sbin/nologin`) sont créés s'ils n'existent pas
 - **AND** `/etc/valerter` est attribué à `root:valerter` en mode 750 et `/etc/valerter/config.yaml` à `root:valerter` en mode 640
 - **AND** les répertoires `rules.d`, `templates.d` et `notifiers.d` sont créés s'ils sont absents, en `root:valerter` mode 750
-- **AND** `/etc/valerter/templates` est attribué à `valerter:valerter` en mode 755, ses fichiers en mode 644, puis `systemctl daemon-reload` est exécuté
+- **AND** `/etc/valerter/templates` est attribué à `valerter:valerter` en mode 755, ses fichiers en mode 644, puis `systemctl daemon-reload` est exécuté si systemd est actif
 
 #### Scenario: Première installation
 - **WHEN** le paquet est installé pour la première fois
@@ -224,11 +233,16 @@ Le paquet Debian SHALL installer le binaire dans `/usr/bin/valerter`, la configu
 
 #### Scenario: Suppression
 - **WHEN** le paquet est supprimé (remove)
-- **THEN** le service est arrêté s'il est actif, désactivé, et `systemctl daemon-reload` est exécuté, l'utilisateur `valerter` et la configuration étant conservés
+- **THEN** le script prerm arrête le service sans condition sur son état (y compris un service en `activating (auto-restart)` entre deux relances) et le désactive, avant la suppression des fichiers du paquet
+- **AND** le script postrm exécute `systemctl daemon-reload`, l'utilisateur `valerter` et la configuration étant conservés
 
 #### Scenario: Purge
 - **WHEN** le paquet est purgé
 - **THEN** l'utilisateur et le groupe `valerter` sont supprimés, le répertoire `/etc/valerter` est supprimé et `systemctl daemon-reload` est exécuté
+
+#### Scenario: Installation sans systemd actif
+- **WHEN** le paquet est installé ou mis à jour dans un conteneur ou un chroot où systemd n'est pas le gestionnaire actif
+- **THEN** postinst n'exécute aucune commande `systemctl` et n'écrit pas l'avertissement « valerter failed to start after upgrade »
 
 ### Requirement: Relance après panic non bloquante avec backoff
 Le moteur SHALL, lorsqu'une tâche panique, journaliser l'incident, incrémenter `valerter_rule_panics_total{rule_name, vl_source}` puis relancer la tâche du même couple (règle, source) avec la même configuration après un délai croissant (5 s, doublé à chaque panic consécutif, plafonné à 5 min), sans limite du nombre de relances, sauf si l'arrêt est demandé. Le compteur de panics consécutifs d'un couple SHALL repartir de zéro après 10 minutes de fonctionnement sans panic. Le délai de relance MUST NOT suspendre la supervision des autres tâches ni la prise en compte de l'arrêt.
