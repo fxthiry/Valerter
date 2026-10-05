@@ -69,9 +69,9 @@ async fn test_send_success_first_attempt() {
         .await;
 
     let webhook_url = format!("{}/hooks/test-webhook", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("test_rule");
@@ -125,9 +125,9 @@ async fn test_retry_on_server_error_then_success() {
         .await;
 
     let webhook_url = format!("{}/hooks/retry-test", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("retry_rule");
@@ -167,9 +167,9 @@ async fn test_failure_after_max_retries() {
         .await;
 
     let webhook_url = format!("{}/hooks/always-fail", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("fail_rule");
@@ -217,9 +217,9 @@ async fn test_mattermost_payload_format() {
         .await;
 
     let webhook_url = format!("{}/hooks/format-test", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("format_rule");
@@ -258,9 +258,9 @@ async fn test_client_error_no_retry() {
         .await;
 
     let webhook_url = format!("{}/hooks/bad-request", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload("bad_rule");
@@ -298,9 +298,9 @@ async fn test_multiple_messages_in_sequence() {
         .await;
 
     let webhook_url = format!("{}/hooks/multi-test", mock_server.uri());
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_test_registry(client, &webhook_url);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send 3 messages
@@ -368,7 +368,6 @@ async fn test_fanout_to_multiple_destinations() {
     let webhook_infra = format!("{}/hooks/infra", mock_server_infra.uri());
     let webhook_ops = format!("{}/hooks/ops", mock_server_ops.uri());
 
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_multi_notifier_registry(
         client,
@@ -378,6 +377,7 @@ async fn test_fanout_to_multiple_destinations() {
         ],
     );
 
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send one alert with two destinations
@@ -429,7 +429,6 @@ async fn test_fanout_partial_failure_continues() {
     let webhook_success = format!("{}/hooks/success", mock_server_success.uri());
     let webhook_fail = format!("{}/hooks/fail", mock_server_fail.uri());
 
-    let queue = NotificationQueue::new(10);
     let client = make_client();
     let registry = make_multi_notifier_registry(
         client,
@@ -439,6 +438,7 @@ async fn test_fanout_partial_failure_continues() {
         ],
     );
 
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     // Send alert to both destinations
@@ -529,7 +529,6 @@ async fn test_webhook_send_with_body_template() {
             .to_string(),
     );
 
-    let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry(
         "test-webhook",
         &webhook_url,
@@ -537,6 +536,7 @@ async fn test_webhook_send_with_body_template() {
         HashMap::new(),
         body_template,
     );
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload_with_destinations("template_rule", vec!["test-webhook".to_string()]);
@@ -576,7 +576,6 @@ async fn test_webhook_send_with_default_body() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
-    let queue = NotificationQueue::new(10);
     // No body_template = uses DefaultWebhookPayload
     let registry = make_webhook_registry(
         "default-webhook",
@@ -585,6 +584,7 @@ async fn test_webhook_send_with_default_body() {
         HashMap::new(),
         None,
     );
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload =
@@ -627,8 +627,8 @@ async fn test_webhook_with_custom_headers() {
     );
     headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
 
-    let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry("header-webhook", &webhook_url, "POST", headers, None);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload_with_destinations("header_rule", vec!["header-webhook".to_string()]);
@@ -672,9 +672,9 @@ async fn test_webhook_retry_on_500_then_success() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
-    let queue = NotificationQueue::new(10);
     let registry =
         make_webhook_registry("retry-webhook", &webhook_url, "POST", HashMap::new(), None);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload_with_destinations("retry_rule", vec!["retry-webhook".to_string()]);
@@ -719,7 +719,6 @@ async fn test_webhook_retry_on_429_then_success() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
-    let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry(
         "retry-429-webhook",
         &webhook_url,
@@ -727,6 +726,7 @@ async fn test_webhook_retry_on_429_then_success() {
         HashMap::new(),
         None,
     );
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload =
@@ -760,7 +760,6 @@ async fn test_webhook_no_retry_on_400() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
-    let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry(
         "no-retry-webhook",
         &webhook_url,
@@ -768,6 +767,7 @@ async fn test_webhook_no_retry_on_400() {
         HashMap::new(),
         None,
     );
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload =
@@ -802,8 +802,8 @@ async fn test_webhook_put_method() {
 
     let webhook_url = format!("{}/api/alerts", mock_server.uri());
 
-    let queue = NotificationQueue::new(10);
     let registry = make_webhook_registry("put-webhook", &webhook_url, "PUT", HashMap::new(), None);
+    let queue = NotificationQueue::new(10, &registry);
     let mut worker = NotificationWorker::new(&queue, registry);
 
     let payload = make_payload_with_destinations("put_rule", vec!["put-webhook".to_string()]);
@@ -821,4 +821,188 @@ async fn test_webhook_put_method() {
     worker_handle.await.unwrap();
 
     mock_server.verify().await;
+}
+
+// ============================================================================
+// Per-destination delivery: a slow destination does not affect the others
+// ============================================================================
+
+/// Webhook client timeout used for the unresponsive endpoint.
+const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Shortest time the webhook notifier needs to exhaust its 3 attempts
+/// against an endpoint that never answers within `SHORT_TIMEOUT`:
+/// 3 timeouts + 500 ms + 1 s of backoff.
+const WEBHOOK_RETRY_FLOOR: Duration = Duration::from_millis(3 * 200 + 500 + 1000);
+
+/// Registry with a webhook notifier `webhook-down` (short client timeout)
+/// and a Mattermost notifier `mm-ops`.
+fn make_isolation_registry(webhook_url: &str, mattermost_url: &str) -> Arc<NotifierRegistry> {
+    let short_client = reqwest::Client::builder()
+        .timeout(SHORT_TIMEOUT)
+        .build()
+        .unwrap();
+    let config = WebhookNotifierConfig {
+        url: SecretString::new(webhook_url.to_string()),
+        method: "POST".to_string(),
+        headers: HashMap::new(),
+        body_template: None,
+    };
+    let mut registry = NotifierRegistry::new();
+    registry
+        .register(Arc::new(
+            WebhookNotifier::from_config("webhook-down", &config, short_client).unwrap(),
+        ))
+        .unwrap();
+    registry
+        .register(Arc::new(MattermostNotifier::new(
+            "mm-ops".to_string(),
+            SecretString::new(mattermost_url.to_string()),
+            make_client(),
+        )))
+        .unwrap();
+    Arc::new(registry)
+}
+
+/// Mount an endpoint that answers 200 only after `delay`.
+async fn mount_endpoint(server: &MockServer, delay: Duration) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(delay))
+        .mount(server)
+        .await;
+}
+
+/// Wait until `server` has received `count` requests, or `deadline` expires.
+async fn wait_for_requests(server: &MockServer, count: usize, deadline: Duration) -> usize {
+    let start = tokio::time::Instant::now();
+    loop {
+        let received = server.received_requests().await.unwrap_or_default().len();
+        if received >= count || start.elapsed() >= deadline {
+            return received;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_unresponsive_destination_does_not_delay_others() {
+    let webhook_server = MockServer::start().await;
+    let mm_server = MockServer::start().await;
+    mount_endpoint(&webhook_server, Duration::from_secs(5)).await;
+    mount_endpoint(&mm_server, Duration::ZERO).await;
+
+    let registry = make_isolation_registry(&webhook_server.uri(), &mm_server.uri());
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    let start = tokio::time::Instant::now();
+    queue
+        .send(make_payload_with_destinations(
+            "both",
+            vec!["webhook-down".to_string(), "mm-ops".to_string()],
+        ))
+        .unwrap();
+    for i in 0..5 {
+        queue
+            .send(make_payload_with_destinations(
+                &format!("mm_only_{i}"),
+                vec!["mm-ops".to_string()],
+            ))
+            .unwrap();
+    }
+
+    let delivered = wait_for_requests(&mm_server, 6, WEBHOOK_RETRY_FLOOR).await;
+    let elapsed = start.elapsed();
+    let webhook_attempts = webhook_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    cancel.cancel();
+    worker_handle.abort();
+
+    assert_eq!(delivered, 6, "mm-ops must receive all its alerts");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "mm-ops alerts took {elapsed:?}, they must not wait for webhook-down retries"
+    );
+    assert!(
+        webhook_attempts < 3,
+        "webhook-down retries should still be running, saw {webhook_attempts} attempts"
+    );
+}
+
+#[test]
+fn test_saturated_destination_drops_only_its_own_alerts() {
+    const BURST: usize = valerter::DEFAULT_QUEUE_CAPACITY + 50;
+
+    // Local recorder on a current-thread runtime: the queue and the workers
+    // run on this thread, so their metrics land in this recorder.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let healthy_received = metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let webhook_server = MockServer::start().await;
+            let mm_server = MockServer::start().await;
+            mount_endpoint(&webhook_server, Duration::from_secs(5)).await;
+            mount_endpoint(&mm_server, Duration::ZERO).await;
+
+            let registry = make_isolation_registry(&webhook_server.uri(), &mm_server.uri());
+            let queue = NotificationQueue::new(valerter::DEFAULT_QUEUE_CAPACITY, &registry);
+            let mut worker = NotificationWorker::new(&queue, registry);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_clone = cancel.clone();
+            let worker_handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+            // A burst well within the healthy endpoint's throughput, but far
+            // beyond what the unresponsive one can absorb.
+            for i in 0..BURST {
+                queue
+                    .send(make_payload_with_destinations(
+                        &format!("burst_{i}"),
+                        vec!["webhook-down".to_string(), "mm-ops".to_string()],
+                    ))
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+
+            let received = wait_for_requests(&mm_server, BURST, Duration::from_secs(10)).await;
+            cancel.cancel();
+            worker_handle.abort();
+            received
+        })
+    });
+
+    assert_eq!(healthy_received, BURST, "mm-ops must receive every alert");
+
+    let rendered = handle.render();
+    let dropped = |notifier: &str, kind: &str| -> u64 {
+        let prefix = format!(
+            "valerter_destination_alerts_dropped_total{{notifier_name=\"{notifier}\",notifier_type=\"{kind}\"}} "
+        );
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(0)
+    };
+    assert!(
+        dropped("webhook-down", "webhook") > 0,
+        "webhook-down must have dropped alerts:\n{rendered}"
+    );
+    assert_eq!(
+        dropped("mm-ops", "mattermost"),
+        0,
+        "mm-ops must not drop anything:\n{rendered}"
+    );
 }

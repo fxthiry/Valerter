@@ -195,7 +195,7 @@ To ensure that if someone misconfigures valerter (no throttle, or throttle too h
 
 Even without throttle:
 - **No crash** under any load tested
-- **Memory bounded** at ~22 MB (queue has fixed size)
+- **Memory bounded** at ~22 MB (each destination queue has a fixed size)
 - **Graceful degradation** (FIFO drops, not OOM)
 
 ---
@@ -243,7 +243,7 @@ Tests that valerter recovers from VictoriaLogs outages.
 | With throttle (any load) | ~18-20 MB |
 | Without throttle (extreme) | ~22 MB |
 
-Memory is **always bounded** regardless of load.
+Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied), so even dozens of notifiers keep the pending alerts within a few MB.
 
 ---
 
@@ -253,7 +253,8 @@ Memory is **always bounded** regardless of load.
 # The metrics that matter in production
 valerter_alerts_sent_total          # Notifications actually delivered
 valerter_alerts_throttled_total     # Logs matched but throttled (expected)
-valerter_alerts_dropped_total       # Queue overflow (should be 0 with throttle)
+valerter_alerts_dropped_total       # Queue overflow, all destinations (should be 0 with throttle)
+valerter_destination_alerts_dropped_total{notifier_name}  # Which destination overflows
 valerter_vl_source_up{vl_source}    # Connection health (per source; v1.x: valerter_victorialogs_up)
 ```
 

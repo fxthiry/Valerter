@@ -7,7 +7,7 @@ use chrono_tz::Tz;
 /// Payload ready to be sent to a notifier.
 ///
 /// Contains all fields needed to send a notification.
-/// Must implement `Clone` as required by `broadcast::Sender`.
+/// Shared between destination queues through `Arc` (queued once, not copied).
 #[derive(Debug, Clone)]
 pub struct AlertPayload {
     /// Rendered message content (title, body, accent_color).

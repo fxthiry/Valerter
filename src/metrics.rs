@@ -43,7 +43,12 @@ pub fn register_metric_descriptions() {
     );
     describe_counter!(
         "valerter_alerts_dropped_total",
-        "Total number of alerts dropped due to full queue"
+        "Total number of deliveries dropped because a destination queue was full \
+         (sum over every destination; an alert routed to two destinations counts twice)"
+    );
+    describe_counter!(
+        "valerter_destination_alerts_dropped_total",
+        "Number of alerts dropped because the queue of this destination was full"
     );
     describe_counter!(
         "valerter_notify_errors_total",
@@ -73,7 +78,12 @@ pub fn register_metric_descriptions() {
     // Gauges
     describe_gauge!(
         "valerter_queue_size",
-        "Current number of alerts in the notification queue"
+        "Current number of pending deliveries across every destination queue \
+         (up to 100 per destination)"
+    );
+    describe_gauge!(
+        "valerter_destination_queue_size",
+        "Current number of alerts pending in the queue of this destination (at most 100)"
     );
     describe_gauge!(
         "valerter_last_query_timestamp",
@@ -316,6 +326,35 @@ pub fn initialize_metrics(
         notifier_count = notifier_names.len(),
         "Metrics initialized to zero"
     );
+}
+
+/// Initialize the per-destination queue metrics to zero.
+///
+/// Call it right after [`initialize_metrics`] so that
+/// `valerter_destination_queue_size` and
+/// `valerter_destination_alerts_dropped_total` are visible for every notifier
+/// from startup.
+///
+/// # Arguments
+///
+/// * `destinations` - `(notifier_name, notifier_type)` of every notifier.
+pub fn initialize_destination_metrics(destinations: &[(&str, &str)]) {
+    use metrics::{counter, gauge};
+
+    for (notifier_name, notifier_type) in destinations {
+        gauge!(
+            "valerter_destination_queue_size",
+            "notifier_name" => notifier_name.to_string(),
+            "notifier_type" => notifier_type.to_string(),
+        )
+        .set(0.0);
+        counter!(
+            "valerter_destination_alerts_dropped_total",
+            "notifier_name" => notifier_name.to_string(),
+            "notifier_type" => notifier_type.to_string(),
+        )
+        .absolute(0);
+    }
 }
 
 #[cfg(test)]

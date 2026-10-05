@@ -759,8 +759,32 @@ mod tests {
             .expect("Failed to create test client")
     }
 
+    /// Notifier that accepts every alert without sending anything.
+    struct NoopNotifier(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::notify::Notifier for NoopNotifier {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn notifier_type(&self) -> &str {
+            "noop"
+        }
+
+        async fn send(&self, _alert: &AlertPayload) -> Result<(), crate::error::NotifyError> {
+            Ok(())
+        }
+    }
+
+    /// Queue routing to the destinations used by these tests (no worker:
+    /// alerts stay pending so tests can inspect them).
     fn make_test_queue() -> NotificationQueue {
-        NotificationQueue::new(10)
+        let mut registry = crate::notify::NotifierRegistry::new();
+        for name in ["mattermost-test", "mattermost-infra", "mattermost-ops"] {
+            registry.register(Arc::new(NoopNotifier(name))).unwrap();
+        }
+        NotificationQueue::new(10, &registry)
     }
 
     fn make_test_rule(name: &str, enabled: bool) -> CompiledRule {
@@ -877,7 +901,6 @@ mod tests {
         let config = make_test_runtime_config(rules);
         let client = make_test_client();
         let queue = make_test_queue();
-        let _rx = queue.subscribe(); // Keep queue alive
 
         let engine = RuleEngine::new(config, client, queue);
         let cancel = CancellationToken::new();
@@ -906,7 +929,6 @@ mod tests {
         let config = make_test_runtime_config(rules);
         let client = make_test_client();
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
 
         let engine = RuleEngine::new(config, client, queue);
         let cancel = CancellationToken::new();
@@ -941,7 +963,6 @@ mod tests {
         let config = make_test_runtime_config(rules);
         let client = make_test_client();
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
 
         let engine = RuleEngine::new(config, client, queue);
         let cancel = CancellationToken::new();
@@ -966,7 +987,6 @@ mod tests {
         let config = make_test_runtime_config(rules);
         let client = make_test_client();
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
 
         let engine = RuleEngine::new(config, client, queue);
         let cancel = CancellationToken::new();
@@ -988,7 +1008,6 @@ mod tests {
         let config = make_test_runtime_config(vec![]);
         let client = make_test_client();
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
 
         let engine = RuleEngine::new(config, client, queue);
         let cancel = CancellationToken::new();
@@ -1026,7 +1045,6 @@ mod tests {
             },
         );
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
         let engine =
             RuleEngine::new(config, make_test_client(), queue).with_runner(failing_runner());
         let cancel = CancellationToken::new();
@@ -1076,7 +1094,6 @@ mod tests {
         });
         let config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
         let queue = make_test_queue();
-        let _rx = queue.subscribe();
         let engine = RuleEngine::new(config, make_test_client(), queue).with_runner(runner);
         let cancel = CancellationToken::new();
 
@@ -1120,8 +1137,7 @@ mod tests {
         };
         let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
-        let queue = NotificationQueue::new(10);
-        let _rx = queue.subscribe();
+        let queue = make_test_queue();
 
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test message"}"#;
 
@@ -1156,8 +1172,7 @@ mod tests {
         };
         let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
-        let queue = NotificationQueue::new(10);
-        let _rx = queue.subscribe();
+        let queue = make_test_queue();
 
         let line = "not valid json";
 
@@ -1169,7 +1184,7 @@ mod tests {
             "default",
             "test_rule",
             "vlprod",
-            &[], // Empty destinations = use default
+            &["mattermost-test".to_string()],
             &queue,
             "UTC",
         )
@@ -1191,8 +1206,7 @@ mod tests {
         };
         let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
-        let queue = NotificationQueue::new(10);
-        let _rx = queue.subscribe();
+        let queue = make_test_queue();
 
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test"}"#;
 
@@ -1205,7 +1219,7 @@ mod tests {
             "default",
             "test_rule",
             "vlprod",
-            &[], // Empty destinations = use default
+            &["mattermost-test".to_string()],
             &queue,
             "UTC",
         )
@@ -1222,7 +1236,7 @@ mod tests {
             "default",
             "test_rule",
             "vlprod",
-            &[],
+            &["mattermost-test".to_string()],
             &queue,
             "UTC",
         )
@@ -1242,8 +1256,7 @@ mod tests {
         };
         let throttler = Throttler::new(Some(&throttle_config), "test_rule", "vlprod");
         let template_engine = TemplateEngine::new(make_test_templates());
-        let queue = NotificationQueue::new(10);
-        let mut rx = queue.subscribe();
+        let queue = make_test_queue();
 
         let line = r#"{"_time":"2026-01-09T10:00:00Z","_stream":"{}","_msg":"test"}"#;
 
@@ -1264,10 +1277,11 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(queue.len(), 1);
+        // One pending delivery per destination
+        assert_eq!(queue.len(), 2);
 
         // Verify the payload has the destinations, timestamps, and vl_source
-        let payload = rx.recv().await.unwrap();
+        let payload = queue.take_pending("mattermost-ops").unwrap();
         assert_eq!(payload.destinations.len(), 2);
         assert_eq!(payload.destinations[0], "mattermost-infra");
         assert_eq!(payload.destinations[1], "mattermost-ops");

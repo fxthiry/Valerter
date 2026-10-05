@@ -37,7 +37,7 @@ src/
     ├── traits.rs        # Notifier async trait
     ├── registry.rs      # NotifierRegistry
     ├── payload.rs       # AlertPayload structure
-    ├── queue.rs         # NotificationQueue + Worker
+    ├── queue.rs         # Per-destination queues + delivery workers
     ├── mattermost.rs    # Mattermost notifier
     ├── email.rs         # Email notifier (SMTP)
     ├── webhook.rs       # Webhook notifier
@@ -86,9 +86,12 @@ Renders the final message using Jinja2 templates (via minijinja):
 
 Sends alerts to configured destinations via `NotifierRegistry`:
 
-- **Fan-out:** One alert can go to multiple notifiers in parallel (`join_all`)
+- **Fan-out:** One alert can go to multiple notifiers; it is queued once per destination
+- **Per-destination delivery:** each notifier has its own queue (exactly 100 alerts) and its own delivery task, so a slow, unavailable or saturated destination only delays or loses its own alerts
+- **Order:** alerts are delivered in arrival order per destination (FIFO per destination, not globally)
 - **Retry:** Exponential backoff (500ms → 5s, max 3 retries)
-- **Drop Oldest:** If queue is full, oldest alerts are dropped (not newest)
+- **Drop Oldest:** If a destination queue is full, its oldest alert is dropped (not the newest), for that destination only
+- **Panic isolation:** a notifier panic is logged (`Notifier panicked while sending alert`), counted as a failed delivery, and the destination moves on to its next alert
 - **Notifier types:** Mattermost, Email (SMTP), Webhook (generic HTTP)
 - **Timestamps:** `log_timestamp` (ISO 8601) and `log_timestamp_formatted` (human-readable with timezone)
 
@@ -99,7 +102,13 @@ main.rs
     │
     ├── MetricsServer::run() ────────────────► :9090/metrics
     │
-    ├── NotificationWorker::run() ───────────► consumes from bounded queue
+    ├── NotificationWorker::run()
+    │       │
+    │       └── JoinSet<()>
+    │               ├── destination task("mattermost-ops") ──► its own bounded queue → send
+    │               ├── destination task("email-alerts")   ──► its own bounded queue → send
+    │               └── destination task("<notifier>")     ──► ...
+    │
     │
     └── RuleEngine::run()
             │
@@ -123,6 +132,7 @@ main.rs
 - **Graceful shutdown:** all tasks respect the `CancellationToken`
 - **No silent exit:** the engine returns `Ok` only after a shutdown request (SIGINT/SIGTERM). If no task can be spawned (`No enabled rules found, engine will exit`) or every task ends without a shutdown request (`All rule tasks completed unexpectedly`), it logs at ERROR and returns an error. `main` then cancels the shared token right away (worker, metrics server and uptime updater stop at once instead of waiting for their timeouts) and the process exits with code 1, so the shipped systemd unit (`Restart=on-failure`) restarts it and `systemctl status` shows it as failed. Exit code 0 means a requested shutdown and is never restarted.
 - **Metric:** `valerter_rule_panics_total{rule_name}` tracks panics per rule. (Per-source label split is deferred to the v2.0.0 part 2 observability spec.)
+- **Delivery isolation:** one delivery task per notifier, each consuming its own queue sequentially (the next alert is taken once the current send, retries included, is over). Destinations progress independently: an endpoint that times out never delays the others.
 
 ## Reconnection Strategy
 
@@ -138,25 +148,22 @@ When the server ends the response cleanly (EOF without error), this is not a fai
 
 ## Notification Queue
 
-Uses Tokio's `broadcast` channel with ring buffer semantics:
+`NotificationQueue` is a router over one bounded queue per notifier of the registry:
 
-- **Capacity:** 100 alerts (constant `DEFAULT_QUEUE_CAPACITY`)
-- **Drop Oldest:** When full, oldest alerts are overwritten (native broadcast behavior)
-- **Metric:** `valerter_alerts_dropped_total` tracks dropped alerts globally via `RecvError::Lagged(n)`
-- **Non-blocking:** Producers never block when queue is full
-- **Fan-out:** `NotificationWorker` sends to ALL destinations in parallel via `join_all`
+- **Capacity:** exactly 100 alerts **per destination** (constant `DEFAULT_QUEUE_CAPACITY`, no rounding), so at most 100 × number of notifiers alerts are pending overall
+- **Routing:** `send` puts the alert (shared via `Arc`, not copied) in the queue of each of its destinations; a destination unknown to the registry is logged and counted (`notifier_type="unknown"`)
+- **Drop Oldest:** when a destination queue is full, its oldest alert is dropped; `valerter_alerts_dropped_total` and `valerter_destination_alerts_dropped_total{notifier_name, notifier_type}` are incremented at once, and the destination task logs `Queue full, dropping N oldest alerts` (fields `dropped_count`, `notifier`) when it takes its next alert
+- **Non-blocking:** producers never block, even when a destination queue is full
+- **Delivery:** `NotificationWorker` runs one task per destination, each delivering its alerts one by one in arrival order (FIFO per destination)
+- **Panic isolation:** a panic during a send is caught, logged and counted in `valerter_notify_errors_total` / `valerter_alerts_failed_total`; the destination continues with its next alert
+- **Shutdown:** on cancellation each destination task stops once its in-flight send is over and its queue is closed; further sends fail with `notification queue closed`
 
 ```
-RuleEngine (producers)              NotificationWorker (consumer)
-    │                                       │
-    ├── rule_task ─┐                        │
-    ├── rule_task ──┼── broadcast::Sender ──┼── broadcast::Receiver
-    └── rule_task ─┘                        │
-                                            ▼
-                                    NotifierRegistry
-                                       ├── mattermost-ops
-                                       ├── email-alerts
-                                       └── webhook-pagerduty
+RuleEngine (producers)        NotificationQueue (router)       Destination tasks
+    │                                │
+    ├── rule_task ─┐                 ├── queue[mattermost-ops]  ──► task ──► mattermost-ops
+    ├── rule_task ──┼── send() ──────┼── queue[email-alerts]    ──► task ──► email-alerts
+    └── rule_task ─┘                 └── queue[webhook-pager]   ──► task ──► webhook-pager
 ```
 
 ## Fail-Fast Validation
@@ -192,9 +199,9 @@ Files are loaded alphabetically. Duplicate names across files cause startup fail
 ## Metrics Pipeline
 
 ```
-Rule tasks ─────┐
-                ├──► metrics::counter!() ──► Prometheus Recorder ──► /metrics
-NotificationWorker ─┘
+Rule tasks ──────────┐
+                     ├──► metrics::counter!() ──► Prometheus Recorder ──► /metrics
+Destination tasks ───┘
 ```
 
 Metrics are emitted throughout the pipeline:

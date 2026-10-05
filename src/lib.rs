@@ -17,7 +17,9 @@ pub mod throttle;
 // Re-export commonly used types
 pub use cli::LogFormat;
 pub use engine::RuleEngine;
-pub use metrics::{MetricsServer, initialize_metrics, register_metric_descriptions};
+pub use metrics::{
+    MetricsServer, initialize_destination_metrics, initialize_metrics, register_metric_descriptions,
+};
 pub use notify::{
     AlertPayload, DEFAULT_QUEUE_CAPACITY, MattermostNotifier, NotificationQueue,
     NotificationWorker, Notifier, NotifierRegistry, backoff_delay,
