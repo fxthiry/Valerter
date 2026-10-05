@@ -1,31 +1,38 @@
 //! Template and color validation utilities.
 
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value};
-use minijinja::{Environment, UndefinedBehavior};
+use minijinja::{Environment, Error, ErrorKind, State, UndefinedBehavior};
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
-/// Sentinel context object used during template validation.
+/// Sentinel value used during template validation.
 ///
 /// Issue #25: validating templates that reference dotted VictoriaLogs fields
 /// (`{{ nginx.http.request_id }}`) used to fail because chained attribute access
 /// against an empty `json!({})` returned `undefined` instead of another value.
 ///
-/// `TruthyChainable` returns itself on every attribute access (so chains never
-/// hit `undefined`), is always truthy (so `{% if x.y %}` walks the body and
-/// validates filters/syntax inside), stringifies as empty, and iterates as an
-/// empty sequence (so `{% for x in tc %}` and `{{ tc | length }}` do not error
-/// — matching the prior `Lenient + json!({})` behaviour).
+/// `TruthyChainable` returns another sentinel on every attribute access (so
+/// chains never hit `undefined`), is always truthy (so `{% if x.y %}` walks the
+/// body and validates filters/syntax inside), stringifies as empty, and
+/// iterates as an empty sequence (so `{% for x in tc %}` and `{{ tc | length }}`
+/// do not error — matching the prior `Lenient + json!({})` behaviour).
+///
+/// Calling a sentinel means the template called a name that is neither a
+/// global function nor a method of a real value (`{{ nosuchfunc() }}`,
+/// `{{ host.nosuch() }}`): it fails with `UnknownFunction`, which
+/// [`validate_template_render`] rejects.
 #[derive(Debug)]
-struct TruthyChainable;
+struct TruthyChainable {
+    name: String,
+}
 
 impl Object for TruthyChainable {
     fn repr(self: &Arc<Self>) -> ObjectRepr {
         ObjectRepr::Seq
     }
 
-    fn get_value(self: &Arc<Self>, _key: &Value) -> Option<Value> {
-        Some(Value::from_dyn_object(self.clone()))
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        Some(TruthyChainable::named(key))
     }
 
     fn enumerate(self: &Arc<Self>) -> Enumerator {
@@ -36,8 +43,40 @@ impl Object for TruthyChainable {
         true
     }
 
+    fn call(self: &Arc<Self>, _state: &State<'_, '_>, _args: &[Value]) -> Result<Value, Error> {
+        Err(Error::new(
+            ErrorKind::UnknownFunction,
+            format!("{} is not a known function or method", self.name),
+        ))
+    }
+
     fn render(self: &Arc<Self>, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
+    }
+}
+
+impl TruthyChainable {
+    fn named(key: &Value) -> Value {
+        let name = key.as_str().map_or_else(|| key.to_string(), str::to_string);
+        Value::from_object(TruthyChainable { name })
+    }
+}
+
+/// Root context of a validation render: every top-level name is a
+/// [`TruthyChainable`], except the environment's globals (`range`, `dict`,
+/// `namespace`…), which must stay reachable as in a real render.
+#[derive(Debug)]
+struct ValidationRoot {
+    globals: Vec<String>,
+}
+
+impl Object for ValidationRoot {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let name = key.as_str()?;
+        if self.globals.iter().any(|g| g == name) {
+            return None;
+        }
+        Some(TruthyChainable::named(key))
     }
 }
 
@@ -49,11 +88,19 @@ pub(crate) fn validate_jinja_template(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates a Jinja template by performing a test render with empty data.
-/// Detects runtime errors like unknown filters.
+/// Validates a Jinja template by performing a test render against a sentinel
+/// context where every field is defined and truthy.
+///
+/// The sentinel cannot stand for every real value (a sequence is not a number
+/// or a string), so only errors that do not depend on the event's values are
+/// reported: syntax errors, unknown filters, tests, functions and methods, and
+/// the `/` operator applied to a field path (issue #41). Any other runtime
+/// error (`| int`, `| float`, `| round`, arithmetic…) is caused by the fake
+/// context and accepted.
 ///
 /// # Errors
-/// Returns an error string if the template syntax is invalid or uses unknown filters.
+/// Returns an error string if the template syntax is invalid, uses an unknown
+/// filter, test, function or method, or divides field paths.
 pub fn validate_template_render(source: &str) -> Result<(), String> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
@@ -63,16 +110,39 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
     let tmpl = env
         .get_template("_render_test")
         .map_err(|e| e.to_string())?;
-    tmpl.render(Value::from_object(TruthyChainable))
-        .map_err(|e| {
-            let msg = e.to_string();
-            match slash_field_hint(source) {
-                Some(hint) if msg.contains("/ operator") => format!("{msg}\n  hint: {hint}"),
-                _ => msg,
-            }
-        })?;
+    let root = ValidationRoot {
+        globals: env.globals().map(|(name, _)| name.to_string()).collect(),
+    };
+    let Err(err) = tmpl.render(Value::from_object(root)) else {
+        return Ok(());
+    };
 
-    Ok(())
+    let msg = err.to_string();
+    match err.kind() {
+        ErrorKind::SyntaxError
+        | ErrorKind::UnknownFilter
+        | ErrorKind::UnknownTest
+        | ErrorKind::UnknownFunction
+        | ErrorKind::UnknownMethod => Err(msg),
+        ErrorKind::InvalidOperation if msg.contains("/ operator") => {
+            match slash_field_hint(source) {
+                Some(hint) => Err(format!("{msg}\n  hint: {hint}")),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks a notifier-level template (`body_template`, `subject_template`):
+/// syntax first, then a render test (see [`validate_template_render`]).
+/// Errors read `<field>: <error>` or `<field> render: <error>`.
+///
+/// Called when notifiers are built, so the check runs at daemon startup and
+/// in `--validate` (preflight), never in `Config::validate()`.
+pub fn validate_notifier_template(field: &str, source: &str) -> Result<(), String> {
+    validate_jinja_template(source).map_err(|e| format!("{field}: {e}"))?;
+    validate_template_render(source).map_err(|e| format!("{field} render: {e}"))
 }
 
 /// Matches an identifier path containing a `/` inside a `{{ ... }}` expression,
@@ -85,20 +155,23 @@ static SLASH_FIELD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// annotations like `authentication.openshift.io/username`). In a Jinja
 /// expression `/` is the division operator, so `{{ a.b.io/username }}` fails
 /// to render. Returns a hint with the bracket-notation rewrite when the
-/// template contains such a path.
+/// template contains such a path. A top-level field (`{{ io/username }}`) has
+/// no parent object to index, so the hint suggests renaming it in the query.
 pub(crate) fn slash_field_hint(source: &str) -> Option<String> {
     let caps = SLASH_FIELD_REGEX.captures(source)?;
     let left = &caps[1];
     let right = &caps[2];
-    let (prefix, leaf) = match left.rfind('.') {
-        Some(i) => (&left[..i], &left[i + 1..]),
-        None => ("", left),
+    let Some((prefix, leaf)) = left.rsplit_once('.') else {
+        let field = format!("{left}/{right}");
+        let renamed = field.replace(['/', '.', '-'], "_");
+        return Some(format!(
+            "field names containing '/' must use bracket notation on their parent object; \
+             a top-level field like '{field}' has no parent and cannot be referenced directly: \
+             rename it in the rule query, e.g. `| rename \"{field}\" as {renamed}`, then use `{{{{ {renamed} }}}}` \
+             (see docs/configuration.md#fields-with-special-characters)"
+        ));
     };
-    let rewrite = if prefix.is_empty() {
-        format!("{{{{ fields[\"{leaf}/{right}\"] }}}}")
-    } else {
-        format!("{{{{ {prefix}[\"{leaf}/{right}\"] }}}}")
-    };
+    let rewrite = format!("{{{{ {prefix}[\"{leaf}/{right}\"] }}}}");
     Some(format!(
         "field names containing '/' must use bracket notation, e.g. `{rewrite}` \
          (in Jinja, '/' is the division operator; see docs/configuration.md#fields-with-special-characters)"
@@ -153,11 +226,21 @@ pub(crate) fn validate_tail_query(query: &str) -> Result<(), String> {
 /// secrets and this message ends up in logs.
 ///
 /// Values containing an unresolved `${VAR}` placeholder are accepted here;
-/// they are resolved (and re-checked) when the notifier is built.
+/// they are resolved (and re-checked with [`validate_resolved_url`]) when the
+/// notifier is built.
 pub(crate) fn validate_url(url: &str) -> Result<(), String> {
     if url.contains("${") {
         return Ok(());
     }
+    validate_resolved_url(url)
+}
+
+/// Validates a URL whose `${VAR}` placeholders have already been resolved:
+/// it must parse and use the `http` or `https` scheme. No exception is made
+/// for a value still containing `${`.
+///
+/// Like [`validate_url`], the URL is never echoed in the error.
+pub fn validate_resolved_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => Ok(()),
@@ -309,9 +392,78 @@ mod tests {
     }
 
     #[test]
-    fn slash_field_hint_top_level_key() {
+    fn slash_field_hint_top_level_key_suggests_rename() {
         let hint = slash_field_hint("{{ io/username }}").expect("hint");
-        assert!(hint.contains(r#"{{ fields["io/username"] }}"#), "{hint}");
+        assert!(hint.contains("rename"), "{hint}");
+        assert!(
+            hint.contains(r#"| rename "io/username" as io_username"#),
+            "{hint}"
+        );
+        assert!(hint.contains("{{ io_username }}"), "{hint}");
+        assert!(!hint.contains("fields["), "{hint}");
+    }
+
+    #[test]
+    fn validate_template_render_top_level_slash_field_is_rejected_with_rename_hint() {
+        let err = validate_template_render("{{ io/username }}").unwrap_err();
+        assert!(err.contains("/ operator"), "{err}");
+        assert!(err.contains("rename"), "{err}");
+        assert!(!err.contains("fields["), "{err}");
+    }
+
+    // ============================================================
+    // D1: only value-independent errors fail the render test
+    // ============================================================
+
+    #[test]
+    fn validate_template_render_accepts_type_conversions_on_fields() {
+        for source in [
+            "{{ status | int }}",
+            "{{ latency | float }}",
+            "{{ (latency | float) > 1.5 }}",
+            "{{ ratio | round }}",
+            "{{ delta | abs }}",
+            "{{ tags | split(',') | first }}",
+            "{{ count + 1 }}",
+            "{{ host }}-{{ status | int }}",
+        ] {
+            assert!(
+                validate_template_render(source).is_ok(),
+                "{source} should validate: {:?}",
+                validate_template_render(source)
+            );
+        }
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_test() {
+        let err = validate_template_render("{% if host is nosuchtest %}x{% endif %}").unwrap_err();
+        assert!(err.contains("nosuchtest"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_function() {
+        let err = validate_template_render("{{ nosuchfunc() }}").unwrap_err();
+        assert!(err.contains("nosuchfunc"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_method() {
+        let err = validate_template_render("{{ host.nosuchmethod() }}").unwrap_err();
+        assert!(err.contains("nosuchmethod"), "{err}");
+        let err = validate_template_render("{{ 'a'.upper() }}").unwrap_err();
+        assert!(err.contains("upper"), "{err}");
+    }
+
+    #[test]
+    fn validate_template_render_keeps_global_functions_reachable() {
+        assert!(validate_template_render("{% for i in range(3) %}{{ i }}{% endfor %}").is_ok());
+        assert!(validate_template_render("{% set ns = namespace(n=0) %}{{ ns.n }}").is_ok());
+    }
+
+    #[test]
+    fn validate_template_render_accepts_escaping_filters() {
+        assert!(validate_template_render("{{ title | tojson }} {{ body | e }}").is_ok());
     }
 
     #[test]
@@ -359,6 +511,25 @@ mod tests {
         let err = validate_url("ftp://example.com/x").unwrap_err();
         assert!(err.contains("unsupported scheme"), "{err}");
         assert!(validate_url("https://example.com/hooks/x").is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_url_rejects_bad_scheme_without_echoing_url() {
+        let err = validate_resolved_url("ftp://vl.example.com:9428/SECRET").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid URL: unsupported scheme 'ftp' (expected http or https)"
+        );
+        let err = validate_resolved_url("not a url SECRET").unwrap_err();
+        assert!(err.starts_with("invalid URL:"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn validate_resolved_url_has_no_placeholder_exception() {
+        let err = validate_resolved_url("${VL_URL}").unwrap_err();
+        assert!(err.starts_with("invalid URL:"), "{err}");
+        assert!(validate_resolved_url("https://vl.example.com:9428").is_ok());
     }
 
     #[test]

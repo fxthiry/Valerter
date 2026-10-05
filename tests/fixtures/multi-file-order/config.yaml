@@ -1,0 +1,29 @@
+# Config for testing the deterministic order of rules loaded from rules.d/
+
+victorialogs:
+  default:
+    url: http://victorialogs:9428
+
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+
+templates:
+  default_alert:
+    title: "Alert"
+    body: "{{ _msg }}"
+
+rules:
+  - name: main_rule
+    query: "_msg:main"
+    parser:
+      regex: "(?P<m>.*)"
+    notify:
+      template: default_alert
+      destinations: [test]

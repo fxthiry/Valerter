@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::{NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars};
+use crate::config::{
+    NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars, validate_resolved_url,
+};
 use crate::error::ConfigError;
 
 use super::{EmailNotifier, MattermostNotifier, Notifier, TelegramNotifier, WebhookNotifier};
@@ -172,6 +174,12 @@ impl NotifierRegistry {
                             message: format!("webhook_url: {}", e),
                         }
                     })?;
+                // `Config::validate()` skips URLs holding a `${VAR}`: re-check
+                // the resolved value (never echoed, it carries the hook token).
+                validate_resolved_url(&resolved_url).map_err(|e| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message: format!("webhook_url: {}", e),
+                })?;
 
                 let notifier = MattermostNotifier::with_options(
                     name.to_string(),

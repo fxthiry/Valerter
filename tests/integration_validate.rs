@@ -603,3 +603,47 @@ fn validate_makes_no_network_call() {
         elapsed
     );
 }
+
+// Test: --validate render-tests notifier body templates (preflight)
+#[test]
+fn validate_webhook_body_template_unknown_filter_exits_failure() {
+    let output = run_validate("config_webhook_body_template_unknown_filter.yaml", &[]);
+    let stderr = assert_preflight_failure(&output);
+
+    assert!(
+        stderr.contains("Notifier configuration error"),
+        "stderr should log a notifier configuration error: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("invalid notifier 'wh': body_template render:"),
+        "stderr should report the body_template render error: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("nosuchfilter"),
+        "stderr should name the unknown filter: {}",
+        stderr
+    );
+}
+
+// Test: --validate rejects an unsupported Telegram parse_mode (preflight)
+#[test]
+fn validate_telegram_unsupported_parse_mode_exits_failure() {
+    let output = run_validate("config_telegram_unsupported_parse_mode.yaml", &[]);
+    let stderr = assert_preflight_failure(&output);
+
+    assert!(
+        stderr.contains("Notifier configuration error"),
+        "stderr should log a notifier configuration error: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(
+            "invalid notifier 'tg': parse_mode 'Markdown2' is not supported \
+             (expected HTML, MarkdownV2 or Markdown)"
+        ),
+        "stderr should report the unsupported parse_mode: {}",
+        stderr
+    );
+}
