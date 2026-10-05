@@ -45,8 +45,8 @@ notifiers:
   mattermost-ops:
     type: mattermost
     # Replace with your real webhook. Environment variables (e.g.
-    # `webhook_url: "${WEBHOOK_URL}"`) work too, but `--validate` parses the
-    # raw string as a URL so it must be valid at validate time.
+    # `webhook_url: "${WEBHOOK_URL}"`) work too, but the variable must be
+    # defined when running `--validate`, which builds every notifier.
     webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
     username: "Valerter"
 

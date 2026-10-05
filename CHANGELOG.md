@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A configuration whose rules are all disabled is now refused.** `Config::validate()` reports `all rules are disabled: enable at least one rule in config.yaml or rules.d/`, so `valerter --validate` flags it and the daemon refuses to start (exit code 1) instead of starting and exiting immediately with code 0. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
 - **`Connection failed, retrying` now logs the delay in milliseconds (`delay_ms`) instead of whole seconds (`delay_secs`)**, which logged `0` for sub-second delays. Log filters on `delay_secs` must be updated. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
 - **A custom `Authorization` header now masks `basic_auth`.** Both used to be sent and the server picked one; the custom header now wins and a warning (without any value) is logged at the start of each affected (rule, source) task.
+- **`--validate` now runs every startup check.** Besides loading and validating the configuration, it compiles it, builds every notifier (resolving `${VAR}` placeholders in notifier secrets, reading `body_template_file`), checks that every rule destination exists and that templates sent to email destinations define `email_body_html`, and emits the `mattermost_channel ignored` warning, with the same messages and exit code 1 as the daemon. It still starts nothing and makes no network call. **Breaking for CI pipelines that validated without secrets:** environment variables referenced by notifiers must now be defined when running `--validate`. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
+- **The `--validate` summary gains a `Notifiers: <n> [<name>=<type>, ...]` line** after `Templates`.
+- **Startup now reports every notifier, destination and email template error in one pass** instead of stopping at the first failed stage (same messages and exit code). A notifier that fails to build is no longer also reported as an unknown destination.
+
+### Security
+
+- **`--validate` no longer prints VictoriaLogs source credentials.** The summary showed each source URL after `${VAR}` resolution, so `http://user:secret@vl:9428?token=abc` reached stdout (often captured by CI). Credentials and query strings are now replaced by `***` and fragments dropped (`http://***@vl:9428/?***`); URLs without such parts are printed unchanged.
 
 ## [2.0.3] - 2026-08-26
 

@@ -1,0 +1,35 @@
+# Fixture: errors in two preflight stages at once.
+# - notifier 'mattermost-ops' references an undefined environment variable;
+# - rule 'r' also targets the undeclared notifier 'nope'.
+# Both errors must be reported, and 'mattermost-ops' must not be reported as unknown.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "${VALERTER_TEST_UNSET_VAR}"
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "mattermost-ops"
+        - "nope"

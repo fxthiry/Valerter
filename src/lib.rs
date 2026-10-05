@@ -8,6 +8,7 @@ pub mod error;
 pub mod metrics;
 pub mod notify;
 pub mod parser;
+pub mod preflight;
 pub mod stream_buffer;
 pub mod tail;
 pub mod template;
@@ -22,6 +23,7 @@ pub use notify::{
     NotificationWorker, Notifier, NotifierRegistry, backoff_delay,
 };
 pub use parser::{RuleParser, record_log_matched, record_parse_error};
+pub use preflight::{PreflightError, PreflightReport, build_http_client, run_preflight};
 pub use stream_buffer::StreamBuffer;
 pub use template::{RenderedMessage, TemplateEngine};
 pub use throttle::{ThrottleResult, Throttler};

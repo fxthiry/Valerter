@@ -114,6 +114,13 @@ rules:
 valerter --validate
 ```
 
+`--validate` builds every notifier: if your notifiers reference environment variables (for example `webhook_url: "${MATTERMOST_WEBHOOK}"`), export them in the shell first, with the same values the service gets (for example from a systemd drop-in with `Environment=`):
+
+```bash
+export MATTERMOST_WEBHOOK="https://mattermost.example.com/hooks/your-webhook-id"
+valerter --validate
+```
+
 ### 3. Start the Service
 
 ```bash

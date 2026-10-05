@@ -1,0 +1,33 @@
+# Fixture: a rule sets mattermost_channel without any Mattermost destination.
+# Valid configuration: the preflight only emits a warning.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  webhook-ops:
+    type: webhook
+    url: "https://hooks.invalid/alert"
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      mattermost_channel: "alerts"
+      destinations:
+        - "webhook-ops"
