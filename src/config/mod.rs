@@ -19,7 +19,7 @@ pub use notifiers::{
 pub use runtime::{
     CompiledParser, CompiledRule, CompiledTemplate, CompiledThrottle, RuntimeConfig,
 };
-pub use secret::SecretString;
+pub use secret::{SecretString, redact_url};
 pub use types::{
     BasicAuthConfig, Config, DEFAULT_CONFIG_PATH, DEFAULT_MAX_STREAMS, DefaultsConfig,
     JsonParserConfig, MetricsConfig, NotifyConfig, ParserConfig, RuleConfig, TemplateConfig,

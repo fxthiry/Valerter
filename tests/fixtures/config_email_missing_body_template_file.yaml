@@ -1,0 +1,41 @@
+# Fixture: an email notifier points to a body_template_file that does not exist.
+# Passes Config::validate(); rejected by the preflight (Notifier configuration error).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+    email_body_html: "<p>{{ _msg }}</p>"
+
+notifiers:
+  email-ops:
+    type: email
+    smtp:
+      host: "smtp.invalid"
+      port: 587
+      tls: starttls
+    from: "alerts@example.com"
+    to:
+      - "team@example.com"
+    subject_template: "[Alert] {{ title }}"
+    body_template_file: "templates/does-not-exist.html.j2"
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "email-ops"

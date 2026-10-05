@@ -29,9 +29,9 @@ Source names must match `^[a-zA-Z0-9_]+$` (alphanumeric or underscore only). No 
 export VL_PROD_USER="prod_user"
 export VL_PROD_PASS="prod_password"
 
-# Edit webhook_url in config.yaml to point at your real Mattermost hook
-# (--validate parses webhook_url as a URL, so it must be valid at validate time;
-#  ${WEBHOOK_URL} expansion is fine for runtime but not for `--validate`).
+# Edit webhook_url in config.yaml to point at your real Mattermost hook.
+# `webhook_url: "${WEBHOOK_URL}"` works too, but WEBHOOK_URL must then be
+# exported before `--validate`, which builds every notifier.
 
 # Validate the config
 valerter --validate -c examples/multi-source/config.yaml

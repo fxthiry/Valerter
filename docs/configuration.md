@@ -330,7 +330,7 @@ with bracket notation:
 
 ### email_body_html Requirement
 
-**Important:** Templates used with email destinations MUST include `email_body_html`. Valerter validates this at startup and will fail if missing.
+**Important:** Templates used with email destinations MUST include `email_body_html`. Valerter validates this at startup and in `--validate`, and fails if missing.
 
 ## Rules
 
@@ -439,8 +439,9 @@ sudo chown valerter:valerter /etc/valerter/config.yaml
 
 `${VAR_NAME}` placeholders are resolved at startup in notifier secrets
 (`webhook_url`, `url`, `headers`, `bot_token`, SMTP `username`/`password`) and
-in VictoriaLogs sources (`url`, `basic_auth.username`/`password`, `headers`).
-An undefined variable is a load error.
+in VictoriaLogs sources (`url`, `basic_auth.username`/`password`, `headers`),
+both at daemon startup and by `valerter --validate`. An undefined variable is
+an error: they must therefore also be defined when running `--validate`.
 
 For Kubernetes or orchestrators, use `${VAR_NAME}` syntax:
 
@@ -472,10 +473,11 @@ These variables are read directly by the process (not substituted in config):
 valerter [OPTIONS]
 
 Options:
-  -c, --config <PATH>  Path to configuration file [default: /etc/valerter/config.yaml]
-      --validate       Validate configuration and exit
-  -h, --help           Print help
-  -V, --version        Print version
+  -c, --config <CONFIG>            Path to configuration file [default: /etc/valerter/config.yaml]
+      --validate                   Validate configuration and exit
+      --log-format <LOG_FORMAT>    Log format: text or json [env: LOG_FORMAT=] [default: text]
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 ## Validation
@@ -483,16 +485,34 @@ Options:
 Always validate before deploying:
 
 ```bash
-valerter --validate
+valerter --validate -c /etc/valerter/config.yaml
 ```
 
-This checks:
-- YAML syntax
-- Required fields
-- Template syntax
-- Notifier configuration
-- Rule destinations exist
-- Email templates have `email_body_html`
+`--validate` runs every blocking check of the daemon startup, with the same error messages and exit code 1 on failure:
+
+1. **Loading** — YAML syntax, unknown fields, `config.d/` merge, `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
+2. **Validation** — required fields, regexes, template syntax, source names, `max_streams` cap, at least one enabled rule
+3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids` and notifier templates are checked
+4. **Rule destinations** — every rule destination (enabled or not) names a declared notifier
+5. **Email body** — templates of enabled rules sent to email destinations define `email_body_html`
+6. **Warning** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination (exit code stays 0)
+
+Errors from steps 3 to 5 are all reported in one pass. No daemon, metrics server or network connection is started: VictoriaLogs sources, SMTP servers and webhooks do not need to be reachable.
+
+Because notifiers are built, **every environment variable referenced by a notifier must be defined when running `--validate`**, including in CI (dummy values are fine, nothing is sent). Run it as a user that can read the `body_template_file` files.
+
+On success, a summary is printed on stdout:
+
+```
+Configuration is valid: /etc/valerter/config.yaml
+  VictoriaLogs sources: 2 [default=http://localhost:9428, prod=https://***@vl.example.com:9428/?***]
+  Rules: 3 (2 enabled)
+  Templates: 2
+  Notifiers: 2 [email-ops=email, mattermost-ops=mattermost]
+  Metrics: enabled (port 9090)
+```
+
+Source URLs are redacted: credentials are replaced by `***`, the query string by `***` and the fragment is dropped. URLs without such parts are printed unchanged.
 
 ## See Also
 

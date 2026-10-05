@@ -12,10 +12,10 @@ use tracing::{error, info};
 use tokio::signal::unix::{SignalKind, signal};
 
 use valerter::cli::{Cli, LogFormat};
-use valerter::config::{Config, RuntimeConfig};
+use valerter::config::{Config, RuntimeConfig, redact_url};
 use valerter::{
-    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, NotifierRegistry,
-    RuleEngine,
+    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, RuleEngine,
+    build_http_client, run_preflight,
 };
 
 /// Initialize the tracing subscriber with the specified log format.
@@ -75,143 +75,6 @@ async fn shutdown_signal() {
     info!("Received shutdown signal (Ctrl+C)");
 }
 
-/// Create notifier registry from configuration.
-///
-/// Reads the `notifiers:` section from the configuration and creates
-/// a registry of all configured notifiers.
-///
-/// # Returns
-///
-/// * `Ok(registry)` - Registry of all configured notifiers
-/// * `Err` - No notifiers configured or configuration error
-fn create_notifier_registry(
-    config: &RuntimeConfig,
-    http_client: reqwest::Client,
-) -> Result<NotifierRegistry> {
-    let notifiers_config = config
-        .notifiers
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No notifiers configured"))?;
-
-    // Create registry from config
-    let registry = NotifierRegistry::from_config(notifiers_config, http_client, &config.config_dir)
-        .map_err(|errors| {
-            for e in &errors {
-                error!(error = %e, "Notifier configuration error");
-            }
-            anyhow::anyhow!("Failed to create notifiers: {} errors", errors.len())
-        })?;
-
-    info!(
-        notifier_count = registry.len(),
-        "Created notifiers from config"
-    );
-
-    Ok(registry)
-}
-
-/// Validate that templates used with email destinations have email_body_html.
-///
-/// For each enabled rule, if any of its destinations is an email notifier,
-/// the template must have email_body_html defined. This is a fail-fast validation
-/// to prevent runtime errors.
-fn validate_email_templates(
-    config: &valerter::config::RuntimeConfig,
-    registry: &NotifierRegistry,
-) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-
-    for rule in &config.rules {
-        if !rule.enabled {
-            continue;
-        }
-
-        // Determine which destinations this rule uses
-        let destinations: Vec<&str> = rule
-            .notify
-            .destinations
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-
-        // Check if any destination is email
-        let has_email_destination = destinations.iter().any(|dest| {
-            registry
-                .get(dest)
-                .map(|n| n.notifier_type() == "email")
-                .unwrap_or(false)
-        });
-
-        if !has_email_destination {
-            continue;
-        }
-
-        // Get the template name for this rule
-        let template_name = &rule.notify.template;
-
-        // Check if template has email_body_html
-        if let Some(template) = config.templates.get(template_name)
-            && template.email_body_html.is_none()
-        {
-            let email_dests: Vec<_> = destinations
-                .iter()
-                .filter(|dest| {
-                    registry
-                        .get(dest)
-                        .map(|n| n.notifier_type() == "email")
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            errors.push(format!(
-                "template '{}' requires email_body_html field when used with email destination{} {} (rule '{}')",
-                template_name,
-                if email_dests.len() > 1 { "s" } else { "" },
-                email_dests.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
-                rule.name
-            ));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Warn if mattermost_channel is set but no Mattermost notifier is in destinations.
-fn warn_unused_mattermost_channels(
-    config: &valerter::config::RuntimeConfig,
-    registry: &NotifierRegistry,
-) {
-    for rule in &config.rules {
-        if !rule.enabled {
-            continue;
-        }
-
-        // Check if mattermost_channel is set
-        if rule.notify.mattermost_channel.is_none() {
-            continue;
-        }
-
-        // Check if any destination is a Mattermost notifier
-        let has_mattermost = rule.notify.destinations.iter().any(|dest| {
-            registry
-                .get(dest)
-                .map(|n| n.notifier_type() == "mattermost")
-                .unwrap_or(false)
-        });
-
-        if !has_mattermost {
-            tracing::warn!(
-                rule_name = %rule.name,
-                "mattermost_channel ignored - no mattermost notifier in destinations"
-            );
-        }
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -242,39 +105,21 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Validate mode: display success and exit
-    if cli.validate {
-        println!("Configuration is valid: {}", cli.config.display());
-        println!(
-            "  VictoriaLogs sources: {} [{}]",
-            config.victorialogs.len(),
-            config
-                .victorialogs
-                .iter()
-                .map(|(name, src)| format!("{}={}", name, src.url))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!(
-            "  Rules: {} ({} enabled)",
-            config.rules.len(),
-            config.rules.iter().filter(|r| r.enabled).count()
-        );
-        println!("  Templates: {}", config.templates.len());
-        println!(
-            "  Metrics: {} (port {})",
-            if config.metrics.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            config.metrics.port
-        );
-        return Ok(());
-    }
-
     // Compile configuration for runtime (FR15)
     let runtime_config = config.compile(&cli.config)?;
+
+    // Validate mode: run the same preflight checks as the daemon startup,
+    // display a summary and exit without starting anything.
+    if cli.validate {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let report = runtime.block_on(async {
+            anyhow::Ok(run_preflight(&runtime_config, build_http_client()?)?)
+        })?;
+        print_validation_summary(&cli.config, &runtime_config, &report.registry);
+        return Ok(());
+    }
 
     info!(config_path = %cli.config.display(), "valerter starting");
 
@@ -287,51 +132,76 @@ fn main() -> Result<()> {
     runtime.block_on(run(runtime_config))
 }
 
+/// Print the `--validate` success summary on stdout.
+///
+/// Source URLs are redacted: they may embed credentials or tokens.
+fn print_validation_summary(
+    config_path: &std::path::Path,
+    config: &RuntimeConfig,
+    registry: &valerter::NotifierRegistry,
+) {
+    println!("Configuration is valid: {}", config_path.display());
+    println!(
+        "  VictoriaLogs sources: {} [{}]",
+        config.victorialogs.len(),
+        config
+            .victorialogs
+            .iter()
+            .map(|(name, src)| format!("{}={}", name, redact_url(&src.url)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  Rules: {} ({} enabled)",
+        config.rules.len(),
+        config.rules.iter().filter(|r| r.enabled).count()
+    );
+    println!("  Templates: {}", config.templates.len());
+    let mut notifiers: Vec<(&str, String)> = registry
+        .names()
+        .filter_map(|name| {
+            registry
+                .get(name)
+                .map(|n| (name, n.notifier_type().to_string()))
+        })
+        .collect();
+    notifiers.sort_unstable();
+    println!(
+        "  Notifiers: {} [{}]",
+        notifiers.len(),
+        notifiers
+            .iter()
+            .map(|(name, kind)| format!("{}={}", name, kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  Metrics: {} (port {})",
+        if config.metrics.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.metrics.port
+    );
+}
+
 /// Main async entry point.
-async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
+async fn run(runtime_config: RuntimeConfig) -> Result<()> {
     // Capture start time for uptime metric
     let start_time = Instant::now();
 
     // Create shared HTTP client for connection pooling (AD-03)
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let http_client = build_http_client()?;
 
     // Create notification queue (FR32: capacity 100)
     let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
 
-    // Create notifier registry (Story 6.2: named notifiers)
-    let registry = create_notifier_registry(&runtime_config, http_client.clone())?;
+    // Build notifiers and check rule destinations and email templates
+    // (same checks as --validate, every error reported before exiting)
+    let report = run_preflight(&runtime_config, http_client.clone())?;
 
-    // Validate rule destinations against registry (Story 6.3: fail-fast at startup)
-    let valid_notifiers: Vec<&str> = registry.names().collect();
-    if let Err(errors) = runtime_config.validate_rule_destinations(&valid_notifiers) {
-        for e in &errors {
-            error!(error = %e, "Destination validation error");
-        }
-        return Err(anyhow::anyhow!(
-            "Destination validation failed: {} errors",
-            errors.len()
-        ));
-    }
-    info!("All rule destinations validated successfully");
-
-    // Validate that templates used with email destinations have email_body_html (fail-fast)
-    if let Err(errors) = validate_email_templates(&runtime_config, &registry) {
-        for e in &errors {
-            error!(error = %e, "Email template validation error");
-        }
-        return Err(anyhow::anyhow!(
-            "Email template validation failed: {} errors",
-            errors.len()
-        ));
-    }
-    info!("All email templates validated successfully");
-
-    // Warn if mattermost_channel is set but no Mattermost notifier in destinations
-    warn_unused_mattermost_channels(&runtime_config, &registry);
-
-    let registry = Arc::new(registry);
+    let registry = Arc::new(report.registry);
 
     // Create notification worker with registry
     let mut worker = NotificationWorker::new(&queue, registry.clone());

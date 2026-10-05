@@ -160,11 +160,13 @@ At startup, Valerter validates (in order):
 2. **Required fields** — All mandatory fields present, at least one notifier, one template and one **enabled** rule (a config whose rules are all `enabled: false` is refused)
 3. **Template syntax** — All templates compile (minijinja)
 4. **Notifier config** — URLs, credentials, env vars resolve correctly
-5. **Destinations exist** — Rule destinations match notifier names in registry
+5. **Destinations exist** — Rule destinations match declared notifier names
 6. **Email template body** — Templates used with email destinations have `email_body_html`
 7. **Mattermost channel warning** — Warns if `mattermost_channel` set but no Mattermost notifier in destinations
 
-If any validation fails, Valerter exits immediately with a clear error message and exit code 1. `valerter --validate` runs the same configuration validation (`Config::validate()`), so a config with all rules disabled is reported there too.
+If any validation fails, Valerter exits with a clear error message and exit code 1. Steps 4 to 7 form the preflight (`src/preflight.rs`): all of its stages are evaluated before exiting, so every notifier, destination and email template error is reported in one pass, and a notifier that failed to build is not reported as an unknown destination.
+
+`valerter --validate` runs this exact sequence (same code, same messages, same exit code) and then prints a summary instead of starting the engine, the notification worker and the metrics server. It makes no network call.
 
 ### Multi-File Configuration
 

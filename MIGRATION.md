@@ -40,6 +40,23 @@ Run `valerter --validate -c /etc/valerter/config.yaml` before upgrading to catch
 - **A custom `Authorization` header now masks `basic_auth`.** When a source defines both `basic_auth` and `headers: { Authorization: ... }`, only the custom header is sent (previously both were sent and the server chose). A warning is logged at startup for each affected (rule, source) task. Keep only the credentials you actually want to use. Custom headers with the name of a default header (`Accept`, `Connection`) also replace it instead of being sent twice.
 - **`valerter_lines_discarded_total{reason="invalid_utf8"}` counts lines, not batches.** Only the invalid line is dropped now, and each one adds one unit, so the counter may grow faster than in 2.0.3 for the same stream. Revisit any alert threshold set on it.
 
+### `--validate` is stricter
+
+Until 2.0.3, `valerter --validate` stopped after loading and validating the configuration: a configuration with an unknown rule destination, an undefined notifier variable, a missing `body_template_file` or an email template without `email_body_html` passed it with exit code 0 and then failed at startup. `--validate` now runs every blocking startup check (same code, same messages, exit code 1), still without starting the daemon or making any network call.
+
+- **Define every environment variable referenced by notifiers when running `--validate`**, including in CI pipelines that validated without secrets. Dummy values are fine, nothing is sent:
+
+  ```bash
+  MATTERMOST_WEBHOOK="https://mattermost.example.com/hooks/dummy" \
+  SMTP_PASSWORD="dummy" \
+    valerter --validate -c config.yaml
+  ```
+
+  Variables used by VictoriaLogs sources were already required by `--validate`.
+- **`body_template_file` files must be readable** by the user running `--validate`, not only by the `valerter` service user.
+- **New errors you may now get from `--validate`:** `Notifier configuration error` (`Failed to create notifiers: N errors`), `Destination validation error` (`Destination validation failed: N errors`) and `Email template validation error` (`Email template validation failed: N errors`). All of them are reported in one run, and the daemon now does the same at startup instead of stopping at the first failed stage.
+- **Summary format.** A `  Notifiers: <n> [<name>=<type>, ...]` line is printed after `Templates`, and source URLs are redacted (`http://***@vl.example.com:9428/?***` for a URL carrying credentials or a query string; URLs without such parts are unchanged). Update scripts that parse this output.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

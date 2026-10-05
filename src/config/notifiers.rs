@@ -22,6 +22,19 @@ pub enum NotifierConfig {
     Telegram(TelegramNotifierConfig),
 }
 
+impl NotifierConfig {
+    /// Notifier type name, identical to `Notifier::notifier_type()` of the
+    /// notifier built from this configuration.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            NotifierConfig::Mattermost(_) => "mattermost",
+            NotifierConfig::Webhook(_) => "webhook",
+            NotifierConfig::Email(_) => "email",
+            NotifierConfig::Telegram(_) => "telegram",
+        }
+    }
+}
+
 /// Configuration for a Mattermost notifier instance.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,6 +253,48 @@ mod tests {
             result.is_err(),
             "icon_url should be rejected by deny_unknown_fields"
         );
+    }
+
+    #[test]
+    fn type_name_matches_built_notifier_type() {
+        let yaml = r#"
+            mm:
+              type: mattermost
+              webhook_url: "https://mattermost.example.com/hooks/x"
+            wh:
+              type: webhook
+              url: "https://hooks.example.com/alert"
+            mail:
+              type: email
+              smtp:
+                host: smtp.example.com
+                port: 587
+              from: "alerts@example.com"
+              to: ["ops@example.com"]
+              subject_template: "{{ title }}"
+            tg:
+              type: telegram
+              bot_token: "123:abc"
+              chat_ids: ["-1"]
+        "#;
+        let config: NotifiersConfig = serde_yaml::from_str(yaml).unwrap();
+        let registry = crate::notify::NotifierRegistry::from_config(
+            &config,
+            reqwest::Client::new(),
+            std::path::Path::new("."),
+        )
+        .expect("all notifiers should build");
+
+        assert_eq!(registry.len(), 4);
+        for (name, notifier_config) in &config {
+            let notifier = registry.get(name).expect("notifier registered");
+            assert_eq!(
+                notifier_config.type_name(),
+                notifier.notifier_type(),
+                "type name mismatch for '{}'",
+                name
+            );
+        }
     }
 
     #[test]

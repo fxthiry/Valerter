@@ -24,7 +24,7 @@ Le système MUST refuser une configuration ne déclarant aucun notifier après f
 - **THEN** la validation échoue avec le message `invalid configuration: no notifiers configured: add notifiers in config.yaml or notifiers.d/`
 
 ### Requirement: Construction du registre au démarrage avec collecte des erreurs
-Le système SHALL instancier tous les notifiers au démarrage du démon (après la validation de la configuration, pas en mode `--validate`), MUST collecter toutes les erreurs d'instanciation plutôt que s'arrêter à la première, journaliser chacune sous `Notifier configuration error`, puis refuser de démarrer avec l'erreur `Failed to create notifiers: <N> errors`.
+Le système SHALL instancier tous les notifiers au démarrage du démon comme en mode `--validate` (après la validation de la configuration), MUST collecter toutes les erreurs d'instanciation plutôt que s'arrêter à la première, journaliser chacune sous `Notifier configuration error`, puis refuser de démarrer avec l'erreur `Failed to create notifiers: <N> errors` ; l'instanciation MUST NOT effectuer d'appel réseau.
 
 #### Scenario: Deux notifiers invalides
 - **WHEN** deux notifiers référencent chacun une variable d'environnement non définie
@@ -33,7 +33,11 @@ Le système SHALL instancier tous les notifiers au démarrage du démon (après 
 
 #### Scenario: Mode validation
 - **WHEN** le binaire est lancé avec `--validate` sur une configuration dont un notifier référence une variable d'environnement non définie
-- **THEN** la validation réussit car les notifiers ne sont pas instanciés dans ce mode
+- **THEN** l'erreur est journalisée sous `Notifier configuration error` et le processus se termine avec le code 1 sans afficher de récapitulatif
+
+#### Scenario: Instanciation sans réseau
+- **WHEN** les notifiers sont instanciés (démarrage ou `--validate`) alors que leurs serveurs SMTP, webhooks ou API sont injoignables
+- **THEN** l'instanciation réussit ; les erreurs de connexion n'apparaissent qu'à l'envoi d'une alerte
 
 ### Requirement: Substitution des variables d'environnement dans les secrets des notifiers
 Le système SHALL remplacer, à l'instanciation des notifiers, chaque motif `${NOM}` (NOM conforme à `[A-Za-z_][A-Za-z0-9_]*`) des champs secrets par la valeur de la variable d'environnement correspondante, et MUST échouer si une variable est absente avec un message listant toutes les variables manquantes (`undefined environment variable: A` ou `undefined environment variables: A, B`) préfixé par `invalid notifier '<nom>': <champ>: `.

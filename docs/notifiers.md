@@ -203,7 +203,7 @@ templates:
     email_body_html: "<p>{{ body }}</p>"    # REQUIRED for email
 ```
 
-Valerter validates this at startup and will fail if missing.
+Valerter validates this at startup and in `valerter --validate`, and fails if missing.
 
 ### Custom Email Templates
 
