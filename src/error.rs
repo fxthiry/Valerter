@@ -81,15 +81,11 @@ pub enum QueueError {
 pub enum RuleError {
     #[error("stream error: {0}")]
     Stream(#[from] StreamError),
-    #[error("parse error: {0}")]
-    Parse(#[from] ParseError),
-    #[error("template error: {0}")]
-    Template(#[from] TemplateError),
-    #[error("queue error: {0}")]
-    Queue(#[from] QueueError),
-    #[error("rule panicked")]
-    Panic,
     /// The engine was started without any `(rule, source)` task to run.
+    ///
+    /// Defensive guard: a configuration whose rules are all disabled is
+    /// already rejected by `Config::validate()`, so the daemon never reaches
+    /// it; the engine, public in the library, still refuses to run idle.
     #[error("no enabled rules: the engine has nothing to watch")]
     NoEnabledRules,
     /// Every `(rule, source)` task ended without a shutdown request.
@@ -217,20 +213,11 @@ mod tests {
 
     #[test]
     fn rule_error_display() {
-        let err = RuleError::Panic;
-        assert_eq!(err.to_string(), "rule panicked");
-
         let err = RuleError::Stream(StreamError::ConnectionFailed("network error".to_string()));
         assert_eq!(
             err.to_string(),
             "stream error: connection failed: network error"
         );
-
-        let err = RuleError::Parse(ParseError::NoMatch);
-        assert_eq!(err.to_string(), "parse error: regex did not match");
-
-        let err = RuleError::Queue(QueueError::Closed);
-        assert_eq!(err.to_string(), "queue error: notification queue closed");
     }
 
     #[test]
