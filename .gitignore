@@ -24,3 +24,6 @@ tarpaulin-report.*
 # Claude Code settings
 .claude/
 CLAUDE.md
+
+# direnv cache (use flake)
+.direnv/
