@@ -22,7 +22,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use super::{AlertPayload, Notifier, NotifierRegistry};
+use super::{AlertPayload, Notifier, NotifierRegistry, record_permanent_failure};
 use crate::error::QueueError;
 
 /// Exact capacity of the queue of each destination (FR32).
@@ -211,7 +211,8 @@ impl NotificationQueue {
     /// Send an alert to the queue of each of its destinations (non-blocking).
     ///
     /// When a destination queue is full, its oldest pending alert is dropped.
-    /// A destination unknown to the registry is logged, counted and skipped.
+    /// A destination unknown to the registry is logged, counted as a permanent
+    /// failure (`notifier_type="unknown"`) and skipped.
     ///
     /// # Returns
     ///
@@ -230,14 +231,7 @@ impl NotificationQueue {
                     rule_name = %payload.rule_name,
                     "Notifier not found in registry (validation should have caught this)"
                 );
-                metrics::counter!(
-                    "valerter_notify_errors_total",
-                    "notifier_name" => dest_name.clone(),
-                    "notifier_type" => "unknown",
-                    "rule_name" => payload.rule_name.clone(),
-                    "vl_source" => payload.vl_source.clone(),
-                )
-                .increment(1);
+                record_permanent_failure(&payload, dest_name, "unknown");
                 continue;
             };
             if queue.push(Arc::clone(&payload)).is_err() {

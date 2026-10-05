@@ -95,3 +95,40 @@ fn daemon_all_rules_disabled_exits_failure_without_starting_engine() {
         stderr
     );
 }
+
+/// A fatal error is logged through the configured format: with
+/// `--log-format json` every stderr line is a JSON object and no unstructured
+/// `Error: ...` line is printed, in daemon and `--validate` modes.
+#[test]
+fn fatal_error_is_logged_as_json() {
+    let config = fixture_path("config_notifier_undefined_env.yaml");
+    let config = config.to_str().unwrap();
+
+    for args in [
+        vec!["--log-format", "json", "-c", config],
+        vec!["--log-format", "json", "--validate", "-c", config],
+    ] {
+        let output = run_with_timeout(&args, Duration::from_secs(10));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}\nstderr: {stderr}");
+
+        let lines: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| {
+                assert!(
+                    !line.starts_with("Error:"),
+                    "{args:?}: unstructured line {line}"
+                );
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("{args:?}: not a JSON line ({e}): {line}"))
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|l| l["level"] == "ERROR"
+                && l["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("Failed to create notifiers: 1 errors"))),
+            "{args:?}: no ERROR line with the fatal error\nstderr: {stderr}"
+        );
+    }
+}

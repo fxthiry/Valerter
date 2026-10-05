@@ -3,12 +3,16 @@ set -e
 
 case "$1" in
     remove|deconfigure)
-        # Stop service before removal (if systemd available).
-        # Not on upgrade: the running process keeps the old binary mapped
-        # and postinst restarts it, so downtime is limited to the restart.
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl is-active --quiet valerter 2>/dev/null; then
-                systemctl stop valerter || true
+        # Stop the service before its files are removed, when systemd is the
+        # running init. Unconditional stop: a unit in `activating
+        # (auto-restart)` is not "active" but would be restarted onto a
+        # deleted binary. Not on upgrade: the running process keeps the old
+        # binary mapped and postinst restarts it, so downtime is limited to
+        # the restart.
+        if [ -d /run/systemd/system ]; then
+            systemctl stop valerter 2>/dev/null || true
+            if [ "$1" = remove ]; then
+                systemctl disable valerter 2>/dev/null || true
             fi
         fi
         ;;

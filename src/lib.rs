@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub(crate) mod http_body;
 pub mod metrics;
 pub mod notify;
 pub mod parser;
@@ -19,7 +20,8 @@ pub use cli::LogFormat;
 pub use engine::RuleEngine;
 pub use metrics::{
     DeliverySeries, MetricsInventory, MetricsServer, NotifierSeries, RuleSourceSeries,
-    initialize_destination_metrics, initialize_metrics, register_metric_descriptions,
+    build_metrics_inventory, initialize_destination_metrics, initialize_metrics,
+    register_metric_descriptions,
 };
 pub use notify::{
     AlertPayload, DEFAULT_QUEUE_CAPACITY, DrainOutcome, MattermostNotifier, NotificationQueue,

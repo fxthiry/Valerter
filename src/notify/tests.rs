@@ -361,6 +361,43 @@ fn registry_from_config_collects_all_errors() {
 }
 
 #[test]
+#[serial]
+fn registry_from_config_reports_errors_in_notifier_name_order() {
+    temp_env::with_var("UNDEFINED_ORDER_VAR", None::<&str>, || {
+        // Several HashMaps built in the same run iterate in different orders.
+        for _ in 0..8 {
+            let mut notifiers_config = HashMap::new();
+            for name in ["zeta", "alpha"] {
+                notifiers_config.insert(
+                    name.to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: SecretString::new("${UNDEFINED_ORDER_VAR}".to_string()),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                    }),
+                );
+            }
+
+            let client = reqwest::Client::new();
+            let Err(errors) =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir())
+            else {
+                panic!("both notifiers are invalid");
+            };
+            let names: Vec<_> = errors
+                .iter()
+                .map(|e| match e {
+                    crate::error::ConfigError::InvalidNotifier { name, .. } => name.as_str(),
+                    other => panic!("Expected InvalidNotifier, got {:?}", other),
+                })
+                .collect();
+            assert_eq!(names, ["alpha", "zeta"]);
+        }
+    });
+}
+
+#[test]
 fn registry_from_config_empty_config_returns_empty_registry() {
     let notifiers_config = HashMap::new();
     let client = reqwest::Client::new();
@@ -685,10 +722,18 @@ fn send_skips_and_counts_unknown_destination() {
 
     assert_eq!(queue.destination_len("mm-ops"), Some(1));
     assert_eq!(queue.len(), 1);
-    assert_series(
-        &rendered,
-        "valerter_notify_errors_total{notifier_name=\"ghost\",notifier_type=\"unknown\",rule_name=\"cpu\",vl_source=\"vlprod\"} 1",
-    );
+    // Counted like any permanent failure: same labels, same order.
+    for name in [
+        "valerter_notify_errors_total",
+        "valerter_alerts_failed_total",
+    ] {
+        assert_series(
+            &rendered,
+            &format!(
+                "{name}{{rule_name=\"cpu\",vl_source=\"vlprod\",notifier_name=\"ghost\",notifier_type=\"unknown\"}} 1"
+            ),
+        );
+    }
 }
 
 #[test]

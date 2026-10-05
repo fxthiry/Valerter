@@ -31,8 +31,8 @@ use valerter::config::{
 };
 use valerter::notify::WebhookNotifier;
 use valerter::{
-    DEFAULT_QUEUE_CAPACITY, DeliverySeries, MetricsInventory, MetricsServer, NotificationQueue,
-    NotificationWorker, NotifierRegistry, NotifierSeries, RuleEngine, RuleSourceSeries,
+    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, NotifierRegistry,
+    RuleEngine,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -206,10 +206,19 @@ async fn metrics_snapshot_two_sources_one_rule() {
     let mut sources = BTreeMap::new();
     sources.insert("vlprod".to_string(), vl_source(&vlprod.uri()));
     sources.insert("vldev".to_string(), vl_source(&vldev.uri()));
+    // Declared but targeted by no rule: never tailed, so no vl_source_up.
+    sources.insert(
+        "vlarchive".to_string(),
+        vl_source("http://vlarchive.invalid:9428"),
+    );
 
     // Throttle count=1 on the only rule so the second event on `vlprod`
     // also exercises the throttled path.
-    let rules = vec![rule("snapshot_rule", Vec::new(), 1)];
+    let rules = vec![rule(
+        "snapshot_rule",
+        vec!["vldev".to_string(), "vlprod".to_string()],
+        1,
+    )];
     let cfg = runtime(sources, rules);
 
     // 2) Boot the metrics server on an ephemeral port. The recorder install
@@ -240,32 +249,20 @@ async fn metrics_snapshot_two_sources_one_rule() {
     let registry = Arc::new(registry);
 
     // 4) Initialize all known metric series so the snapshot is deterministic
-    //    even before counters tick. Mirrors the inventory valerter's main
+    //    even before counters tick, from the inventory valerter's main
     //    builds: one pair per (rule, source), one triplet per destination.
-    let rule_sources = ["vldev", "vlprod"].map(|source| RuleSourceSeries {
-        rule_name: "snapshot_rule".to_string(),
-        vl_source: source.to_string(),
-        regex_parser: false,
-    });
-    let deliveries = ["vldev", "vlprod"].map(|source| DeliverySeries {
-        rule_name: "snapshot_rule".to_string(),
-        vl_source: source.to_string(),
-        notifier_name: "dest".to_string(),
-        notifier_type: "webhook".to_string(),
-    });
-    let notifiers = ["dest", "idle"].map(|name| NotifierSeries {
-        name: name.to_string(),
-        notifier_type: "webhook".to_string(),
-    });
-    valerter::initialize_metrics(&MetricsInventory {
-        sources: vec!["vldev".to_string(), "vlprod".to_string()],
-        rule_sources: rule_sources.to_vec(),
-        deliveries: deliveries.to_vec(),
-        notifiers: notifiers.to_vec(),
-    });
+    let inventory = valerter::build_metrics_inventory(&cfg, &registry);
+    assert_eq!(inventory.sources, ["vldev", "vlprod"]);
+    valerter::initialize_metrics(&inventory);
     // Per-destination queue series, seeded for every notifier. `idle` never
     // receives an alert, so its series must stay at their initial zero.
-    valerter::initialize_destination_metrics(&[("dest", "webhook"), ("idle", "webhook")]);
+    let destinations: Vec<(&str, &str)> = inventory
+        .notifiers
+        .iter()
+        .map(|n| (n.name.as_str(), n.notifier_type.as_str()))
+        .collect();
+    assert_eq!(destinations, [("dest", "webhook"), ("idle", "webhook")]);
+    valerter::initialize_destination_metrics(&destinations);
 
     // Scrape before any event: every seeded series is at 0.
     let url = format!("http://127.0.0.1:{}/metrics", port);
@@ -474,4 +471,14 @@ async fn metrics_snapshot_two_sources_one_rule() {
         "valerter_victorialogs_up must be removed in v2.0.0 (replaced by valerter_vl_source_up). Found in /metrics:\n{}",
         body
     );
+
+    // A declared source no enabled rule targets has no vl_source_up series.
+    for scrape in [&initial, &body] {
+        assert!(
+            !scrape.contains(r#"valerter_vl_source_up{vl_source="vlarchive"}"#),
+            "untargeted source must not get valerter_vl_source_up:\n{}",
+            scrape
+        );
+        assert!(!scrape.contains("vlarchive"), "{}", scrape);
+    }
 }

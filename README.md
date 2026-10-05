@@ -125,6 +125,8 @@ rules:
 ```
 
 > **Upgrading from v1.x?** The config schema and Prometheus metrics changed in v2.0.0. See [MIGRATION.md](MIGRATION.md) for the full guide.
+>
+> **Upgrading to 2.1.0?** Validation is stricter and some metrics and behaviors changed: read [MIGRATION.md#upgrading-to-210](MIGRATION.md#upgrading-to-210) and run `valerter --validate` with the new binary before upgrading.
 
 ## Documentation
 

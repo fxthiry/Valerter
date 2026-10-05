@@ -35,8 +35,10 @@ case "$1" in
             chmod 755 /etc/valerter/templates
             find /etc/valerter/templates -type f -exec chmod 644 {} \;
         fi
-        # Reload systemd (if available)
-        if command -v systemctl >/dev/null 2>&1; then
+        # Reload systemd and restart the service, only when systemd is the
+        # running init (not in a container or chroot, where the binary may be
+        # present without a manager)
+        if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
             # Restart service on upgrade (not on fresh install) when it is
             # active or enabled. The enabled check also covers upgrades from

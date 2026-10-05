@@ -1,0 +1,32 @@
+# Fixture: defaults.throttle.key uses an unknown filter after a type conversion.
+# Rejected by Config::validate() (the render test must not stop at `| int`).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    key: "{{ status | int }}-{{ host | truncat(10) }}"
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  mm:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/test"
+
+rules:
+  - name: "r"
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "mm"

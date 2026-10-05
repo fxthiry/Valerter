@@ -1055,11 +1055,11 @@ mod tests {
     }
 
     // ===================================================================
-    // Task 1.5: Test JoinSet supervision detects task completion
+    // Task 1.5: engine run with a token cancelled before it starts
     // ===================================================================
 
     #[tokio::test]
-    async fn engine_supervision_detects_completion() {
+    async fn engine_run_returns_ok_when_cancelled_before_start() {
         let rules = vec![make_test_rule("rule1", true)];
         let config = make_test_runtime_config(rules);
         let client = make_test_client();

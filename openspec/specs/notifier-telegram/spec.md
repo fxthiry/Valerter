@@ -177,11 +177,16 @@ toute valeur lue à l'intervalle [1 s, 60 s] ; la tentative MUST être décompt�
 Le système MUST abandonner immédiatement, sans relance, l'envoi à une discussion lorsque Telegram répond un statut
 4xx autre que 429, journaliser `Telegram returned client error, not retrying` au niveau error et renvoyer pour cette
 discussion l'erreur `client error: <statut>`, à la seule exception du renvoi unique en texte brut décrit par « Repli en
-texte brut sur rejet HTML » lorsqu'un envoi en `parse_mode` HTML reçoit un 400.
+texte brut sur rejet HTML » lorsqu'un envoi en `parse_mode` HTML reçoit un 400 dont la description signale une erreur
+d'analyse des entités.
 
 #### Scenario: Requête rejetée
 - **WHEN** Telegram répond 400 pour une discussion à une requête sans `parse_mode` HTML (ou au renvoi en texte brut)
 - **THEN** aucune autre requête n'est envoyée pour cette discussion et elle est comptée en échec
+
+#### Scenario: Discussion introuvable en mode HTML
+- **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 400 avec la description `Bad Request: chat not found`
+- **THEN** une seule requête est envoyée pour cette discussion, qui est en échec avec `client error: 400 Bad Request`
 
 ### Requirement: Résultat global et métriques par discussion
 Le système SHALL considérer l'alerte comme livrée dès qu'au moins une discussion a réussi, en incrémentant une fois
@@ -220,18 +225,18 @@ et à la présence d'un `body_template`, sans les `chat_ids`.
 - **THEN** la sortie contient `name`, `chat_count`, `parse_mode` et `has_body_template`, sans jeton, URL ni `chat_ids`
 
 ### Requirement: Repli en texte brut sur rejet HTML
-Le système SHALL, lorsque `parse_mode` vaut `HTML` (sans tenir compte de la casse) et que Telegram répond 400 à l'envoi pour une discussion, renvoyer une seule fois à cette discussion le même texte sans le champ `parse_mode` (texte brut), en journalisant l'avertissement `Telegram rejected HTML message, resending as plain text` avec le nom du notifier et de la règle, sans le jeton, l'URL de l'API ni le texte. Ce renvoi MUST suivre la même politique de relance que tout envoi (5xx, 429 et erreurs réseau, au plus 3 tentatives) ; une réponse 4xx au renvoi MUST être traitée comme un échec définitif de la discussion. Aucun repli n'a lieu pour les autres statuts 4xx ni pour les autres valeurs de `parse_mode`.
+Le système SHALL, lorsque `parse_mode` vaut `HTML` (sans tenir compte de la casse) et que Telegram répond 400 à l'envoi pour une discussion avec une `description` (corps JSON de la réponse, lu dans une limite de taille) contenant `can't parse entities` sans tenir compte de la casse, renvoyer une seule fois à cette discussion le même texte sans le champ `parse_mode` (texte brut), en journalisant l'avertissement `Telegram rejected HTML message, resending as plain text` avec le nom du notifier et de la règle, sans le jeton, l'URL de l'API ni le texte. Ce renvoi MUST suivre la même politique de relance que tout envoi (5xx, 429 et erreurs réseau, au plus 3 tentatives) ; une réponse 4xx au renvoi MUST être traitée comme un échec définitif de la discussion. Aucun repli n'a lieu pour un 400 sans cette description (corps absent, illisible ou autre erreur), pour les autres statuts 4xx ni pour les autres valeurs de `parse_mode`.
 
 #### Scenario: Balise coupée par la troncature
-- **WHEN** `parse_mode` vaut `HTML`, que le texte tronqué se termine au milieu d'une balise et que Telegram répond 400 puis 200
+- **WHEN** `parse_mode` vaut `HTML`, que le texte tronqué se termine au milieu d'une balise et que Telegram répond 400 avec la description `Bad Request: can't parse entities: Unclosed start tag at byte offset 4090` puis 200
 - **THEN** deux requêtes sont envoyées pour cette discussion, la seconde sans champ `parse_mode` et avec le même `text`, la discussion est comptée comme réussie et l'avertissement est journalisé
 
 #### Scenario: Caractère non échappé dans un template personnalisé
-- **WHEN** `body_template: "{{ body }}"` est configuré, que le corps contient `a < b` et que Telegram répond 400 à la requête HTML
+- **WHEN** `body_template: "{{ body }}"` est configuré, que le corps contient `a < b` et que Telegram répond 400 à la requête HTML avec la description `Bad Request: can't parse entities: Unsupported start tag "b" at byte offset 2`
 - **THEN** le texte est renvoyé une fois en texte brut à cette discussion
 
 #### Scenario: Renvoi en texte brut également rejeté
-- **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 400 à la requête HTML puis 400 au renvoi
+- **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 400 avec une description `can't parse entities` à la requête HTML puis 400 au renvoi
 - **THEN** exactement deux requêtes sont envoyées pour cette discussion et elle est en échec avec `client error: 400 Bad Request`
 
 #### Scenario: Pas de repli hors mode HTML
@@ -241,6 +246,14 @@ Le système SHALL, lorsque `parse_mode` vaut `HTML` (sans tenir compte de la cas
 #### Scenario: Pas de repli sur un autre statut 4xx
 - **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 403
 - **THEN** une seule requête est envoyée pour cette discussion
+
+#### Scenario: Pas de repli sur un autre 400
+- **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 400 avec la description `Bad Request: message text is empty`, ou sans corps JSON
+- **THEN** une seule requête est envoyée pour cette discussion
+
+#### Scenario: Description en casse différente
+- **WHEN** `parse_mode` vaut `HTML` et que Telegram répond 400 avec la description `Bad Request: Can't Parse Entities: ...` puis 200
+- **THEN** deux requêtes sont envoyées pour cette discussion
 
 ### Requirement: Validation et normalisation de parse_mode
 Le système MUST n'accepter pour `parse_mode` que `HTML`, `MarkdownV2` ou `Markdown`, sans tenir compte de la casse, et SHALL transmettre la forme canonique correspondante ; toute autre valeur MUST être refusée à l'instanciation du notifier (démarrage du démon et mode `--validate`), avec `invalid notifier '<nom>': parse_mode '<valeur>' is not supported (expected HTML, MarkdownV2 or Markdown)`. Le défaut reste `HTML`.

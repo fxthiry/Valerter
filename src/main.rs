@@ -14,9 +14,9 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use valerter::cli::{Cli, LogFormat};
 use valerter::config::{Config, RuntimeConfig, redact_url};
 use valerter::{
-    DEFAULT_QUEUE_CAPACITY, DeliverySeries, MetricsInventory, MetricsServer, NotificationQueue,
-    NotificationWorker, NotifierRegistry, NotifierSeries, RuleEngine, RuleSourceSeries,
-    SHUTDOWN_DRAIN_TIMEOUT, await_worker_drain, build_http_client, run_preflight,
+    DEFAULT_QUEUE_CAPACITY, MetricsServer, NotificationQueue, NotificationWorker, NotifierRegistry,
+    RuleEngine, SHUTDOWN_DRAIN_TIMEOUT, await_worker_drain, build_http_client,
+    build_metrics_inventory, run_preflight,
 };
 
 /// Initialize the tracing subscriber with the specified log format.
@@ -139,7 +139,20 @@ async fn handle_shutdown_signals(
     }
 }
 
-fn main() -> Result<()> {
+/// Longest wait, when the process ends, for blocking tasks still running in
+/// the runtime (e.g. a DNS resolution stuck in the blocking pool).
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Log a fatal error through the configured log format and exit with code 1.
+///
+/// Every fatal error goes through here, so the process never prints an
+/// unstructured `Error: ...` line (which `main() -> Result` would).
+fn fatal(err: anyhow::Error) -> ! {
+    error!("{err:#}");
+    std::process::exit(1);
+}
+
+fn main() {
     let cli = Cli::parse();
 
     // Initialize tracing subscriber with configured log format (AD-10, FR42)
@@ -170,19 +183,23 @@ fn main() -> Result<()> {
     }
 
     // Compile configuration for runtime (FR15)
-    let runtime_config = config.compile(&cli.config)?;
+    let runtime_config = config
+        .compile(&cli.config)
+        .unwrap_or_else(|e| fatal(e.into()));
 
     // Validate mode: run the same preflight checks as the daemon startup,
     // display a summary and exit without starting anything.
     if cli.validate {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
-        let report = runtime.block_on(async {
-            anyhow::Ok(run_preflight(&runtime_config, build_http_client()?)?)
-        })?;
+            .build()
+            .unwrap_or_else(|e| fatal(e.into()));
+        let result = runtime
+            .block_on(async { anyhow::Ok(run_preflight(&runtime_config, build_http_client()?)?) });
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        let report = result.unwrap_or_else(|e| fatal(e));
         print_validation_summary(&cli.config, &runtime_config, &report.registry);
-        return Ok(());
+        return;
     }
 
     info!(config_path = %cli.config.display(), "valerter starting");
@@ -190,10 +207,16 @@ fn main() -> Result<()> {
     // Create tokio runtime
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .unwrap_or_else(|e| fatal(e.into()));
 
-    // Run the main async function
-    runtime.block_on(run(runtime_config))
+    // Run the main async function, then bound the runtime teardown: a task
+    // stuck in the blocking pool must not delay the exit.
+    let result = runtime.block_on(run(runtime_config));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    if let Err(e) = result {
+        fatal(e);
+    }
 }
 
 /// Print the `--validate` success summary on stdout.
@@ -248,66 +271,6 @@ fn print_validation_summary(
         },
         config.metrics.port
     );
-}
-
-/// Build the metric series inventory seeded at startup.
-///
-/// Multi-source observability (v2.0.0 part 2): every per-rule metric also
-/// carries `vl_source`, so one pair per `(enabled rule, resolved source)`, with
-/// the same fan-out as the engine: empty `vl_sources` means every configured
-/// source, a non-empty list restricts to the named, declared sources. Each
-/// pair is crossed with the rule destinations, typed through the registry.
-fn build_metrics_inventory(
-    config: &RuntimeConfig,
-    registry: &NotifierRegistry,
-) -> MetricsInventory {
-    let sources: Vec<String> = config.victorialogs.keys().cloned().collect();
-    let mut inventory = MetricsInventory {
-        sources,
-        ..MetricsInventory::default()
-    };
-
-    for rule in config.rules.iter().filter(|r| r.enabled) {
-        let rule_sources = inventory
-            .sources
-            .iter()
-            .filter(|s| rule.vl_sources.is_empty() || rule.vl_sources.contains(s));
-        for vl_source in rule_sources {
-            inventory.rule_sources.push(RuleSourceSeries {
-                rule_name: rule.name.clone(),
-                vl_source: vl_source.clone(),
-                regex_parser: rule.parser.regex.is_some(),
-            });
-            // Destinations missing from the registry were rejected by the
-            // preflight checks.
-            for (notifier_name, notifier) in rule
-                .notify
-                .destinations
-                .iter()
-                .filter_map(|d| registry.get(d).map(|n| (d, n)))
-            {
-                inventory.deliveries.push(DeliverySeries {
-                    rule_name: rule.name.clone(),
-                    vl_source: vl_source.clone(),
-                    notifier_name: notifier_name.clone(),
-                    notifier_type: notifier.notifier_type().to_string(),
-                });
-            }
-        }
-    }
-
-    let mut notifiers: Vec<NotifierSeries> = registry
-        .names()
-        .filter_map(|name| {
-            registry.get(name).map(|n| NotifierSeries {
-                name: name.to_string(),
-                notifier_type: n.notifier_type().to_string(),
-            })
-        })
-        .collect();
-    notifiers.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    inventory.notifiers = notifiers;
-    inventory
 }
 
 /// Main async entry point.
@@ -365,8 +328,8 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
         // Wait for the recorder to be installed before emitting any metrics
         // This fixes the race condition where metrics were lost if emitted
         // before the Prometheus recorder was ready
+        // (logged once by `fatal`)
         if ready_rx.await.is_err() {
-            error!("Metrics recorder failed to initialize");
             return Err(anyhow::anyhow!("Metrics recorder failed to initialize"));
         }
 
@@ -438,10 +401,8 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
             info!("valerter shutdown complete");
             Ok(())
         }
-        Err(e) => {
-            error!(error = %e, "Engine error");
-            Err(anyhow::anyhow!("Engine error: {}", e))
-        }
+        // Logged once by `fatal`.
+        Err(e) => Err(anyhow::anyhow!("Engine error: {}", e)),
     }
 }
 
@@ -577,178 +538,6 @@ mod tests {
             .unwrap();
         assert!(cancel.is_cancelled());
         assert!(exit.try_recv().is_err());
-    }
-
-    // build_metrics_inventory
-
-    /// Notifier stub: only its name and type matter to the inventory.
-    struct StubNotifier(&'static str, &'static str);
-
-    #[async_trait::async_trait]
-    impl valerter::Notifier for StubNotifier {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn notifier_type(&self) -> &str {
-            self.1
-        }
-        async fn send(
-            &self,
-            _alert: &valerter::AlertPayload,
-        ) -> Result<(), valerter::error::NotifyError> {
-            Ok(())
-        }
-    }
-
-    fn inventory_rule(
-        name: &str,
-        enabled: bool,
-        vl_sources: &[&str],
-        destinations: &[&str],
-        regex: Option<&str>,
-    ) -> valerter::config::CompiledRule {
-        use valerter::config::{CompiledParser, CompiledRule, JsonParserConfig, NotifyConfig};
-        CompiledRule {
-            name: name.to_string(),
-            enabled,
-            query: "_stream:test".to_string(),
-            parser: CompiledParser {
-                regex: regex.map(|r| regex::Regex::new(r).unwrap()),
-                json: regex.is_none().then(|| JsonParserConfig {
-                    fields: vec!["_msg".to_string()],
-                }),
-            },
-            throttle: None,
-            notify: NotifyConfig {
-                template: "tpl".to_string(),
-                mattermost_channel: None,
-                destinations: destinations.iter().map(|d| d.to_string()).collect(),
-            },
-            vl_sources: vl_sources.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn inventory_config(rules: Vec<valerter::config::CompiledRule>) -> RuntimeConfig {
-        use valerter::config::{
-            DEFAULT_MAX_STREAMS, DefaultsConfig, MetricsConfig, ThrottleConfig, VlSourceConfig,
-        };
-        let source = |url: &str| VlSourceConfig {
-            url: url.to_string(),
-            basic_auth: None,
-            headers: None,
-            tls: None,
-        };
-        RuntimeConfig {
-            victorialogs: [
-                ("vldev".to_string(), source("http://vldev:9428")),
-                ("vlprod".to_string(), source("http://vlprod:9428")),
-                ("vlstaging".to_string(), source("http://vlstaging:9428")),
-            ]
-            .into_iter()
-            .collect(),
-            defaults: DefaultsConfig {
-                throttle: ThrottleConfig {
-                    key: None,
-                    count: 5,
-                    window: Duration::from_secs(60),
-                },
-                timestamp_timezone: "UTC".to_string(),
-                max_streams: DEFAULT_MAX_STREAMS,
-            },
-            templates: std::collections::HashMap::new(),
-            rules,
-            metrics: MetricsConfig::default(),
-            notifiers: None,
-            config_dir: std::path::PathBuf::from("."),
-        }
-    }
-
-    #[test]
-    fn metrics_inventory_crosses_rule_sources_with_typed_destinations() {
-        let config = inventory_config(vec![
-            inventory_rule(
-                "errors",
-                true,
-                &["vlprod", "vldev"],
-                &["hook", "mail"],
-                Some(r"(?P<x>.*)"),
-            ),
-            inventory_rule("off", false, &[], &["idle"], None),
-        ]);
-        let mut registry = NotifierRegistry::new();
-        for (name, kind) in [("hook", "webhook"), ("mail", "email"), ("idle", "telegram")] {
-            registry
-                .register(Arc::new(StubNotifier(name, kind)))
-                .unwrap();
-        }
-
-        let inventory = build_metrics_inventory(&config, &registry);
-
-        assert_eq!(inventory.sources, ["vldev", "vlprod", "vlstaging"]);
-        let pairs: Vec<_> = inventory
-            .rule_sources
-            .iter()
-            .map(|p| (p.rule_name.as_str(), p.vl_source.as_str(), p.regex_parser))
-            .collect();
-        assert_eq!(
-            pairs,
-            [("errors", "vldev", true), ("errors", "vlprod", true)],
-            "the disabled rule gets no series"
-        );
-        let deliveries: Vec<_> = inventory
-            .deliveries
-            .iter()
-            .map(|d| {
-                (
-                    d.vl_source.as_str(),
-                    d.notifier_name.as_str(),
-                    d.notifier_type.as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            deliveries,
-            [
-                ("vldev", "hook", "webhook"),
-                ("vldev", "mail", "email"),
-                ("vlprod", "hook", "webhook"),
-                ("vlprod", "mail", "email"),
-            ]
-        );
-        assert!(
-            inventory
-                .deliveries
-                .iter()
-                .all(|d| d.notifier_name != "idle"),
-            "a notifier used by no enabled rule gets no delivery series"
-        );
-        let notifiers: Vec<_> = inventory
-            .notifiers
-            .iter()
-            .map(|n| (n.name.as_str(), n.notifier_type.as_str()))
-            .collect();
-        assert_eq!(
-            notifiers,
-            [("hook", "webhook"), ("idle", "telegram"), ("mail", "email")]
-        );
-    }
-
-    #[test]
-    fn metrics_inventory_fans_out_empty_vl_sources_to_every_source() {
-        let config = inventory_config(vec![inventory_rule("all", true, &[], &[], None)]);
-
-        let inventory = build_metrics_inventory(&config, &NotifierRegistry::new());
-
-        let pairs: Vec<_> = inventory
-            .rule_sources
-            .iter()
-            .map(|p| (p.vl_source.as_str(), p.regex_parser))
-            .collect();
-        assert_eq!(
-            pairs,
-            [("vldev", false), ("vlprod", false), ("vlstaging", false)]
-        );
-        assert!(inventory.deliveries.is_empty());
     }
 
     /// Test the full shutdown flow with cancellation token integration.

@@ -89,10 +89,10 @@ Sends alerts to configured destinations via `NotifierRegistry`:
 - **Fan-out:** One alert can go to multiple notifiers; it is queued once per destination
 - **Per-destination delivery:** each notifier has its own queue (exactly 100 alerts) and its own delivery task, so a slow, unavailable or saturated destination only delays or loses its own alerts
 - **Order:** alerts are delivered in arrival order per destination (FIFO per destination, not globally)
-- **Retry:** Exponential backoff (500ms → 5s, max 3 retries)
+- **Retry:** Exponential backoff, max 3 attempts: 500ms → 5s for Mattermost, webhook and Telegram, 1 s → 30 s for email
 - **Drop Oldest:** If a destination queue is full, its oldest alert is dropped (not the newest), for that destination only
 - **Panic isolation:** a notifier panic is logged (`Notifier panicked while sending alert`), counted as a failed delivery, and the destination moves on to its next alert
-- **Notifier types:** Mattermost, Email (SMTP), Webhook (generic HTTP)
+- **Notifier types:** Mattermost, Email (SMTP), Webhook (generic HTTP), Telegram
 - **Timestamps:** `log_timestamp` (ISO 8601) and `log_timestamp_formatted` (human-readable with timezone)
 
 ## Concurrency Model
@@ -142,7 +142,7 @@ When VictoriaLogs connection fails:
 2. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max), with ±10% jitter
 3. **Metric update:** the per-source gauge `valerter_vl_source_up{vl_source}` is set to 0 after 3 consecutive failures of a task (transient errors are debounced), and restored to 1 on successful reconnection
 4. **Reconnection metric:** `valerter_reconnections_total{rule_name, vl_source}` incremented: it only counts reconnections after a failure (connection error, HTTP error response or error while reading the stream)
-5. **On success:** the throttle keys fed only by this source are reset (prevents stale state); keys shared with the rule's other sources are kept
+5. **On success:** the throttle keys fed only by this source are reset (prevents stale state); keys shared with the rule's other sources are kept. A stream cut by an error (connection reset, truncated chunked body) is a failure too: the next successful connection resets the source's throttle keys the same way
 
 When the server ends the response cleanly (EOF without error), this is not a failure: the throttle cache is kept and the tail is reopened after ~1s if the connection received data. If the server keeps closing the stream without sending anything, the delay grows with the number of consecutive empty EOFs: ~1s, then 2s, 4s, ... up to 60s, and drops back to ~1s as soon as a connection receives data. Clean ends are counted in `valerter_stream_ends_total{rule_name, vl_source}`, not in `valerter_reconnections_total`, so a proxy closing idle streams does not look like a failing source.
 
@@ -158,7 +158,7 @@ When the server ends the response cleanly (EOF without error), this is not a fai
 - **Panic isolation:** a panic during a send is caught, logged and counted in `valerter_notify_errors_total` / `valerter_alerts_failed_total`; the destination continues with its next alert
 - **Shutdown drain:** the worker has its own drain token, cancelled by `main` once every rule task has stopped, so no alert can be queued anymore. Each destination task then finishes its in-flight send (retries included), delivers the alerts still in its queue in order until it is empty, and closes its queue (further sends fail with `notification queue closed`). Destinations drain in parallel: a slow one does not hold back the others. An empty queue does not delay the exit
 - **Drain deadline:** `main` waits at most 20 s for the drain (constant `SHUTDOWN_DRAIN_TIMEOUT`, not configurable), counted once the rule tasks have stopped. It logs `Waiting for notification worker to drain queue...` (field `queued`), then either `Notification queue drained`, or, when the deadline expires, aborts the worker and logs the WARN `Shutdown drain timeout reached, alerts not delivered` with `undelivered` = alerts left in all queues (an interrupted in-flight send is not counted). The process still exits with code 0
-- **Shutdown budget:** stopping the rule tasks + 20 s of drain + 2 s for the metrics server fits in the `TimeoutStopSec=30` of the shipped systemd unit (about 27 s at worst). Container runtimes must allow as much: `docker stop --stop-timeout 30`, or `stop_grace_period: 30s` in Compose (Docker's default of 10 s kills the process before the drain ends). A second SIGTERM/SIGINT skips the drain and exits immediately with code 1
+- **Shutdown budget:** stopping the rule tasks + at most 20 s of drain fits in the `TimeoutStopSec=30` of the shipped systemd unit (about 20 s at worst: the metrics server stops as soon as the engine returns, and the teardown of the runtime waits at most 2 s for blocking tasks). Container runtimes must allow as much: `docker stop --stop-timeout 30`, or `stop_grace_period: 30s` in Compose (Docker's default of 10 s kills the process before the drain ends). A second SIGTERM/SIGINT skips the drain and exits immediately with code 1
 
 ```
 RuleEngine (producers)        NotificationQueue (router)       Destination tasks

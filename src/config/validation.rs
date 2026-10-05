@@ -1,9 +1,20 @@
 //! Template and color validation utilities.
 
-use minijinja::value::{Enumerator, Object, ObjectRepr, Value};
+use minijinja::value::{Enumerator, Object, ObjectRepr, Rest, Value};
 use minijinja::{Environment, Error, ErrorKind, State, UndefinedBehavior};
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
+
+/// Which branch a validation render explores (see [`validate_template_render`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Every condition on a field is true and every loop over a field
+    /// iterates one element.
+    Truthy,
+    /// Every condition on a field is false, every loop is empty and the
+    /// `defined` test is false for a field.
+    Falsy,
+}
 
 /// Sentinel value used during template validation.
 ///
@@ -12,10 +23,13 @@ use std::sync::{Arc, LazyLock};
 /// against an empty `json!({})` returned `undefined` instead of another value.
 ///
 /// `TruthyChainable` returns another sentinel on every attribute access (so
-/// chains never hit `undefined`), is always truthy (so `{% if x.y %}` walks the
-/// body and validates filters/syntax inside), stringifies as empty, and
-/// iterates as an empty sequence (so `{% for x in tc %}` and `{{ tc | length }}`
-/// do not error — matching the prior `Lenient + json!({})` behaviour).
+/// chains never hit `undefined`) and stringifies as empty. Its truthiness and
+/// iteration depend on the [`Pass`]: in the truthy pass it is true and a
+/// non-leaf sentinel iterates one leaf sentinel (so `{% for x in tc %}` walks
+/// the body), in the falsy pass it is false and iterates as an empty sequence
+/// (so `else` branches and `{% if not x %}` bodies are walked). A leaf always
+/// iterates as an empty sequence: without it `{{ tc | tojson }}` would recurse
+/// forever.
 ///
 /// Calling a sentinel means the template called a name that is neither a
 /// global function nor a method of a real value (`{{ nosuchfunc() }}`,
@@ -24,6 +38,8 @@ use std::sync::{Arc, LazyLock};
 #[derive(Debug)]
 struct TruthyChainable {
     name: String,
+    pass: Pass,
+    leaf: bool,
 }
 
 impl Object for TruthyChainable {
@@ -32,15 +48,19 @@ impl Object for TruthyChainable {
     }
 
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
-        Some(TruthyChainable::named(key))
+        Some(TruthyChainable::named(key, self.pass))
     }
 
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        Enumerator::Empty
+        if self.pass == Pass::Truthy && !self.leaf {
+            Enumerator::Values(vec![TruthyChainable::leaf(&self.name, self.pass)])
+        } else {
+            Enumerator::Empty
+        }
     }
 
     fn is_true(self: &Arc<Self>) -> bool {
-        true
+        self.pass == Pass::Truthy
     }
 
     fn call(self: &Arc<Self>, _state: &State<'_, '_>, _args: &[Value]) -> Result<Value, Error> {
@@ -56,10 +76,26 @@ impl Object for TruthyChainable {
 }
 
 impl TruthyChainable {
-    fn named(key: &Value) -> Value {
+    fn named(key: &Value, pass: Pass) -> Value {
         let name = key.as_str().map_or_else(|| key.to_string(), str::to_string);
-        Value::from_object(TruthyChainable { name })
+        Value::from_object(TruthyChainable {
+            name,
+            pass,
+            leaf: false,
+        })
     }
+
+    fn leaf(name: &str, pass: Pass) -> Value {
+        Value::from_object(TruthyChainable {
+            name: name.to_string(),
+            pass,
+            leaf: true,
+        })
+    }
+}
+
+fn is_sentinel(value: &Value) -> bool {
+    value.downcast_object_ref::<TruthyChainable>().is_some()
 }
 
 /// Root context of a validation render: every top-level name is a
@@ -68,6 +104,7 @@ impl TruthyChainable {
 #[derive(Debug)]
 struct ValidationRoot {
     globals: Vec<String>,
+    pass: Pass,
 }
 
 impl Object for ValidationRoot {
@@ -76,8 +113,127 @@ impl Object for ValidationRoot {
         if self.globals.iter().any(|g| g == name) {
             return None;
         }
-        Some(TruthyChainable::named(key))
+        Some(TruthyChainable::named(key, self.pass))
     }
+}
+
+/// Errors that do not depend on the event's values: the only ones a
+/// validation render reports (besides the `/` operator on a field path).
+fn is_value_independent(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::SyntaxError
+            | ErrorKind::UnknownFilter
+            | ErrorKind::UnknownTest
+            | ErrorKind::UnknownFunction
+            | ErrorKind::UnknownMethod
+    )
+}
+
+/// The built-in filters of minijinja 2.24 with the `builtins` and `json`
+/// features (keep in sync with `build_builtin_filters` in minijinja's
+/// `defaults.rs`; `builtin_filter_wrappers_still_report_unknown_filters`
+/// guards the list). valerter registers no filter of its own, so wrapping
+/// these keeps the validation environment faithful to production.
+fn builtin_filters() -> Vec<(&'static str, Value)> {
+    use minijinja::filters as f;
+    vec![
+        ("safe", Value::from_function(f::safe)),
+        ("escape", Value::from_function(f::escape)),
+        ("e", Value::from_function(f::escape)),
+        ("lower", Value::from_function(f::lower)),
+        ("upper", Value::from_function(f::upper)),
+        ("title", Value::from_function(f::title)),
+        ("capitalize", Value::from_function(f::capitalize)),
+        ("replace", Value::from_function(f::replace)),
+        ("length", Value::from_function(f::length)),
+        ("count", Value::from_function(f::length)),
+        ("dictsort", Value::from_function(f::dictsort)),
+        ("items", Value::from_function(f::items)),
+        ("reverse", Value::from_function(f::reverse)),
+        ("trim", Value::from_function(f::trim)),
+        ("join", Value::from_function(f::join)),
+        ("split", Value::from_function(f::split)),
+        ("lines", Value::from_function(f::lines)),
+        ("default", Value::from_function(f::default)),
+        ("d", Value::from_function(f::default)),
+        ("round", Value::from_function(f::round)),
+        ("abs", Value::from_function(f::abs)),
+        ("int", Value::from_function(f::int)),
+        ("float", Value::from_function(f::float)),
+        ("attr", Value::from_function(f::attr)),
+        ("first", Value::from_function(f::first)),
+        ("last", Value::from_function(f::last)),
+        ("min", Value::from_function(f::min)),
+        ("max", Value::from_function(f::max)),
+        ("sort", Value::from_function(f::sort)),
+        ("list", Value::from_function(f::list)),
+        ("string", Value::from_function(f::string)),
+        ("bool", Value::from_function(f::bool)),
+        ("batch", Value::from_function(f::batch)),
+        ("slice", Value::from_function(f::slice)),
+        ("sum", Value::from_function(f::sum)),
+        ("indent", Value::from_function(f::indent)),
+        ("select", Value::from_function(f::select)),
+        ("reject", Value::from_function(f::reject)),
+        ("selectattr", Value::from_function(f::selectattr)),
+        ("rejectattr", Value::from_function(f::rejectattr)),
+        ("map", Value::from_function(f::map)),
+        ("groupby", Value::from_function(f::groupby)),
+        ("unique", Value::from_function(f::unique)),
+        ("chain", Value::from_function(f::chain)),
+        ("zip", Value::from_function(f::zip)),
+        ("pprint", Value::from_function(f::pprint)),
+        ("format", Value::from_function(f::format)),
+        ("tojson", Value::from_function(f::tojson)),
+    ]
+}
+
+/// Value returned by a wrapped built-in filter that failed on a sentinel:
+/// a number after a conversion (so `{{ count | int + 1 }}` keeps rendering),
+/// one sentinel pair for `items`/`dictsort` (so `{% for k, v in m | items %}`
+/// walks its body), a leaf sentinel otherwise (so chaining continues).
+fn filter_substitute(name: &str, pass: Pass) -> Value {
+    match name {
+        "int" | "abs" => Value::from(0),
+        "float" | "round" => Value::from(0.0),
+        "items" | "dictsort" if pass == Pass::Truthy => Value::from(vec![Value::from(vec![
+            TruthyChainable::leaf(name, pass),
+            TruthyChainable::leaf(name, pass),
+        ])]),
+        "items" | "dictsort" => Value::from(Vec::<Value>::new()),
+        _ => TruthyChainable::leaf(name, pass),
+    }
+}
+
+/// Builds the environment of a validation render: lenient undefined values
+/// as in production, every built-in filter wrapped so that a failure caused
+/// by a sentinel argument returns [`filter_substitute`] instead of stopping
+/// the render, and, in the falsy pass, `defined`/`undefined` tests that treat
+/// a sentinel as undefined (so `{% if x is not defined %}` bodies are walked).
+fn validation_env(pass: Pass) -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    for (name, filter) in builtin_filters() {
+        env.add_filter(
+            name,
+            move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
+                match filter.call(state, &args) {
+                    Err(err)
+                        if !is_value_independent(err.kind()) && args.iter().any(is_sentinel) =>
+                    {
+                        Ok(filter_substitute(name, pass))
+                    }
+                    other => other,
+                }
+            },
+        );
+    }
+    if pass == Pass::Falsy {
+        env.add_test("defined", |v: &Value| !v.is_undefined() && !is_sentinel(v));
+        env.add_test("undefined", |v: &Value| v.is_undefined() || is_sentinel(v));
+    }
+    env
 }
 
 /// Validates Jinja template syntax.
@@ -88,22 +244,33 @@ pub(crate) fn validate_jinja_template(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates a Jinja template by performing a test render against a sentinel
-/// context where every field is defined and truthy.
+/// Validates a Jinja template by performing two test renders against a
+/// sentinel context where every field is defined: a truthy pass (conditions
+/// true, loops over a field iterate one element) then a falsy pass
+/// (conditions false, loops empty, `is defined` false), so `else` branches,
+/// `{% if not x %}`, `is not defined` and loop bodies are all checked. The
+/// first rejected error is returned.
 ///
 /// The sentinel cannot stand for every real value (a sequence is not a number
 /// or a string), so only errors that do not depend on the event's values are
 /// reported: syntax errors, unknown filters, tests, functions and methods, and
-/// the `/` operator applied to a field path (issue #41). Any other runtime
-/// error (`| int`, `| float`, `| round`, arithmetic…) is caused by the fake
-/// context and accepted.
+/// the `/` operator applied to a field path (issue #41). A built-in filter
+/// applied to a field (`| int`, `| float`, `| round`, `| split`, `| upper`…)
+/// does not stop the render: it returns a substitute value and the rest of the
+/// template is still checked. Any other runtime error (arithmetic on a raw
+/// field, `{{ count + 1 }}`…) is caused by the fake context and accepted, but
+/// stops the current pass. The body of an `elif` is reached by neither pass.
 ///
 /// # Errors
 /// Returns an error string if the template syntax is invalid, uses an unknown
 /// filter, test, function or method, or divides field paths.
 pub fn validate_template_render(source: &str) -> Result<(), String> {
-    let mut env = Environment::new();
-    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    render_pass(source, Pass::Truthy)?;
+    render_pass(source, Pass::Falsy)
+}
+
+fn render_pass(source: &str, pass: Pass) -> Result<(), String> {
+    let mut env = validation_env(pass);
     env.add_template("_render_test", source)
         .map_err(|e| e.to_string())?;
 
@@ -112,6 +279,7 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let root = ValidationRoot {
         globals: env.globals().map(|(name, _)| name.to_string()).collect(),
+        pass,
     };
     let Err(err) = tmpl.render(Value::from_object(root)) else {
         return Ok(());
@@ -119,11 +287,7 @@ pub fn validate_template_render(source: &str) -> Result<(), String> {
 
     let msg = err.to_string();
     match err.kind() {
-        ErrorKind::SyntaxError
-        | ErrorKind::UnknownFilter
-        | ErrorKind::UnknownTest
-        | ErrorKind::UnknownFunction
-        | ErrorKind::UnknownMethod => Err(msg),
+        kind if is_value_independent(kind) => Err(msg),
         ErrorKind::InvalidOperation if msg.contains("/ operator") => {
             match slash_field_hint(source) {
                 Some(hint) => Err(format!("{msg}\n  hint: {hint}")),
@@ -155,10 +319,16 @@ static SLASH_FIELD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// annotations like `authentication.openshift.io/username`). In a Jinja
 /// expression `/` is the division operator, so `{{ a.b.io/username }}` fails
 /// to render. Returns a hint with the bracket-notation rewrite when the
-/// template contains such a path. A top-level field (`{{ io/username }}`) has
+/// template contains such a path. A top-level field (`{{ io/user-name }}`) has
 /// no parent object to index, so the hint suggests renaming it in the query.
+///
+/// Only paths whose left side is dotted (`a.b/c`) or whose right side contains
+/// `.`, `-` or `/` are field paths: `{{ total/count }}` is a division between
+/// two plain identifiers and gets no hint.
 pub(crate) fn slash_field_hint(source: &str) -> Option<String> {
-    let caps = SLASH_FIELD_REGEX.captures(source)?;
+    let caps = SLASH_FIELD_REGEX
+        .captures_iter(source)
+        .find(|caps| caps[1].contains('.') || caps[2].contains(['.', '-', '/']))?;
     let left = &caps[1];
     let right = &caps[2];
     let Some((prefix, leaf)) = left.rsplit_once('.') else {
@@ -393,22 +563,163 @@ mod tests {
 
     #[test]
     fn slash_field_hint_top_level_key_suggests_rename() {
-        let hint = slash_field_hint("{{ io/username }}").expect("hint");
+        let hint = slash_field_hint("{{ io/user-name }}").expect("hint");
         assert!(hint.contains("rename"), "{hint}");
         assert!(
-            hint.contains(r#"| rename "io/username" as io_username"#),
+            hint.contains(r#"| rename "io/user-name" as io_user_name"#),
             "{hint}"
         );
-        assert!(hint.contains("{{ io_username }}"), "{hint}");
+        assert!(hint.contains("{{ io_user_name }}"), "{hint}");
         assert!(!hint.contains("fields["), "{hint}");
     }
 
     #[test]
     fn validate_template_render_top_level_slash_field_is_rejected_with_rename_hint() {
-        let err = validate_template_render("{{ io/username }}").unwrap_err();
+        let err = validate_template_render("{{ io/user-name }}").unwrap_err();
         assert!(err.contains("/ operator"), "{err}");
         assert!(err.contains("rename"), "{err}");
         assert!(!err.contains("fields["), "{err}");
+    }
+
+    #[test]
+    fn validate_template_render_accepts_division_between_plain_identifiers() {
+        assert!(slash_field_hint("{{ total/count }}").is_none());
+        assert!(
+            validate_template_render("{{ total/count }}").is_ok(),
+            "{:?}",
+            validate_template_render("{{ total/count }}")
+        );
+        // A later dotted field path is still detected.
+        let hint = slash_field_hint("{{ total/count }} {{ a.b/c }}").expect("hint");
+        assert!(hint.contains(r#"{{ a["b/c"] }}"#), "{hint}");
+    }
+
+    // ============================================================
+    // Two-pass render test with wrapped built-in filters
+    // ============================================================
+
+    #[test]
+    fn sentinel_tojson_and_nested_loops_do_not_overflow() {
+        for pass in [Pass::Truthy, Pass::Falsy] {
+            let env = validation_env(pass);
+            let root = || {
+                Value::from_object(ValidationRoot {
+                    globals: Vec::new(),
+                    pass,
+                })
+            };
+            env.render_str("{{ a | tojson }}", root())
+                .expect("tojson on a sentinel");
+            env.render_str(
+                "{% for x in a %}{% for y in x %}{{ y }}{% endfor %}{% endfor %}",
+                root(),
+            )
+            .expect("nested loops on a sentinel");
+        }
+    }
+
+    #[test]
+    fn validation_env_keeps_builtin_filter_results() {
+        for pass in [Pass::Truthy, Pass::Falsy] {
+            let env = validation_env(pass);
+            assert_eq!(env.render_str("{{ '7' | int + 1 }}", ()).unwrap(), "8");
+            assert_eq!(
+                env.render_str("{{ 3.14159 | round(2) }}", ()).unwrap(),
+                "3.14"
+            );
+            assert_eq!(
+                env.render_str(
+                    "{{ 'a,c,b' | split(',') | sort(reverse=true) | join('') }}",
+                    ()
+                )
+                .unwrap(),
+                "cba"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_filter_after_builtin_filter() {
+        for source in [
+            "{{ status | int }}-{{ host | truncat(10) }}",
+            "{{ x | float | round(2) }} {{ y | nosuch }}",
+            "{{ host | split('.') | first }} {{ host | nosuch }}",
+        ] {
+            let err = validate_template_render(source).unwrap_err();
+            assert!(
+                err.contains("truncat") || err.contains("nosuch"),
+                "{source}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_filter_in_alternative_branch() {
+        for source in [
+            "{% if a %}ok{% else %}{{ a | nosuch }}{% endif %}",
+            "{% if not a %}{{ a | nosuch }}{% endif %}",
+            "{% if a is not defined %}{{ a | nosuch }}{% endif %}",
+            "{% if a is undefined %}{{ a | nosuch }}{% endif %}",
+        ] {
+            let err = validate_template_render(source).unwrap_err();
+            assert!(err.contains("nosuch"), "{source}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_template_render_rejects_unknown_filter_in_loop_body() {
+        for source in [
+            "{% for i in items %}{{ i | nosuch }}{% endfor %}",
+            "{% for k, v in m | items %}{{ v | nosuch }}{% endfor %}",
+            "{% for k, v in m | dictsort %}{{ k | nosuch }}{% endfor %}",
+        ] {
+            let err = validate_template_render(source).unwrap_err();
+            assert!(err.contains("nosuch"), "{source}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_template_render_accepts_common_builtin_filters_on_fields() {
+        for source in [
+            "{{ status | int }} {{ (latency | float) > 1.5 }} {{ count + 1 }}",
+            "{{ a | length }} {{ a | join(',') }} {{ a | default('x') | upper }} \
+             {{ a | replace('a', 'b') | lower | trim }} {{ a | tojson }} {{ a | dictsort }} \
+             {{ count | int + 1 }}",
+            "{{ a | sum }} {{ a | max }} {{ a | min }} {{ a | sort }} {{ a | unique }} \
+             {{ a | reverse }} {{ a | batch(2) }}",
+            "{% set ns = namespace(n=0) %}{% for i in items %}{% set ns.n = ns.n + 1 %}{% endfor %}{{ ns.n }}",
+            "{% if status == '500' %}x{% elif status > 3 %}y{% endif %}",
+            "{% if a is defined %}{{ a }}{% else %}none{% endif %}",
+        ] {
+            assert!(
+                validate_template_render(source).is_ok(),
+                "{source}: {:?}",
+                validate_template_render(source)
+            );
+        }
+    }
+
+    /// Guard for minijinja upgrades: every wrapped built-in filter, applied to
+    /// a field, must let the render reach the unknown filter that follows.
+    #[test]
+    fn builtin_filter_wrappers_still_report_unknown_filters() {
+        let required_args = |name: &str| match name {
+            "replace" => "('a', 'b')",
+            "attr" | "selectattr" | "rejectattr" | "groupby" => "('a')",
+            "batch" | "slice" | "indent" => "(2)",
+            "map" => "('upper')",
+            "chain" | "zip" => "(y)",
+            _ => "",
+        };
+        for (name, _) in builtin_filters() {
+            let source = format!(
+                "{{{{ x | {name}{} }}}}{{{{ y | nosuchfilter }}}}",
+                required_args(name)
+            );
+            let err = validate_template_render(&source)
+                .expect_err(&format!("{source} should be rejected"));
+            assert!(err.contains("nosuchfilter"), "{source}: {err}");
+        }
     }
 
     // ============================================================

@@ -627,6 +627,60 @@ fn validate_webhook_body_template_unknown_filter_exits_failure() {
     );
 }
 
+// Test: --validate rejects an unknown filter in a webhook body_template else branch
+#[test]
+fn validate_webhook_body_template_unknown_filter_in_else_exits_failure() {
+    let output = run_validate(
+        "config_webhook_body_template_unknown_filter_in_else.yaml",
+        &[],
+    );
+    let stderr = assert_preflight_failure(&output);
+
+    assert!(
+        stderr.contains("invalid notifier 'wh': body_template render:"),
+        "stderr should report the body_template render error: {}",
+        stderr
+    );
+    assert!(stderr.contains("nosuchfilter"), "{}", stderr);
+}
+
+/// Run `--validate` on a fixture rejected by `Config::validate()` and return stderr.
+fn assert_config_validation_failure(fixture: &str) -> String {
+    let output = run_validate(fixture, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty on failure"
+    );
+    assert!(
+        stderr.contains("Configuration validation error"),
+        "stderr: {stderr}"
+    );
+    stderr
+}
+
+// Test: --validate rejects an unknown filter after a conversion in throttle.key
+#[test]
+fn validate_throttle_key_unknown_filter_after_conversion_exits_failure() {
+    let stderr = assert_config_validation_failure("config_throttle_key_filter_after_int.yaml");
+    assert!(stderr.contains("defaults.throttle.key render:"), "{stderr}");
+    assert!(stderr.contains("truncat"), "{stderr}");
+}
+
+// Test: --validate rejects a notifier listed twice in notify.destinations
+#[test]
+fn validate_duplicate_destinations_exits_failure() {
+    let stderr = assert_config_validation_failure("config_duplicate_destinations.yaml");
+    assert!(
+        stderr.contains(
+            "rule 'r': notify.destinations contains duplicate entry 'mattermost-ops' \
+             (each notifier may appear at most once)"
+        ),
+        "{stderr}"
+    );
+}
+
 // Test: --validate rejects an unsupported Telegram parse_mode (preflight)
 #[test]
 fn validate_telegram_unsupported_parse_mode_exits_failure() {

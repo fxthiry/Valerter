@@ -865,6 +865,18 @@ impl Config {
                     rule.name
                 )));
             }
+
+            // Validate destinations contain no duplicates (each would be
+            // delivered twice to the same notifier)
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for destination in &rule.notify.destinations {
+                if !seen.insert(destination.as_str()) {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': notify.destinations contains duplicate entry '{}' (each notifier may appear at most once)",
+                        rule.name, destination
+                    )));
+                }
+            }
         }
 
         // Templates are checked by sorted name, for a stable error order.

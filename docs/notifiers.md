@@ -68,12 +68,18 @@ from the environment **once, in the template source**, when the notifier is buil
 
 - An undefined variable refuses the configuration with
   `invalid notifier '<name>': body_template: invalid configuration: undefined environment variable: <VAR>`.
-  There is no escape syntax: a literal `${...}` cannot be kept in the template.
+  To send a literal `${VAR}`, write `{{ '$' }}{VAR}`: the substitution does not
+  recognize it and the render produces `${VAR}`.
 - Values rendered from logs are never resolved: a `${HOME}` in a log line is sent as is.
 - The resolved value is inserted **as is** in the template source, before Jinja
   parses it. A value containing `{{`, `{%` or `"` is interpreted by Jinja or breaks
   the JSON body: keep such values out of `body_template` (use a header instead).
-- The resolved template is never logged, so a secret placed there is not exposed.
+- Substitution is a single pass: a value containing `${...}` is inserted as is,
+  never resolved again.
+- The resolved template is never logged, so a secret placed there is not exposed,
+  with one exception: the message of a syntax error may quote a fragment of the
+  resolved source, when a substituted value contains `{{`, `{%` or breaks the
+  template syntax.
 
 ### Checks at startup and in `--validate`
 
@@ -369,12 +375,14 @@ rule that sets it without any Mattermost destination logs
 
 If Mattermost rejects the rule's channel with a 4xx response other than 429
 (webhook locked to its own channel with "Lock to this channel", channel that
-does not exist), the alert is **resent once without `channel`**, so it lands in
-the webhook's default channel instead of being lost, and this warning is logged
-for every such alert until the configuration is fixed:
+does not exist), the alert is **resent once to the notifier's `channel`** if it
+has one and it differs from the rule's, **otherwise without `channel`** (the
+webhook's default channel), so it is not lost, and this warning is logged for
+every such alert until the configuration is fixed (`fallback_channel` is absent
+when the resend has no `channel`):
 
 ```
-WARN Mattermost rejected channel override, resending without channel notifier_name=mattermost-ops rule_name=db_errors channel=db-alerts status=400 Bad Request
+WARN Mattermost rejected channel override, resending to notifier default notifier_name=mattermost-ops rule_name=db_errors channel=db-alerts fallback_channel=ops status=400 Bad Request
 ```
 
 The resend follows the usual retry policy; a 4xx on the resend fails the alert
@@ -465,13 +473,13 @@ If at least one chat succeeds, the alert is delivered (`Ok`) and `valerter_alert
 
 Telegram's hard limit is **4096 Unicode codepoints** per message. Longer messages are truncated to 4095 codepoints + `…` (one Unicode codepoint). Each truncation increments `valerter_alerts_truncated_total{notifier_type="telegram"}` **once per alert** (not per chat) and emits a `warn` log.
 
-The cut is a plain codepoint cut: with `parse_mode: HTML` it can split a tag (`<pre>` left open, `</b` cut in half) or an entity (`&am`). Telegram then rejects the message with a 400, and the plain-text fallback below delivers it.
+The cut is a plain codepoint cut: with `parse_mode: HTML` it can split a tag (`<pre>` left open, `</b` cut in half) or an entity (`&am`). Telegram then rejects the message with a 400 `can't parse entities`, and the plain-text fallback below delivers it.
 
 ### Plain-text fallback on HTML rejection
 
-When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat, the same text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text: the alert is delivered, with its HTML tags and entities shown literally. A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
+When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat with a `description` containing `can't parse entities` (any case; e.g. `Bad Request: can't parse entities: Unclosed start tag at byte offset 4090`), the same text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text: the alert is delivered, with its HTML tags and entities shown literally. A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
 
-The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2` or `Markdown`: those fail immediately.
+The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for any other 400 (`chat not found`, `message text is empty`, a body without that description), for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2` or `Markdown`: those fail immediately.
 
 Frequent fallback warnings mean the template produces invalid HTML: escape every inserted value with `|e` (see below).
 
@@ -527,7 +535,7 @@ All notifiers implement exponential backoff retry, up to **3 attempts** per send
 | `webhook`, `mattermost`, `telegram` | 500ms | 5s |
 | `email` | 1s | 30s |
 
-What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) and the Mattermost [resend without channel](#channel-per-rule) for the two exceptions); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
+What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) and the Mattermost [resend to the notifier default](#channel-per-rule) for the two exceptions); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
 
 After all retries are exhausted, the alert is marked as failed and logged.
 
@@ -552,7 +560,7 @@ Metrics count each alert **once per notifier** (see [Metrics](metrics.md)): `val
 
 1. Verify webhook URL is correct
 2. Check webhook is enabled in Mattermost
-3. Verify channel exists (if specified); a rejected `mattermost_channel` logs `Mattermost rejected channel override, resending without channel`
+3. Verify channel exists (if specified); a rejected `mattermost_channel` logs `Mattermost rejected channel override, resending to notifier default`
 4. Check logs for HTTP errors
 
 ## See Also

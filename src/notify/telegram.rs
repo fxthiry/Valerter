@@ -9,11 +9,12 @@ use crate::config::{
     SecretString, TelegramNotifierConfig, resolve_env_vars, validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
+use crate::http_body::read_body_prefix;
 use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use minijinja::{Environment, context};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::Instrument;
@@ -210,11 +211,33 @@ async fn parse_retry_after(response: reqwest::Response, attempt: u32) -> Duratio
     extract_retry_after(header.as_deref(), &body, attempt)
 }
 
+/// Bytes of a 400 response body read at most to find its `description`.
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+
+/// `description` field of a Bot API error body, if the body is JSON.
+fn error_description(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        description: Option<String>,
+    }
+    serde_json::from_slice::<ErrorBody>(body).ok()?.description
+}
+
+/// Whether a 400 description reports malformed HTML markup (`Bad Request:
+/// can't parse entities: ...`), the only rejection a plain-text resend fixes.
+fn is_entity_parse_error(description: &str) -> bool {
+    description.to_lowercase().contains("can't parse entities")
+}
+
 /// Why a `sendMessage` request to one chat failed for good.
 #[derive(Debug)]
 enum ChatSendError {
     /// 4xx other than 429: the request itself was rejected, not retried.
-    Client(reqwest::StatusCode),
+    /// `description` is the Bot API error description, read for a 400 only.
+    Client {
+        status: reqwest::StatusCode,
+        description: Option<String>,
+    },
     /// 5xx, 429 and network errors until the retry pool was exhausted.
     RetriesExhausted,
 }
@@ -332,9 +355,11 @@ impl TelegramNotifier {
     /// success, `Err` on permanent failure (retries exhausted or 4xx other
     /// than 429).
     ///
-    /// A 400 on an HTML message (malformed markup: a tag cut by truncation, an
-    /// unescaped `<` or `&` in a custom template) is resent once as plain text,
-    /// so the alert is delivered with its tags shown literally rather than lost.
+    /// A 400 `can't parse entities` on an HTML message (malformed markup: a
+    /// tag cut by truncation, an unescaped `<` or `&` in a custom template) is
+    /// resent once as plain text, so the alert is delivered with its tags
+    /// shown literally rather than lost. Any other 400 (`chat not found`,
+    /// `message text is empty`…) fails the chat at once.
     async fn send_to_chat(
         &self,
         alert: &AlertPayload,
@@ -350,9 +375,12 @@ impl TelegramNotifier {
         };
 
         let result = match self.post_with_retry(chat_id, &payload).await {
-            Err(ChatSendError::Client(status))
-                if status == reqwest::StatusCode::BAD_REQUEST
-                    && self.parse_mode.eq_ignore_ascii_case("HTML") =>
+            Err(ChatSendError::Client {
+                status,
+                description: Some(description),
+            }) if status == reqwest::StatusCode::BAD_REQUEST
+                && self.parse_mode.eq_ignore_ascii_case("HTML")
+                && is_entity_parse_error(&description) =>
             {
                 tracing::warn!(
                     notifier_name = %self.name,
@@ -369,7 +397,7 @@ impl TelegramNotifier {
 
         match result {
             Ok(()) => Ok(()),
-            Err(ChatSendError::Client(status)) => {
+            Err(ChatSendError::Client { status, .. }) => {
                 tracing::error!(
                     chat_id = %chat_id,
                     status = %status,
@@ -425,7 +453,22 @@ impl TelegramNotifier {
                     continue;
                 }
                 Ok(response) if response.status().is_client_error() => {
-                    return Err(ChatSendError::Client(response.status()));
+                    let status = response.status();
+                    // Only a 400 can trigger the plain-text fallback: read
+                    // its description, within a size limit (the duration is
+                    // bounded by the request timeout).
+                    let description = if status == reqwest::StatusCode::BAD_REQUEST {
+                        let body =
+                            read_body_prefix(response, ERROR_BODY_MAX_BYTES, TELEGRAM_HTTP_TIMEOUT)
+                                .await;
+                        error_description(&body)
+                    } else {
+                        None
+                    };
+                    return Err(ChatSendError::Client {
+                        status,
+                        description,
+                    });
                 }
                 Ok(response) => {
                     tracing::warn!(
@@ -959,33 +1002,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn send_partial_success_returns_ok_and_does_not_stop_after_failure() {
-        let server = MockServer::start().await;
-        // Every chat gets 200 — we verify the important property: 3 requests
-        // are issued in order even when the middle one hits a permanent error
-        // in a separate test. Here we first establish that the multi-chat
-        // fan-out reaches all chats.
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
-            .expect(3)
-            .mount(&server)
-            .await;
-
-        let notifier = test_notifier(
-            &server,
-            vec![
-                "-100A".to_string(),
-                "-100B".to_string(),
-                "-100C".to_string(),
-            ],
-        );
-        let alert = sample_alert("hi", "body");
-        notifier.send(&alert).await.expect("should succeed");
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn send_one_permanent_failure_in_middle_still_returns_ok_partial() {
         // wiremock can't route per chat_id (it's in the JSON body), but we can
         // assert the partial-success behaviour by exhausting a single mock
@@ -1001,8 +1017,9 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(200).set_body_string("{\"ok\":true}")
                 } else {
-                    ResponseTemplate::new(400)
-                        .set_body_string("{\"ok\":false,\"description\":\"bad chat\"}")
+                    ResponseTemplate::new(400).set_body_string(
+                        "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}",
+                    )
                 }
             })
             .mount(&server)
@@ -1022,10 +1039,9 @@ mod tests {
             .await
             .expect("partial success should be Ok");
 
-        // 1 success + 2 permanent failures. The failing chats get a 400 in HTML
-        // mode, so each is resent once as plain text (rejected again) and then
-        // given up without retry: 1 + 2 * 2 = 5 requests.
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        // 1 success + 2 permanent failures. `chat not found` is not a markup
+        // error: no plain-text resend, no retry: 1 + 2 = 3 requests.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1034,11 +1050,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string("{\"ok\":false,\"description\":\"bad chat\"}"),
+                ResponseTemplate::new(400).set_body_string(
+                    "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}",
+                ),
             )
-            // Each chat: HTML request + one plain-text resend, both rejected.
-            .expect(4)
+            // One request per chat: `chat not found` is not resent.
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1157,29 +1174,101 @@ mod tests {
 
     // ── Plain-text fallback on HTML rejection ────────────────────────────
 
-    /// Mount a responder answering the given statuses in order (the last one
-    /// repeats) and return the notifier pointed at it.
-    async fn scripted_notifier(
+    /// Bot API body of a 400 caused by malformed HTML markup.
+    const ENTITY_ERROR_BODY: &str = "{\"ok\":false,\"error_code\":400,\"description\":\
+        \"Bad Request: can't parse entities: Unclosed start tag at byte offset 4090\"}";
+
+    /// Mount a responder answering the given `(status, body)` pairs in order
+    /// (the last one repeats) and return the notifier pointed at it.
+    async fn scripted_responses(
         server: &MockServer,
-        statuses: &'static [u16],
+        responses: Vec<(u16, &'static str)>,
         parse_mode: &str,
     ) -> TelegramNotifier {
         let calls = Arc::new(AtomicU32::new(0));
         Mock::given(method("POST"))
             .respond_with(move |_req: &wiremock::Request| {
                 let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
-                let status = statuses[n.min(statuses.len() - 1)];
-                ResponseTemplate::new(status).set_body_string(if status == 200 {
-                    "{\"ok\":true}"
-                } else {
-                    "{\"ok\":false,\"description\":\"Bad Request: can't parse entities\"}"
-                })
+                let (status, body) = responses[n.min(responses.len() - 1)];
+                ResponseTemplate::new(status).set_body_string(body)
             })
             .mount(server)
             .await;
         let mut notifier = test_notifier(server, vec!["-100A".to_string()]);
         notifier.parse_mode = parse_mode.to_string();
         notifier
+    }
+
+    /// Like [`scripted_responses`], with `{"ok":true}` for a 200 and a
+    /// realistic `can't parse entities` body for any other status.
+    async fn scripted_notifier(
+        server: &MockServer,
+        statuses: &'static [u16],
+        parse_mode: &str,
+    ) -> TelegramNotifier {
+        let responses: Vec<(u16, &'static str)> = statuses
+            .iter()
+            .map(|&status| {
+                (
+                    status,
+                    if status == 200 {
+                        "{\"ok\":true}"
+                    } else {
+                        ENTITY_ERROR_BODY
+                    },
+                )
+            })
+            .collect();
+        scripted_responses(server, responses, parse_mode).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_400_other_than_entity_parse_error_is_not_resent() {
+        for body in [
+            "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: chat not found\"}",
+            "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}",
+            "",
+            "not json",
+        ] {
+            let server = MockServer::start().await;
+            let responses = vec![(400, body), (200, "{\"ok\":true}")];
+            let notifier = scripted_responses(&server, responses, "HTML").await;
+
+            let err = notifier
+                .send_to_chat(&sample_alert("hi", "body"), "-100A", "text")
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(&err, NotifyError::SendFailed(msg) if msg == "client error: 400 Bad Request"),
+                "{body}: unexpected error: {err:?}"
+            );
+            assert_eq!(request_bodies(&server).await.len(), 1, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn entity_parse_error_is_matched_case_insensitively() {
+        let server = MockServer::start().await;
+        let notifier = scripted_responses(
+            &server,
+            vec![
+                (
+                    400,
+                    "{\"ok\":false,\"error_code\":400,\"description\":\
+                     \"Bad Request: Can't Parse Entities: unsupported start tag\"}",
+                ),
+                (200, "{\"ok\":true}"),
+            ],
+            "HTML",
+        )
+        .await;
+
+        notifier.send(&sample_alert("hi", "body")).await.unwrap();
+
+        assert_eq!(request_bodies(&server).await.len(), 2);
     }
 
     async fn request_bodies(server: &MockServer) -> Vec<serde_json::Value> {
@@ -1478,10 +1567,10 @@ mod tests {
                 .respond_with(move |_req: &wiremock::Request| {
                     let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
                     let status = statuses[n.min(statuses.len() - 1)];
-                    ResponseTemplate::new(status).set_body_string(if status == 200 {
-                        "{\"ok\":true}"
-                    } else {
-                        "{\"ok\":false,\"description\":\"Forbidden\"}"
+                    ResponseTemplate::new(status).set_body_string(match status {
+                        200 => "{\"ok\":true}",
+                        400 => ENTITY_ERROR_BODY,
+                        _ => "{\"ok\":false,\"description\":\"Forbidden\"}",
                     })
                 })
                 .mount(&server)
