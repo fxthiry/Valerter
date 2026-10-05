@@ -21,8 +21,9 @@ pub use metrics::{
     MetricsServer, initialize_destination_metrics, initialize_metrics, register_metric_descriptions,
 };
 pub use notify::{
-    AlertPayload, DEFAULT_QUEUE_CAPACITY, MattermostNotifier, NotificationQueue,
-    NotificationWorker, Notifier, NotifierRegistry, backoff_delay,
+    AlertPayload, DEFAULT_QUEUE_CAPACITY, DrainOutcome, MattermostNotifier, NotificationQueue,
+    NotificationWorker, Notifier, NotifierRegistry, SHUTDOWN_DRAIN_TIMEOUT, await_worker_drain,
+    backoff_delay,
 };
 pub use parser::{RuleParser, record_log_matched, record_parse_error};
 pub use preflight::{PreflightError, PreflightReport, build_http_client, run_preflight};

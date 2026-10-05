@@ -6,6 +6,9 @@
 //! destination task delivers its own alerts one by one. A slow, unavailable,
 //! saturated or panicking destination therefore only delays or loses its own
 //! alerts.
+//!
+//! On shutdown, every destination task drains its queue before stopping, and
+//! [`await_worker_drain`] bounds that drain to [`SHUTDOWN_DRAIN_TIMEOUT`].
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -15,7 +18,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -30,6 +33,13 @@ use crate::error::QueueError;
 /// to a power of two), so up to `DEFAULT_QUEUE_CAPACITY` × number of
 /// notifiers alerts can be pending overall.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 100;
+
+/// Maximum time given to the notification worker to drain its queues on
+/// shutdown, counted once every rule task has stopped.
+///
+/// Fixed so that the whole shutdown sequence (rule tasks, drain, metrics
+/// server) stays under the `TimeoutStopSec=30` of the shipped systemd unit.
+pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Mutable state of a destination queue, guarded by its mutex.
 #[derive(Debug, Default)]
@@ -281,9 +291,10 @@ impl NotificationQueue {
 
 /// Delivery task of a single destination.
 ///
-/// Delivers the alerts of its queue one by one, in arrival order, until
-/// cancelled. Each destination runs its own task, so it can be given its own
-/// cancellation token.
+/// Delivers the alerts of its queue one by one, in arrival order. Once its
+/// drain token is cancelled, it keeps delivering until its queue is empty,
+/// then stops. Each destination runs its own task, so it can be given its own
+/// token.
 struct DestinationWorker {
     queue: Arc<DestinationQueue>,
     notifier: Arc<dyn Notifier>,
@@ -299,14 +310,11 @@ impl Drop for CloseOnExit {
 }
 
 impl DestinationWorker {
-    async fn run(self, cancel: CancellationToken) {
+    async fn run(self, drain: CancellationToken) {
         let _close = CloseOnExit(Arc::clone(&self.queue));
         tracing::debug!(notifier = %self.queue.notifier_name, "Destination worker started");
 
         loop {
-            if cancel.is_cancelled() {
-                break;
-            }
             match self.queue.pop() {
                 Some((alert, dropped)) => {
                     if dropped > 0 {
@@ -319,10 +327,12 @@ impl DestinationWorker {
                     }
                     self.deliver(&alert).await;
                 }
+                // Drain mode: the queue is empty, nothing left to deliver.
+                None if drain.is_cancelled() => break,
                 None => {
                     tokio::select! {
                         _ = self.queue.notify.notified() => {}
-                        _ = cancel.cancelled() => break,
+                        _ = drain.cancelled() => {}
                     }
                 }
             }
@@ -426,17 +436,23 @@ impl NotificationWorker {
         }
     }
 
-    /// Run one delivery task per destination until cancelled.
+    /// Run one delivery task per destination until the queues are drained.
     ///
     /// Each task delivers the alerts of its destination sequentially, in
-    /// arrival order. On cancellation, every task stops once its in-flight
-    /// send is over (pending alerts are not sent) and every destination
-    /// queue is closed.
+    /// arrival order. Once `drain` is cancelled, every task finishes its
+    /// in-flight send, delivers the alerts still pending in its queue, then
+    /// stops and closes its queue. The method returns once every task has
+    /// stopped, after logging `Notification queue drained`.
+    ///
+    /// The drain is not bounded here: wrap the task with
+    /// [`await_worker_drain`] to give it a deadline. `drain` must only be
+    /// cancelled once producers have stopped, otherwise the queues may never
+    /// become empty.
     ///
     /// # Arguments
     ///
-    /// * `cancel` - Cancellation token for graceful shutdown.
-    pub async fn run(&mut self, cancel: CancellationToken) {
+    /// * `drain` - Token cancelled to drain the queues and stop.
+    pub async fn run(&mut self, drain: CancellationToken) {
         tracing::debug!(
             destination_count = self.queue.destinations.len(),
             "Notification worker started"
@@ -457,7 +473,7 @@ impl NotificationWorker {
                 queue: Arc::clone(queue),
                 notifier,
             };
-            tasks.spawn(worker.run(cancel.clone()));
+            tasks.spawn(worker.run(drain.clone()));
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -467,7 +483,73 @@ impl NotificationWorker {
         }
 
         self.queue.close();
-        tracing::debug!("Notification worker shutting down gracefully");
+        let undelivered = self.queue.len();
+        if undelivered == 0 {
+            tracing::info!("Notification queue drained");
+        } else {
+            // Only when a destination task stopped abnormally.
+            tracing::warn!(
+                undelivered,
+                "Notification worker stopped, alerts not delivered"
+            );
+        }
+    }
+}
+
+/// Outcome of [`await_worker_drain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The worker stopped before the deadline.
+    Drained,
+    /// The deadline expired: the worker was aborted with `undelivered`
+    /// alerts still queued (in-flight sends are not counted).
+    TimedOut {
+        /// Alerts left in the queues, across every destination.
+        undelivered: usize,
+    },
+}
+
+/// Wait at most `timeout` for the notification worker task to drain `queue`.
+///
+/// The worker's drain token must already be cancelled. When the deadline
+/// expires, the worker task is aborted (with its destination tasks) and the
+/// alerts left in the queues are reported in a warning.
+///
+/// # Arguments
+///
+/// * `handle` - Task running [`NotificationWorker::run`].
+/// * `queue` - Queue drained by that worker.
+/// * `timeout` - Drain deadline ([`SHUTDOWN_DRAIN_TIMEOUT`] in the daemon).
+pub async fn await_worker_drain(
+    mut handle: JoinHandle<()>,
+    queue: &NotificationQueue,
+    timeout: Duration,
+) -> DrainOutcome {
+    tracing::info!(
+        queued = queue.len(),
+        "Waiting for notification worker to drain queue..."
+    );
+
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(result) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Notification worker stopped unexpectedly");
+            }
+            DrainOutcome::Drained
+        }
+        Err(_) => {
+            // A timeout does not stop the task: abort it explicitly, then
+            // wait for the abort so no delivery runs past this point.
+            handle.abort();
+            let _ = handle.await;
+            let undelivered = queue.len();
+            tracing::warn!(
+                undelivered,
+                timeout_secs = timeout.as_secs(),
+                "Shutdown drain timeout reached, alerts not delivered"
+            );
+            DrainOutcome::TimedOut { undelivered }
+        }
     }
 }
 

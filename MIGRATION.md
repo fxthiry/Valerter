@@ -92,6 +92,15 @@ Until 2.0.3, every alert went through a single queue consumed by a single worker
 
   Alerts based on `rate(valerter_alerts_dropped_total[...])` keep their meaning and need no change; use `valerter_destination_alerts_dropped_total` to see which destination drops.
 
+### Queued alerts are delivered on shutdown
+
+Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the queue. In 2.1.0, on SIGTERM/SIGINT the rule tasks stop first, then every destination delivers its in-flight and queued alerts before the process exits, within 20 seconds. No configuration change is needed; the visible changes are:
+
+- **A shutdown can take up to ~27 s** (about 20 s more than before) when alerts are queued or an endpoint is slow. With empty queues the process still exits at once. If the 20 s expire, the WARN `Shutdown drain timeout reached, alerts not delivered` gives the number of alerts lost (`undelivered`) and the exit code stays 0.
+- **Package upgrades can block `dpkg`/`apt` for up to ~27 s.** The `systemctl restart` run by the Debian `postinst` waits for the old process to drain its queues. This is expected: do not interrupt the upgrade. The shipped unit (`TimeoutStopSec=30`) needs no change.
+- **Raise the stop timeout of container runtimes to 30 s** to benefit from the drain: `docker stop --stop-timeout 30 valerter`, or `stop_grace_period: 30s` in Docker Compose. Docker's default of 10 s kills the process before the drain ends (alerts are then lost, as before 2.1.0). Use the same value for any other supervisor that sends SIGKILL after a delay.
+- **A second SIGTERM/SIGINT forces an immediate exit** (e.g. a second Ctrl+C), whatever the shutdown phase. It logs `Second shutdown signal received, forcing immediate exit` and exits with code **1**, since queued alerts may be lost.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

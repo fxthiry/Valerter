@@ -21,7 +21,10 @@ pub mod webhook;
 pub use email::EmailNotifier;
 pub use mattermost::MattermostNotifier;
 pub use payload::{AlertPayload, format_log_timestamp};
-pub use queue::{DEFAULT_QUEUE_CAPACITY, NotificationQueue, NotificationWorker, backoff_delay};
+pub use queue::{
+    DEFAULT_QUEUE_CAPACITY, DrainOutcome, NotificationQueue, NotificationWorker,
+    SHUTDOWN_DRAIN_TIMEOUT, await_worker_drain, backoff_delay,
+};
 pub use registry::NotifierRegistry;
 pub use telegram::TelegramNotifier;
 pub use traits::Notifier;
