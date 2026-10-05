@@ -1006,6 +1006,103 @@ async fn test_first_empty_eof_reconnects_after_about_one_second() {
     );
 }
 
+/// Run `stream_with_reconnect` against `mock_server` for `duration` under a
+/// local Prometheus recorder (current-thread runtime, so every metric lands
+/// in it). Returns the rendering.
+fn stream_counted(mock_server_setup: impl AsyncFnOnce(&MockServer), duration: Duration) -> String {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let mock_server = MockServer::start().await;
+            mock_server_setup(&mock_server).await;
+            let mut client = TailClient::new(create_config(&mock_server, "_stream:m")).unwrap();
+            let _ = tokio::time::timeout(duration, async {
+                client
+                    .stream_with_reconnect("r", "s", None, |_| async { Ok(()) })
+                    .await
+            })
+            .await;
+        })
+    });
+    handle.render()
+}
+
+/// Value of the `{rule_name="r",vl_source="s"}` series of `name`, if emitted.
+fn rs_counter(rendered: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name}{{rule_name=\"r\",vl_source=\"s\"}} ");
+    rendered
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix)?.parse().ok())
+}
+
+/// A clean EOF counts in `valerter_stream_ends_total`, never in
+/// `valerter_reconnections_total`.
+#[test]
+fn test_clean_eof_counts_stream_end_not_reconnection() {
+    let rendered = stream_counted(
+        async |server| {
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+                )
+                .mount(server)
+                .await;
+        },
+        Duration::from_millis(1500),
+    );
+
+    let ends = rs_counter(&rendered, "valerter_stream_ends_total").unwrap_or(0);
+    assert!(ends >= 1, "expected stream ends, got {ends}:\n{rendered}");
+    assert_eq!(
+        rs_counter(&rendered, "valerter_reconnections_total").unwrap_or(0),
+        0,
+        "a clean EOF is not a reconnection after failure:\n{rendered}"
+    );
+}
+
+/// One clean EOF, then an HTTP 500: one stream end, one reconnection.
+#[test]
+fn test_clean_eof_then_http_500_are_counted_separately() {
+    let rendered = stream_counted(
+        async |server| {
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+                )
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(server)
+                .await;
+        },
+        // EOF at ~0s, ~1s delay, 500 at ~1s, then a >= 1s failure backoff.
+        Duration::from_millis(1700),
+    );
+
+    assert_eq!(
+        rs_counter(&rendered, "valerter_stream_ends_total"),
+        Some(1),
+        "{rendered}"
+    );
+    assert_eq!(
+        rs_counter(&rendered, "valerter_reconnections_total"),
+        Some(1),
+        "{rendered}"
+    );
+}
+
 // =============================================================================
 // URL normalization and header replacement
 // =============================================================================

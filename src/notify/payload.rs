@@ -29,6 +29,33 @@ pub struct AlertPayload {
     pub log_timestamp_formatted: String,
 }
 
+/// Count a permanent delivery failure of `alert` for one notifier.
+///
+/// Increments `valerter_notify_errors_total` and `valerter_alerts_failed_total`
+/// once, with the `rule_name`, `vl_source`, `notifier_name` and
+/// `notifier_type` labels. Notifiers call it for every permanent failure
+/// (retries exhausted, non-retryable response, render error at send time),
+/// once per alert.
+pub(crate) fn record_permanent_failure(
+    alert: &AlertPayload,
+    notifier_name: &str,
+    notifier_type: &'static str,
+) {
+    for name in [
+        "valerter_notify_errors_total",
+        "valerter_alerts_failed_total",
+    ] {
+        metrics::counter!(
+            name,
+            "rule_name" => alert.rule_name.clone(),
+            "vl_source" => alert.vl_source.clone(),
+            "notifier_name" => notifier_name.to_string(),
+            "notifier_type" => notifier_type,
+        )
+        .increment(1);
+    }
+}
+
 /// Format a raw ISO 8601 timestamp to human-readable format.
 ///
 /// # Arguments

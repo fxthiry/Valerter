@@ -5,7 +5,7 @@
 
 use crate::config::SecretString;
 use crate::error::NotifyError;
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
@@ -219,23 +219,7 @@ impl Notifier for MattermostNotifier {
                             status = %status,
                             "Mattermost returned client error, not retrying"
                         );
-                        metrics::counter!(
-                            "valerter_notify_errors_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost",
-                        )
-                        .increment(1);
-                        // Permanent failure - count as failed alert
-                        metrics::counter!(
-                            "valerter_alerts_failed_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost",
-                        )
-                        .increment(1);
+                        record_permanent_failure(alert, &self.name, "mattermost");
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
                     }
                     Ok(response) => {
@@ -270,23 +254,7 @@ impl Notifier for MattermostNotifier {
                 max_retries = MATTERMOST_MAX_RETRIES,
                 "Failed to send alert after all retries"
             );
-            metrics::counter!(
-                "valerter_notify_errors_total",
-                "rule_name" => alert.rule_name.clone(),
-                "vl_source" => alert.vl_source.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "mattermost",
-            )
-            .increment(1);
-            // Permanent failure after retries exhausted
-            metrics::counter!(
-                "valerter_alerts_failed_total",
-                "rule_name" => alert.rule_name.clone(),
-                "vl_source" => alert.vl_source.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "mattermost",
-            )
-            .increment(1);
+            record_permanent_failure(alert, &self.name, "mattermost");
             Err(NotifyError::MaxRetriesExceeded)
         }
         .instrument(span)

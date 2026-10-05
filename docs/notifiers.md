@@ -406,7 +406,7 @@ notifiers:
 
 Each `chat_id` receives one **sequential** `sendMessage` call — Telegram rate-limits at 1 message per second per chat, so parallel delivery wouldn't help. The order in `chat_ids` is preserved.
 
-If at least one chat succeeds, the alert is counted as delivered (`Ok`). Per-chat failures are logged at `error` level and recorded in `valerter_notify_errors_total` / `valerter_alerts_failed_total`.
+If at least one chat succeeds, the alert is delivered (`Ok`) and `valerter_alerts_sent_total` increases by 1, whatever the number of chats that succeeded. If every chat fails, the notifier returns `all chat_ids failed` and `valerter_notify_errors_total` / `valerter_alerts_failed_total` increase by 1, once for the alert. Each failed chat is logged at `error` level and counted in `valerter_telegram_chat_errors_total{rule_name, vl_source, notifier_name}`, the Telegram counterpart of `valerter_email_recipient_errors_total`. A chat delivered through the [plain-text fallback](#plain-text-fallback-on-html-rejection) is a success, not a failure.
 
 ### Message length
 
@@ -477,6 +477,8 @@ All notifiers implement exponential backoff retry, up to **3 attempts** per send
 What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) for its single exception); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
 
 After all retries are exhausted, the alert is marked as failed and logged.
+
+Metrics count each alert **once per notifier** (see [Metrics](metrics.md)): `valerter_alerts_sent_total` when it is delivered (to at least one recipient or chat for `email` and `telegram`), `valerter_notify_errors_total` and `valerter_alerts_failed_total` when it permanently fails. A template that fails to render at send time (`body_template` of a `webhook`, subject or body of an `email`, message text of a `telegram` notifier) is such a permanent failure: nothing is sent, nothing is retried, and both counters increase by 1.
 
 ## Troubleshooting
 

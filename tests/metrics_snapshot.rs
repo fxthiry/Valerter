@@ -17,8 +17,6 @@
 //! recorder for its run and does not race with `src/metrics.rs` unit tests
 //! or other integration suites.
 
-mod common;
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,13 +26,16 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use valerter::config::{
     CompiledParser, CompiledRule, CompiledTemplate, DEFAULT_MAX_STREAMS, DefaultsConfig,
-    JsonParserConfig, MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    JsonParserConfig, MetricsConfig, NotifyConfig, RuntimeConfig, SecretString, ThrottleConfig,
+    VlSourceConfig, WebhookNotifierConfig,
 };
-use valerter::{MetricsServer, RuleEngine};
+use valerter::notify::WebhookNotifier;
+use valerter::{
+    DEFAULT_QUEUE_CAPACITY, DeliverySeries, MetricsInventory, MetricsServer, NotificationQueue,
+    NotificationWorker, NotifierRegistry, NotifierSeries, RuleEngine, RuleSourceSeries,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use common::recording::RecordingDelivery;
 
 /// Re-serialize a JSON value into NDJSON (one event + trailing newline).
 fn ndjson_body(events: &[&Value]) -> Vec<u8> {
@@ -123,6 +124,17 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
         notifiers: None,
         config_dir: std::path::PathBuf::from("."),
     }
+}
+
+/// Real webhook notifier posting to `server`.
+fn webhook(name: &str, server: &MockServer) -> Arc<WebhookNotifier> {
+    let config = WebhookNotifierConfig {
+        url: SecretString::new(format!("{}/hook", server.uri())),
+        method: "POST".to_string(),
+        headers: std::collections::HashMap::new(),
+        body_template: None,
+    };
+    Arc::new(WebhookNotifier::from_config(name, &config, reqwest::Client::new()).unwrap())
 }
 
 /// Parse a Prometheus exposition body and return the set of `name{labelkeys}`
@@ -214,31 +226,80 @@ async fn metrics_snapshot_two_sources_one_rule() {
     });
     ready_rx.await.expect("metrics server should signal ready");
 
-    // 3) Initialize all known metric series so the snapshot is deterministic
-    //    even before counters tick. Mirrors the call valerter's main does.
-    let rule_source_pairs: Vec<(&str, &str)> =
-        vec![("snapshot_rule", "vlprod"), ("snapshot_rule", "vldev")];
-    let source_names: Vec<&str> = vec!["vlprod", "vldev"];
-    // Pass at least one notifier so the per-notifier sentinel counters
-    // (`alerts_failed_total{notifier}` / `notify_errors_total{notifier}`)
-    // are seeded and the snapshot can assert their presence.
-    let notifier_names: Vec<&str> = vec!["sentinel"];
-    valerter::initialize_metrics(&rule_source_pairs, &source_names, &notifier_names);
+    // 3) Real delivery path: `dest` is a webhook notifier posting to a
+    //    wiremock endpoint, `idle` is declared but used by no rule.
+    let hook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&hook_server)
+        .await;
+    let mut registry = NotifierRegistry::new();
+    registry.register(webhook("dest", &hook_server)).unwrap();
+    registry.register(webhook("idle", &hook_server)).unwrap();
+    let registry = Arc::new(registry);
+
+    // 4) Initialize all known metric series so the snapshot is deterministic
+    //    even before counters tick. Mirrors the inventory valerter's main
+    //    builds: one pair per (rule, source), one triplet per destination.
+    let rule_sources = ["vldev", "vlprod"].map(|source| RuleSourceSeries {
+        rule_name: "snapshot_rule".to_string(),
+        vl_source: source.to_string(),
+        regex_parser: false,
+    });
+    let deliveries = ["vldev", "vlprod"].map(|source| DeliverySeries {
+        rule_name: "snapshot_rule".to_string(),
+        vl_source: source.to_string(),
+        notifier_name: "dest".to_string(),
+        notifier_type: "webhook".to_string(),
+    });
+    let notifiers = ["dest", "idle"].map(|name| NotifierSeries {
+        name: name.to_string(),
+        notifier_type: "webhook".to_string(),
+    });
+    valerter::initialize_metrics(&MetricsInventory {
+        sources: vec!["vldev".to_string(), "vlprod".to_string()],
+        rule_sources: rule_sources.to_vec(),
+        deliveries: deliveries.to_vec(),
+        notifiers: notifiers.to_vec(),
+    });
     // Per-destination queue series, seeded for every notifier. `idle` never
     // receives an alert, so its series must stay at their initial zero.
-    valerter::initialize_destination_metrics(&[("dest", "recording"), ("idle", "recording")]);
+    valerter::initialize_destination_metrics(&[("dest", "webhook"), ("idle", "webhook")]);
 
-    // 4) Run the engine briefly so each metric path fires at least once.
-    let mut delivery = RecordingDelivery::start(&["dest", "idle"]);
-    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
+    // Scrape before any event: every seeded series is at 0.
+    let url = format!("http://127.0.0.1:{}/metrics", port);
+    let initial = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("scrape should succeed")
+        .text()
+        .await
+        .expect("body should decode");
+
+    // 5) Run the engine briefly so each metric path fires at least once.
+    let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry.clone());
+    let worker_cancel = CancellationToken::new();
+    let worker_cancel_clone = worker_cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel_clone).await });
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
     let cancel_for_engine = cancel.clone();
     let engine_handle = tokio::spawn(async move { engine.run(cancel_for_engine).await });
 
-    // Drain a few alerts to make sure the throttle/passed/sent paths run.
-    delivery.drain(5, Duration::from_secs(2)).await;
+    // Wait until the webhook delivered at least one alert, so the
+    // throttle/passed/sent paths ran.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hook_server.received_requests().await.unwrap().is_empty()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Let the worker record the metrics of the delivered alerts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 5) Scrape /metrics.
-    let url = format!("http://127.0.0.1:{}/metrics", port);
+    // 6) Scrape /metrics.
     let body = reqwest::Client::new()
         .get(&url)
         .send()
@@ -248,13 +309,14 @@ async fn metrics_snapshot_two_sources_one_rule() {
         .await
         .expect("body should decode");
 
-    // 6) Tear down. The engine task runs forever until cancelled.
+    // 7) Tear down. The engine task runs forever until cancelled.
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), engine_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), metrics_handle).await;
-    delivery.shutdown().await;
+    worker_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), worker_handle).await;
 
-    // 7) Assert the snapshot. We check that *every expected* metric series
+    // 8) Assert the snapshot. We check that *every expected* metric series
     //    (name + label-key set) is present. The actual output may carry
     //    additional series from per-(rule, source) initialization that we
     //    explicitly seeded, so we tolerate supersets.
@@ -266,15 +328,15 @@ async fn metrics_snapshot_two_sources_one_rule() {
     let expected: Arc<[&'static str]> = Arc::from([
         // Per-(rule, source) counters seeded by initialize_metrics.
         "valerter_alerts_passed_total{rule_name,vl_source}",
-        "valerter_alerts_sent_total{rule_name,vl_source}",
         "valerter_alerts_throttled_total{rule_name,vl_source}",
         "valerter_logs_matched_total{rule_name,vl_source}",
-        "valerter_parse_errors_total{rule_name,vl_source}",
         "valerter_reconnections_total{rule_name,vl_source}",
         "valerter_rule_errors_total{rule_name,vl_source}",
         "valerter_rule_panics_total{rule_name,vl_source}",
-        // Per-(rule, source) discarded counter (3-label, reason="oversized").
+        "valerter_stream_ends_total{rule_name,vl_source}",
+        // Per-(rule, source) counters carrying their emission label.
         "valerter_lines_discarded_total{reason,rule_name,vl_source}",
+        "valerter_parse_errors_total{error_type,rule_name,vl_source}",
         // Per-(rule, source) gauge for last query timestamp.
         "valerter_last_query_timestamp{rule_name,vl_source}",
         // Per-(rule, source) histogram exported as a Prometheus summary by
@@ -283,9 +345,10 @@ async fn metrics_snapshot_two_sources_one_rule() {
         "valerter_query_duration_seconds{quantile,rule_name,vl_source}",
         "valerter_query_duration_seconds_count{rule_name,vl_source}",
         "valerter_query_duration_seconds_sum{rule_name,vl_source}",
-        // Per-notifier sentinel counters.
-        "valerter_alerts_failed_total{notifier}",
-        "valerter_notify_errors_total{notifier}",
+        // Per-(rule, source, destination) notification counters.
+        "valerter_alerts_failed_total{notifier_name,notifier_type,rule_name,vl_source}",
+        "valerter_alerts_sent_total{notifier_name,notifier_type,rule_name,vl_source}",
+        "valerter_notify_errors_total{notifier_name,notifier_type,rule_name,vl_source}",
         // Global / shared counters & gauges.
         "valerter_alerts_dropped_total",
         "valerter_queue_size",
@@ -314,11 +377,50 @@ async fn metrics_snapshot_two_sources_one_rule() {
         body
     );
 
+    // Before any event, every seeded series is present at 0, with the
+    // label values of its emission.
+    for series in [
+        "valerter_alerts_sent_total{rule_name=\"snapshot_rule\",vl_source=\"vlprod\",notifier_name=\"dest\",notifier_type=\"webhook\"} 0",
+        "valerter_alerts_failed_total{rule_name=\"snapshot_rule\",vl_source=\"vldev\",notifier_name=\"dest\",notifier_type=\"webhook\"} 0",
+        "valerter_parse_errors_total{rule_name=\"snapshot_rule\",vl_source=\"vldev\",error_type=\"invalid_json\"} 0",
+        "valerter_lines_discarded_total{rule_name=\"snapshot_rule\",vl_source=\"vlprod\",reason=\"invalid_utf8\"} 0",
+        "valerter_stream_ends_total{rule_name=\"snapshot_rule\",vl_source=\"vlprod\"} 0",
+    ] {
+        assert!(
+            initial.lines().any(|l| l == series),
+            "missing `{}` in the initial /metrics:\n{}",
+            series,
+            initial
+        );
+    }
+
+    // The seeded series is the one incremented: a single alerts_sent series
+    // for (snapshot_rule, vlprod), now above 0.
+    let sent_prod: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            l.starts_with("valerter_alerts_sent_total{") && l.contains("vl_source=\"vlprod\"")
+        })
+        .collect();
+    assert_eq!(
+        sent_prod.len(),
+        1,
+        "one alerts_sent series: {:?}",
+        sent_prod
+    );
+    assert!(
+        sent_prod[0].starts_with(
+            "valerter_alerts_sent_total{rule_name=\"snapshot_rule\",vl_source=\"vlprod\",notifier_name=\"dest\",notifier_type=\"webhook\"} "
+        ) && !sent_prod[0].ends_with(" 0"),
+        "unexpected alerts_sent series: {:?}",
+        sent_prod
+    );
+
     // The per-destination series exist at 0 for a notifier that never
     // received anything.
     for series in [
-        "valerter_destination_queue_size{notifier_name=\"idle\",notifier_type=\"recording\"} 0",
-        "valerter_destination_alerts_dropped_total{notifier_name=\"idle\",notifier_type=\"recording\"} 0",
+        "valerter_destination_queue_size{notifier_name=\"idle\",notifier_type=\"webhook\"} 0",
+        "valerter_destination_alerts_dropped_total{notifier_name=\"idle\",notifier_type=\"webhook\"} 0",
     ] {
         assert!(
             body.lines().any(|l| l == series),
@@ -327,6 +429,42 @@ async fn metrics_snapshot_two_sources_one_rule() {
             body
         );
     }
+
+    // A notifier used by no rule gets no notification series.
+    assert!(
+        !body
+            .lines()
+            .any(|l| l.starts_with("valerter_alerts_") && l.contains("notifier_name=\"idle\"")),
+        "no notification series for the unused notifier:\n{}",
+        body
+    );
+
+    // Reduced label sets are gone: no `{notifier}` series, no alerts_sent
+    // without notifier_name, no parse_errors without error_type, and no
+    // notifier config error counter.
+    for forbidden in [
+        "valerter_alerts_failed_total{notifier}",
+        "valerter_notify_errors_total{notifier}",
+        "valerter_alerts_sent_total{rule_name,vl_source}",
+        "valerter_parse_errors_total{rule_name,vl_source}",
+    ] {
+        assert!(
+            !actual.contains(forbidden),
+            "series `{}` must not exist:\n{}",
+            forbidden,
+            body
+        );
+    }
+    assert!(
+        !body.contains("notifier=\""),
+        "no series may carry a `notifier` label:\n{}",
+        body
+    );
+    assert!(
+        !body.contains("valerter_notifier_config_errors_total"),
+        "valerter_notifier_config_errors_total must be removed:\n{}",
+        body
+    );
 
     // Hard regression: the v1.x per-rule gauge MUST be gone in v2.0.0.
     assert!(

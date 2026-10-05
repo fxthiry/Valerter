@@ -8,7 +8,7 @@ use crate::config::{
     validate_resolved_url,
 };
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use chrono::Utc;
 use minijinja::{Environment, context};
@@ -252,6 +252,32 @@ impl WebhookNotifier {
         })
     }
 
+    /// Build the request body: the rendered `body_template`, or the default
+    /// JSON payload.
+    fn build_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
+        match &self.body_template_source {
+            Some(template_source) => {
+                let rendered = render_body_template(template_source, alert)?;
+                // Safety net: warn (without the body, which may hold secrets or
+                // log data) but still send, as some endpoints tolerate it.
+                if let Some(e) = json_body_error(&self.headers, &rendered) {
+                    tracing::warn!(
+                        line = e.line(),
+                        column = e.column(),
+                        "Webhook body is not valid JSON"
+                    );
+                }
+                Ok(rendered)
+            }
+            None => {
+                let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
+                serde_json::to_string(&payload).map_err(|e| {
+                    NotifyError::SendFailed(format!("JSON serialization error: {}", e))
+                })
+            }
+        }
+    }
+
     /// Get the resolved URL (for testing).
     #[cfg(test)]
     pub fn url(&self) -> &str {
@@ -295,26 +321,13 @@ impl Notifier for WebhookNotifier {
         );
 
         async {
-            // Build request body
-            let body = match &self.body_template_source {
-                Some(template_source) => {
-                    let rendered = render_body_template(template_source, alert)?;
-                    // Safety net: warn (without the body, which may hold secrets or
-                    // log data) but still send, as some endpoints tolerate it.
-                    if let Some(e) = json_body_error(&self.headers, &rendered) {
-                        tracing::warn!(
-                            line = e.line(),
-                            column = e.column(),
-                            "Webhook body is not valid JSON"
-                        );
-                    }
-                    rendered
-                }
-                None => {
-                    let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
-                    serde_json::to_string(&payload).map_err(|e| {
-                        NotifyError::SendFailed(format!("JSON serialization error: {}", e))
-                    })?
+            // A body that cannot be built is a permanent failure for this
+            // alert: count it, send nothing.
+            let body = match self.build_body(alert) {
+                Ok(body) => body,
+                Err(e) => {
+                    record_permanent_failure(alert, &self.name, "webhook");
+                    return Err(e);
                 }
             };
             tracing::trace!(body_len = body.len(), "Request body built");
@@ -351,23 +364,7 @@ impl Notifier for WebhookNotifier {
                             status = %status,
                             "Webhook returned client error, not retrying"
                         );
-                        metrics::counter!(
-                            "valerter_notify_errors_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "webhook",
-                        )
-                        .increment(1);
-                        // Permanent failure - count as failed alert
-                        metrics::counter!(
-                            "valerter_alerts_failed_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "webhook",
-                        )
-                        .increment(1);
+                        record_permanent_failure(alert, &self.name, "webhook");
                         return Err(NotifyError::SendFailed(format!("client error: {}", status)));
                     }
                     Ok(response) => {
@@ -401,23 +398,7 @@ impl Notifier for WebhookNotifier {
                 max_retries = WEBHOOK_MAX_RETRIES,
                 "Failed to send webhook alert after all retries"
             );
-            metrics::counter!(
-                "valerter_notify_errors_total",
-                "rule_name" => alert.rule_name.clone(),
-                "vl_source" => alert.vl_source.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "webhook",
-            )
-            .increment(1);
-            // Permanent failure after retries exhausted
-            metrics::counter!(
-                "valerter_alerts_failed_total",
-                "rule_name" => alert.rule_name.clone(),
-                "vl_source" => alert.vl_source.clone(),
-                "notifier_name" => self.name.clone(),
-                "notifier_type" => "webhook",
-            )
-            .increment(1);
+            record_permanent_failure(alert, &self.name, "webhook");
             Err(NotifyError::MaxRetriesExceeded)
         }
         .instrument(span)
@@ -1189,5 +1170,58 @@ mod tests {
             parsed["text"],
             format!("*{}*\n{}", alert.message.title, alert.message.body)
         );
+    }
+
+    // ===================================================================
+    // Render failure at send time
+    // ===================================================================
+
+    #[test]
+    fn render_failure_at_send_is_counted_and_sends_nothing() {
+        use crate::notify::test_metrics::{counter_total, run_with_recorder};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ((err, requests), rendered) = run_with_recorder(|| async {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let config = WebhookNotifierConfig {
+                url: SecretString::new(format!("{}/hook", server.uri())),
+                method: "POST".to_string(),
+                headers: HashMap::new(),
+                body_template: None,
+            };
+            let mut notifier =
+                WebhookNotifier::from_config("hook", &config, reqwest::Client::new()).unwrap();
+            // Fails only at render time (load-time validation bypassed).
+            notifier.body_template_source = Some("{{ title | no_such_filter }}".to_string());
+
+            let err = notifier
+                .send(&make_alert_payload("r"))
+                .await
+                .expect_err("render failure must fail the alert");
+            (err, server.received_requests().await.unwrap().len())
+        });
+
+        assert_eq!(requests, 0, "no request may reach the endpoint");
+        assert!(
+            matches!(&err, NotifyError::SendFailed(_))
+                && err
+                    .to_string()
+                    .starts_with("failed to send notification: template render error: "),
+            "unexpected error: {err:?}"
+        );
+        for series in [
+            "valerter_notify_errors_total{rule_name=\"r\",vl_source=\"vlprod\",notifier_name=\"hook\",notifier_type=\"webhook\"} 1",
+            "valerter_alerts_failed_total{rule_name=\"r\",vl_source=\"vlprod\",notifier_name=\"hook\",notifier_type=\"webhook\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "missing `{series}` in:\n{rendered}"
+            );
+        }
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
     }
 }

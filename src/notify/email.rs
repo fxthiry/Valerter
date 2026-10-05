@@ -14,7 +14,7 @@ use crate::config::{
     validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
@@ -572,9 +572,18 @@ impl Notifier for EmailNotifier {
         );
 
         async {
-            // Render templates once for all recipients
-            let subject = self.render_subject(alert)?;
-            let body = self.render_body(alert)?;
+            // Render templates once for all recipients. A render error is a
+            // permanent failure for this alert: count it, send nothing.
+            let rendered = self
+                .render_subject(alert)
+                .and_then(|subject| self.render_body(alert).map(|body| (subject, body)));
+            let (subject, body) = match rendered {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    record_permanent_failure(alert, &self.name, "email");
+                    return Err(e);
+                }
+            };
             tracing::trace!(
                 subject_len = subject.len(),
                 body_len = body.len(),
@@ -638,23 +647,7 @@ impl Notifier for EmailNotifier {
                     recipient_count = failure_count,
                     "Email delivery failed to all recipients"
                 );
-                metrics::counter!(
-                    "valerter_notify_errors_total",
-                    "rule_name" => alert.rule_name.clone(),
-                    "vl_source" => alert.vl_source.clone(),
-                    "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email",
-                )
-                .increment(1);
-                // Permanent failure - all recipients failed
-                metrics::counter!(
-                    "valerter_alerts_failed_total",
-                    "rule_name" => alert.rule_name.clone(),
-                    "vl_source" => alert.vl_source.clone(),
-                    "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email",
-                )
-                .increment(1);
+                record_permanent_failure(alert, &self.name, "email");
                 Err(NotifyError::SendFailed(format!(
                     "all {} recipients failed",
                     failure_count
@@ -1933,5 +1926,48 @@ Accent Color: {{ accent_color }}"#;
             "Built-in filters should pass: {:?}",
             result.err()
         );
+    }
+
+    // ===================================================================
+    // Render failure at send time
+    // ===================================================================
+
+    #[test]
+    fn render_failure_at_send_is_counted_and_sends_nothing() {
+        use crate::notify::test_metrics::{counter_total, run_with_recorder};
+
+        // Subject, then body: each fails only at render time.
+        for (subject, body) in [
+            ("{{ title | no_such_filter }}", None),
+            ("{{ title }}", Some("{{ body | no_such_filter }}")),
+        ] {
+            let mock = Arc::new(MockEmailTransport::new());
+            let notifier = EmailNotifier::with_transport(
+                "mail",
+                mock.clone(),
+                "sender@test.com".parse().unwrap(),
+                vec!["dest@test.com".parse().unwrap()],
+                subject,
+                body,
+            );
+
+            let (result, rendered) =
+                run_with_recorder(|| async { notifier.send(&make_alert_payload("r")).await });
+
+            assert!(
+                matches!(result, Err(NotifyError::TemplateError(_))),
+                "unexpected result: {result:?}"
+            );
+            assert_eq!(mock.send_count(), 0, "no SMTP send may be attempted");
+            assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 1);
+            assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 1);
+            assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+            assert!(
+                rendered.contains(
+                    "valerter_alerts_failed_total{rule_name=\"r\",vl_source=\"vlprod\",notifier_name=\"mail\",notifier_type=\"email\"} 1"
+                ),
+                "unexpected labels in:\n{rendered}"
+            );
+        }
     }
 }

@@ -20,6 +20,7 @@ pub mod webhook;
 // Re-exports
 pub use email::EmailNotifier;
 pub use mattermost::MattermostNotifier;
+pub(crate) use payload::record_permanent_failure;
 pub use payload::{AlertPayload, format_log_timestamp};
 pub use queue::{
     DEFAULT_QUEUE_CAPACITY, DrainOutcome, NotificationQueue, NotificationWorker,
@@ -30,5 +31,7 @@ pub use telegram::TelegramNotifier;
 pub use traits::Notifier;
 pub use webhook::WebhookNotifier;
 
+#[cfg(test)]
+mod test_metrics;
 #[cfg(test)]
 mod tests;

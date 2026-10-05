@@ -604,8 +604,10 @@ impl TailClient {
                 delay_ms = delay.as_millis(),
                 "Stream ended, reconnecting"
             );
+            // A clean end is not a failure: `valerter_reconnections_total`
+            // only counts reconnections after a failure.
             metrics::counter!(
-                "valerter_reconnections_total",
+                "valerter_stream_ends_total",
                 "rule_name" => rule_name.to_string(),
                 "vl_source" => vl_source.to_string(),
             )

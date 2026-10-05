@@ -239,7 +239,7 @@ pub(crate) fn validate_url(url: &str) -> Result<(), String> {
 /// it must parse and use the `http` or `https` scheme. No exception is made
 /// for a value still containing `${`.
 ///
-/// Like [`validate_url`], the URL is never echoed in the error.
+/// Like `validate_url`, the URL is never echoed in the error.
 pub fn validate_resolved_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     match parsed.scheme() {

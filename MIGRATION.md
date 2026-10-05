@@ -122,6 +122,35 @@ Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the qu
 - **Raise the stop timeout of container runtimes to 30 s** to benefit from the drain: `docker stop --stop-timeout 30 valerter`, or `stop_grace_period: 30s` in Docker Compose. Docker's default of 10 s kills the process before the drain ends (alerts are then lost, as before 2.1.0). Use the same value for any other supervisor that sends SIGKILL after a delay.
 - **A second SIGTERM/SIGINT forces an immediate exit** (e.g. a second Ctrl+C), whatever the shutdown phase. It logs `Second shutdown signal received, forcing immediate exit` and exits with code **1**, since queued alerts may be lost.
 
+### Prometheus metrics: label sets and counting
+
+2.1.0 makes the series exposed at startup match the ones that are incremented, and gives each counter a single meaning. No configuration change is needed; review your PromQL queries, dashboards and alerts:
+
+- **Breaking: startup series with reduced labels are removed.** Until 2.0.3, valerter seeded at startup `valerter_alerts_sent_total{rule_name, vl_source}`, `valerter_parse_errors_total{rule_name, vl_source}` (without `error_type`), `valerter_alerts_failed_total{notifier}` and `valerter_notify_errors_total{notifier}`. Nothing ever incremented them: they stayed at 0 next to the real series, which only appeared at the first event. They are gone, and every series is now created at 0 with its emission labels (`rule_name`, `vl_source`, `notifier_name`, `notifier_type` for the notification counters; `error_type` for parse errors; see [docs/metrics.md](docs/metrics.md#series-initialized-at-startup)). Replace the `notifier` label with `notifier_name`:
+
+  ```yaml
+  # before
+  expr: increase(valerter_alerts_failed_total{notifier="mattermost-ops"}[1h]) > 0
+  # after
+  expr: sum by (notifier_name) (increase(valerter_alerts_failed_total{notifier_name="mattermost-ops"}[1h])) > 0
+  ```
+
+  Unfiltered sums (`sum(valerter_alerts_sent_total)`) keep their values, since the removed series were always 0. A notifier used by no enabled rule no longer has `valerter_alerts_failed_total` or `valerter_notify_errors_total` series: list notifiers with `valerter_destination_queue_size`, which exists for every notifier.
+- **Breaking: `valerter_notifier_config_errors_total` is removed.** It was incremented before the metrics exporter started and the error stops valerter with exit code 1, so no scrape could ever see it. To detect a notifier configuration error (e.g. an undefined `${VAR}`), alert on the systemd unit state (`failed`, repeated restarts) or on the ERROR log `Notifier configuration error`, and run `valerter --validate` before deploying.
+- **Breaking: `valerter_reconnections_total` no longer counts clean stream ends.** 2.0.3 started counting a clean end of the stream (HTTP 200 then EOF without error) in `valerter_reconnections_total`, in a release announced without breaking changes. 2.1.0 reverts that choice: `valerter_reconnections_total` only counts reconnections after a failure (connection error, HTTP error response, error while reading the stream), and clean ends are counted in the new `valerter_stream_ends_total{rule_name, vl_source}`. Dashboards and alerts built since 2.0.3 see lower values, especially behind a proxy or load balancer that closes idle streams. To get the 2.0.3 total back:
+
+  ```promql
+  valerter_reconnections_total + valerter_stream_ends_total
+  ```
+
+  An alert such as `rate(valerter_reconnections_total[5m]) > 0` now only fires on failures, which makes it usable without filtering out normal stream ends.
+- **Breaking: Telegram alerts are counted once per alert.** Until 2.0.3, a Telegram notifier incremented `valerter_alerts_sent_total` once per successful chat and `valerter_notify_errors_total` / `valerter_alerts_failed_total` once per failed chat, even when the alert reached other chats. It now counts like the email notifier: `valerter_alerts_sent_total` +1 when at least one chat received the alert, `valerter_notify_errors_total` and `valerter_alerts_failed_total` +1 only when every chat failed. For a notifier with several `chat_ids`, `valerter_alerts_sent_total` is therefore divided by the number of chats, and `rate(valerter_alerts_failed_total[5m]) > 0` no longer fires on a partial failure. To watch individual chats, use the new `valerter_telegram_chat_errors_total{rule_name, vl_source, notifier_name}` (one unit per failed chat; a chat delivered through the plain-text fallback is not a failure):
+
+  ```yaml
+  expr: increase(valerter_telegram_chat_errors_total[15m]) > 0
+  ```
+- **Template render errors at send time are counted.** A webhook `body_template`, an email subject or body, or a Telegram message text that fails to render now increments `valerter_notify_errors_total` and `valerter_alerts_failed_total`; it used to be only logged. Most of these errors are now refused at startup (see [Stricter configuration validation](#stricter-configuration-validation)).
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

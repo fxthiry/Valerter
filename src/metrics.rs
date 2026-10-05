@@ -27,11 +27,11 @@ pub fn register_metric_descriptions() {
     );
     describe_counter!(
         "valerter_alerts_failed_total",
-        "Total number of alerts that permanently failed after all retries exhausted"
+        "Total number of alerts that permanently failed for a notifier, once per alert and notifier"
     );
     describe_counter!(
         "valerter_alerts_sent_total",
-        "Total number of alerts successfully sent to notification channels"
+        "Total number of alerts delivered by a notifier, once per alert and notifier"
     );
     describe_counter!(
         "valerter_alerts_throttled_total",
@@ -52,7 +52,16 @@ pub fn register_metric_descriptions() {
     );
     describe_counter!(
         "valerter_notify_errors_total",
-        "Total number of notification errors after retries exhausted"
+        "Total number of permanent notification failures (retries exhausted, \
+         non-retryable response or render error), once per alert and notifier"
+    );
+    describe_counter!(
+        "valerter_email_recipient_errors_total",
+        "Number of email recipients an alert could not be delivered to"
+    );
+    describe_counter!(
+        "valerter_telegram_chat_errors_total",
+        "Number of Telegram chats an alert could not be delivered to"
     );
     describe_counter!(
         "valerter_alerts_truncated_total",
@@ -63,8 +72,16 @@ pub fn register_metric_descriptions() {
         "Total number of log parsing errors (regex no-match or invalid JSON)"
     );
     describe_counter!(
+        "valerter_lines_discarded_total",
+        "Total number of streamed lines discarded before parsing (oversized or invalid UTF-8)"
+    );
+    describe_counter!(
         "valerter_reconnections_total",
-        "Total number of VictoriaLogs reconnections"
+        "Total number of VictoriaLogs reconnections after a failure"
+    );
+    describe_counter!(
+        "valerter_stream_ends_total",
+        "Total number of clean VictoriaLogs stream ends (EOF without error), each followed by a reconnection"
     );
     describe_counter!(
         "valerter_rule_panics_total",
@@ -112,8 +129,10 @@ pub fn register_metric_descriptions() {
 
 /// Metrics server for Prometheus exposition.
 ///
-/// Starts an HTTP server that serves metrics on `/metrics` and
-/// a health check on `/health`.
+/// Starts an HTTP server that serves metrics on `/metrics`, the only
+/// documented path. The listener comes from `metrics-exporter-prometheus`:
+/// it does no routing of its own beyond a built-in `/health` reply and serves
+/// the metrics on any other path; valerter documents neither behavior.
 pub struct MetricsServer {
     port: u16,
     /// Optional channel to signal when the recorder is ready.
@@ -201,25 +220,55 @@ pub fn is_recorder_installed() -> bool {
     RECORDER_INSTALLED.get().is_some()
 }
 
+/// One `(rule, source)` pair the engine runs a task for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSourceSeries {
+    pub rule_name: String,
+    pub vl_source: String,
+    /// Whether the rule uses a regex parser (it can then emit
+    /// `error_type="regex_no_match"`).
+    pub regex_parser: bool,
+}
+
+/// One `(rule, source, destination)` triplet an alert can be delivered to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySeries {
+    pub rule_name: String,
+    pub vl_source: String,
+    pub notifier_name: String,
+    pub notifier_type: String,
+}
+
+/// A registered notifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifierSeries {
+    pub name: String,
+    pub notifier_type: String,
+}
+
+/// Every label combination [`initialize_metrics`] seeds at startup.
+///
+/// Built by the binary from the enabled rules (same source fan-out as the
+/// engine), their destinations and the notifier registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsInventory {
+    /// Every configured `vl_source`, whether a rule tails it or not.
+    pub sources: Vec<String>,
+    /// Every `(enabled rule, resolved source)` pair.
+    pub rule_sources: Vec<RuleSourceSeries>,
+    /// Every `(enabled rule, resolved source, rule destination)` triplet.
+    pub deliveries: Vec<DeliverySeries>,
+    /// Every registered notifier, used or not.
+    pub notifiers: Vec<NotifierSeries>,
+}
+
 /// Initialize all known metrics to their default values.
 ///
-/// This function should be called immediately after the Prometheus recorder
-/// is installed to ensure all metrics are visible in `/metrics` from startup,
-/// even before any events occur.
-///
-/// # Arguments
-///
-/// * `rule_source_pairs` - List of `(rule_name, vl_source)` pairs to initialize
-///   per-(rule, source) counters. Same shape the engine spawns tasks for.
-/// * `source_names` - List of every configured `vl_source` (independent of
-///   which rules tail it). Used to seed the per-source `valerter_vl_source_up`
-///   gauge to 0 at startup.
-/// * `notifier_names` - List of notifier names to initialize per-notifier counters.
-pub fn initialize_metrics(
-    rule_source_pairs: &[(&str, &str)],
-    source_names: &[&str],
-    notifier_names: &[&str],
-) {
+/// Call it right after the Prometheus recorder is installed so that every
+/// series is visible in `/metrics` from startup, before any event. Each series
+/// gets exactly the labels (names and order) it is emitted with, so that the
+/// seeded series is the one later incremented.
+pub fn initialize_metrics(inventory: &MetricsInventory) {
     use metrics::{counter, gauge};
 
     // Initialize gauges with their initial values
@@ -229,101 +278,125 @@ pub fn initialize_metrics(
 
     // Initialize per-source `vl_source_up` gauge to 0 for every configured
     // source. The engine flips it to 1 on the first successful tail connect.
-    for source_name in source_names {
-        gauge!("valerter_vl_source_up", "vl_source" => source_name.to_string()).set(0.0);
+    for source_name in &inventory.sources {
+        gauge!("valerter_vl_source_up", "vl_source" => source_name.clone()).set(0.0);
     }
 
     // Initialize counters without labels (global counters)
     counter!("valerter_alerts_dropped_total").absolute(0);
 
-    // Initialize per-(rule, source) counters. Every per-rule metric also
-    // carries `vl_source` (v2.0.0 multi-source observability).
-    for (rule_name, vl_source) in rule_source_pairs {
-        counter!(
+    // Per-(rule, source) series. Every per-rule metric also carries
+    // `vl_source` (v2.0.0 multi-source observability).
+    for pair in &inventory.rule_sources {
+        let rule_name = &pair.rule_name;
+        let vl_source = &pair.vl_source;
+        for name in [
             "valerter_logs_matched_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
-            "valerter_alerts_sent_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
             "valerter_alerts_throttled_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
             "valerter_alerts_passed_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
-            "valerter_parse_errors_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
             "valerter_rule_panics_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
             "valerter_rule_errors_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
             "valerter_reconnections_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-        )
-        .absolute(0);
-        counter!(
-            "valerter_lines_discarded_total",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
-            "reason" => "oversized",
-        )
-        .absolute(0);
+            "valerter_stream_ends_total",
+        ] {
+            counter!(
+                name,
+                "rule_name" => rule_name.clone(),
+                "vl_source" => vl_source.clone(),
+            )
+            .absolute(0);
+        }
+        for reason in ["oversized", "invalid_utf8"] {
+            counter!(
+                "valerter_lines_discarded_total",
+                "rule_name" => rule_name.clone(),
+                "vl_source" => vl_source.clone(),
+                "reason" => reason,
+            )
+            .absolute(0);
+        }
+        // The VictoriaLogs envelope is always parsed as JSON; only a regex
+        // parser can fail to match.
+        let error_types: &[&'static str] = if pair.regex_parser {
+            &["invalid_json", "regex_no_match"]
+        } else {
+            &["invalid_json"]
+        };
+        for error_type in error_types {
+            counter!(
+                "valerter_parse_errors_total",
+                "rule_name" => rule_name.clone(),
+                "vl_source" => vl_source.clone(),
+                "error_type" => *error_type,
+            )
+            .absolute(0);
+        }
         // Histograms can't be `absolute(0)` but referencing the handle here
         // registers the series so it appears in /metrics from startup.
         let _ = metrics::histogram!(
             "valerter_query_duration_seconds",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
+            "rule_name" => rule_name.clone(),
+            "vl_source" => vl_source.clone(),
         );
         gauge!(
             "valerter_last_query_timestamp",
-            "rule_name" => rule_name.to_string(),
-            "vl_source" => vl_source.to_string(),
+            "rule_name" => rule_name.clone(),
+            "vl_source" => vl_source.clone(),
         )
         .set(0.0);
     }
 
-    // Initialize per-notifier counters. The actual emit sites carry
-    // (rule_name, vl_source) labels; this loop pre-registers a per-notifier
-    // sentinel series so dashboards listing notifiers see them at startup.
-    // The two label sets coexist legitimately (different aggregations).
-    for notifier_name in notifier_names {
-        counter!("valerter_alerts_failed_total", "notifier" => notifier_name.to_string())
+    // Per-(rule, source, destination) notification series, plus the
+    // per-target error counter of email and telegram destinations.
+    for delivery in &inventory.deliveries {
+        for name in [
+            "valerter_alerts_sent_total",
+            "valerter_notify_errors_total",
+            "valerter_alerts_failed_total",
+        ] {
+            counter!(
+                name,
+                "rule_name" => delivery.rule_name.clone(),
+                "vl_source" => delivery.vl_source.clone(),
+                "notifier_name" => delivery.notifier_name.clone(),
+                "notifier_type" => delivery.notifier_type.clone(),
+            )
             .absolute(0);
-        counter!("valerter_notify_errors_total", "notifier" => notifier_name.to_string())
+        }
+        let target_errors = match delivery.notifier_type.as_str() {
+            "email" => Some("valerter_email_recipient_errors_total"),
+            "telegram" => Some("valerter_telegram_chat_errors_total"),
+            _ => None,
+        };
+        if let Some(name) = target_errors {
+            counter!(
+                name,
+                "rule_name" => delivery.rule_name.clone(),
+                "vl_source" => delivery.vl_source.clone(),
+                "notifier_name" => delivery.notifier_name.clone(),
+            )
             .absolute(0);
+        }
+    }
+
+    // Truncation is only emitted by telegram notifiers, without rule labels.
+    for notifier in inventory
+        .notifiers
+        .iter()
+        .filter(|n| n.notifier_type == "telegram")
+    {
+        counter!(
+            "valerter_alerts_truncated_total",
+            "notifier_type" => "telegram",
+            "notifier_name" => notifier.name.clone()
+        )
+        .absolute(0);
     }
 
     tracing::info!(
-        rule_source_pair_count = rule_source_pairs.len(),
-        source_count = source_names.len(),
-        notifier_count = notifier_names.len(),
+        rule_source_pair_count = inventory.rule_sources.len(),
+        source_count = inventory.sources.len(),
+        notifier_count = inventory.notifiers.len(),
         "Metrics initialized to zero"
     );
 }
@@ -485,5 +558,185 @@ mod tests {
     fn new_with_port_zero_allowed() {
         let server = MetricsServer::new(0);
         assert_eq!(server.port(), 0);
+    }
+
+    // initialize_metrics: label sets seeded from a synthetic inventory
+
+    fn synthetic_inventory() -> MetricsInventory {
+        let delivery = |rule: &str, source: &str, name: &str, kind: &str| DeliverySeries {
+            rule_name: rule.to_string(),
+            vl_source: source.to_string(),
+            notifier_name: name.to_string(),
+            notifier_type: kind.to_string(),
+        };
+        let notifier = |name: &str, kind: &str| NotifierSeries {
+            name: name.to_string(),
+            notifier_type: kind.to_string(),
+        };
+        MetricsInventory {
+            sources: vec!["vlprod".to_string(), "vldev".to_string()],
+            rule_sources: vec![
+                RuleSourceSeries {
+                    rule_name: "re".to_string(),
+                    vl_source: "vlprod".to_string(),
+                    regex_parser: true,
+                },
+                RuleSourceSeries {
+                    rule_name: "js".to_string(),
+                    vl_source: "vldev".to_string(),
+                    regex_parser: false,
+                },
+            ],
+            deliveries: vec![
+                delivery("re", "vlprod", "hook", "webhook"),
+                delivery("re", "vlprod", "mail", "email"),
+                delivery("js", "vldev", "tg", "telegram"),
+            ],
+            notifiers: vec![
+                notifier("hook", "webhook"),
+                notifier("mail", "email"),
+                notifier("tg", "telegram"),
+                notifier("tg-idle", "telegram"),
+                notifier("idle", "mattermost"),
+            ],
+        }
+    }
+
+    /// Initialize `inventory` under a local recorder and return the
+    /// non-comment lines of the rendering.
+    fn initialized_series(inventory: &MetricsInventory) -> Vec<String> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || initialize_metrics(inventory));
+        handle
+            .render()
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_has(series: &[String], expected: &str) {
+        assert!(
+            series.iter().any(|l| l == expected),
+            "missing `{expected}` in:\n{}",
+            series.join("\n")
+        );
+    }
+
+    #[test]
+    fn initialize_metrics_seeds_emission_label_sets_at_zero() {
+        let series = initialized_series(&synthetic_inventory());
+
+        for expected in [
+            r#"valerter_vl_source_up{vl_source="vldev"} 0"#,
+            r#"valerter_stream_ends_total{rule_name="re",vl_source="vlprod"} 0"#,
+            r#"valerter_reconnections_total{rule_name="js",vl_source="vldev"} 0"#,
+            r#"valerter_lines_discarded_total{rule_name="re",vl_source="vlprod",reason="oversized"} 0"#,
+            r#"valerter_lines_discarded_total{rule_name="re",vl_source="vlprod",reason="invalid_utf8"} 0"#,
+            r#"valerter_parse_errors_total{rule_name="re",vl_source="vlprod",error_type="invalid_json"} 0"#,
+            r#"valerter_parse_errors_total{rule_name="re",vl_source="vlprod",error_type="regex_no_match"} 0"#,
+            r#"valerter_parse_errors_total{rule_name="js",vl_source="vldev",error_type="invalid_json"} 0"#,
+            r#"valerter_alerts_sent_total{rule_name="re",vl_source="vlprod",notifier_name="hook",notifier_type="webhook"} 0"#,
+            r#"valerter_notify_errors_total{rule_name="re",vl_source="vlprod",notifier_name="mail",notifier_type="email"} 0"#,
+            r#"valerter_alerts_failed_total{rule_name="js",vl_source="vldev",notifier_name="tg",notifier_type="telegram"} 0"#,
+            r#"valerter_email_recipient_errors_total{rule_name="re",vl_source="vlprod",notifier_name="mail"} 0"#,
+            r#"valerter_telegram_chat_errors_total{rule_name="js",vl_source="vldev",notifier_name="tg"} 0"#,
+            r#"valerter_alerts_truncated_total{notifier_type="telegram",notifier_name="tg"} 0"#,
+            r#"valerter_alerts_truncated_total{notifier_type="telegram",notifier_name="tg-idle"} 0"#,
+        ] {
+            assert_has(&series, expected);
+        }
+    }
+
+    #[test]
+    fn initialize_metrics_creates_no_impossible_or_reduced_series() {
+        let series = initialized_series(&synthetic_inventory());
+        let with_prefix = |prefix: &str| -> Vec<&String> {
+            series.iter().filter(|l| l.starts_with(prefix)).collect()
+        };
+
+        // No regex_no_match for a JSON-only rule.
+        assert!(
+            with_prefix(r#"valerter_parse_errors_total{rule_name="js""#)
+                .iter()
+                .all(|l| !l.contains("regex_no_match"))
+        );
+        // Every notification series carries the four labels.
+        for name in [
+            "valerter_alerts_sent_total",
+            "valerter_notify_errors_total",
+            "valerter_alerts_failed_total",
+        ] {
+            let lines = with_prefix(&format!("{name}{{"));
+            assert_eq!(lines.len(), 3, "{name}: {lines:?}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| l.contains("notifier_name=") && l.contains("notifier_type=")),
+                "{name}: {lines:?}"
+            );
+        }
+        // Per-target error counters only for destinations of the right type.
+        assert_eq!(
+            with_prefix("valerter_email_recipient_errors_total").len(),
+            1
+        );
+        assert_eq!(with_prefix("valerter_telegram_chat_errors_total").len(), 1);
+        // Unused notifiers get no notification series.
+        assert!(
+            series
+                .iter()
+                .all(|l| !l.contains(r#"notifier_name="idle""#))
+        );
+        assert!(
+            series
+                .iter()
+                .all(|l| !l.contains("notifier=") && !l.contains("notifier_config_errors"))
+        );
+    }
+
+    #[test]
+    fn emission_after_initialize_metrics_updates_the_seeded_series() {
+        use crate::error::ParseError;
+        use crate::notify::{AlertPayload, record_permanent_failure};
+        use crate::parser::record_parse_error;
+
+        let alert = AlertPayload {
+            message: crate::template::RenderedMessage {
+                title: String::new(),
+                body: String::new(),
+                email_body_html: None,
+                accent_color: None,
+            },
+            rule_name: "re".to_string(),
+            vl_source: "vlprod".to_string(),
+            destinations: vec!["hook".to_string()],
+            log_timestamp: String::new(),
+            log_timestamp_formatted: String::new(),
+        };
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            initialize_metrics(&synthetic_inventory());
+            record_parse_error("re", "vlprod", &ParseError::NoMatch);
+            record_permanent_failure(&alert, "hook", "webhook");
+        });
+        let rendered = handle.render();
+
+        for (prefix, expected) in [
+            (
+                r#"valerter_parse_errors_total{rule_name="re",vl_source="vlprod",error_type="regex_no_match"}"#,
+                1,
+            ),
+            (
+                r#"valerter_alerts_failed_total{rule_name="re",vl_source="vlprod",notifier_name="hook""#,
+                1,
+            ),
+        ] {
+            let lines: Vec<_> = rendered.lines().filter(|l| l.starts_with(prefix)).collect();
+            assert_eq!(lines.len(), expected, "one series for {prefix}: {lines:?}");
+            assert!(lines[0].ends_with(" 1"), "{lines:?}");
+        }
     }
 }
