@@ -93,6 +93,12 @@ pub enum RuleError {
     Queue(#[from] QueueError),
     #[error("rule panicked")]
     Panic,
+    /// The engine was started without any `(rule, source)` task to run.
+    #[error("no enabled rules: the engine has nothing to watch")]
+    NoEnabledRules,
+    /// Every `(rule, source)` task ended without a shutdown request.
+    #[error("all rule tasks stopped unexpectedly: the engine no longer watches anything")]
+    AllTasksStopped,
 }
 
 #[cfg(test)]
@@ -238,5 +244,17 @@ mod tests {
 
         let err = RuleError::Queue(QueueError::Closed);
         assert_eq!(err.to_string(), "queue error: notification queue closed");
+    }
+
+    #[test]
+    fn rule_error_engine_exit_display() {
+        assert_eq!(
+            RuleError::NoEnabledRules.to_string(),
+            "no enabled rules: the engine has nothing to watch"
+        );
+        assert_eq!(
+            RuleError::AllTasksStopped.to_string(),
+            "all rule tasks stopped unexpectedly: the engine no longer watches anything"
+        );
     }
 }

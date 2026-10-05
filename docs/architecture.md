@@ -114,6 +114,7 @@ main.rs
 - **Error isolation:** one task's failure doesn't affect others — neither sibling sources of the same rule, nor sibling rules of the same source.
 - **Panic recovery:** panicked tasks are respawned after 5s delay (`PANIC_RESTART_DELAY`), keyed by `(rule, source)` so the right cancellation token and source config are restored.
 - **Graceful shutdown:** all tasks respect the `CancellationToken`
+- **No silent exit:** the engine returns `Ok` only after a shutdown request (SIGINT/SIGTERM). If no task can be spawned (`No enabled rules found, engine will exit`) or every task ends without a shutdown request (`All rule tasks completed unexpectedly`), it logs at ERROR and returns an error. `main` then cancels the shared token right away (worker, metrics server and uptime updater stop at once instead of waiting for their timeouts) and the process exits with code 1, so the shipped systemd unit (`Restart=on-failure`) restarts it and `systemctl status` shows it as failed. Exit code 0 means a requested shutdown and is never restarted.
 - **Metric:** `valerter_rule_panics_total{rule_name}` tracks panics per rule. (Per-source label split is deferred to the v2.0.0 part 2 observability spec.)
 
 ## Reconnection Strategy
@@ -153,14 +154,14 @@ RuleEngine (producers)              NotificationWorker (consumer)
 At startup, Valerter validates (in order):
 
 1. **YAML syntax** — Config file is valid YAML
-2. **Required fields** — All mandatory fields present
+2. **Required fields** — All mandatory fields present, at least one notifier, one template and one **enabled** rule (a config whose rules are all `enabled: false` is refused)
 3. **Template syntax** — All templates compile (minijinja)
 4. **Notifier config** — URLs, credentials, env vars resolve correctly
 5. **Destinations exist** — Rule destinations match notifier names in registry
 6. **Email template body** — Templates used with email destinations have `email_body_html`
 7. **Mattermost channel warning** — Warns if `mattermost_channel` set but no Mattermost notifier in destinations
 
-If any validation fails, Valerter exits immediately with a clear error message.
+If any validation fails, Valerter exits immediately with a clear error message and exit code 1. `valerter --validate` runs the same configuration validation (`Config::validate()`), so a config with all rules disabled is reported there too.
 
 ### Multi-File Configuration
 

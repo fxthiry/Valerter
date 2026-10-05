@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - Unreleased
+
+### Fixed
+
+- **The daemon now exits with code 1 when it no longer watches anything.** When every `(rule, source)` task stopped without a shutdown request, or when the engine started without any task, valerter logged a warning and exited with code 0: the shipped systemd unit (`Restart=on-failure`) did not restart it and `systemctl status` showed a clean `inactive (dead)` while no alert was produced anymore. The engine now returns an error in both cases (`No enabled rules found, engine will exit` / `All rule tasks completed unexpectedly`, same text, now logged at ERROR), the process exits with code 1, the unit shows `failed` and systemd restarts it. Exit code 0 now only follows a requested shutdown (SIGINT/SIGTERM).
+- **No more ~7 s wait before exiting after the engine stops.** The shutdown token is now cancelled as soon as the engine returns, whatever the cause, so the notification worker and the metrics server stop at once instead of running until their 5 s and 2 s timeouts.
+- **Upgrading the `.deb` no longer leaves the service stopped.** `prerm` no longer stops the service on `upgrade`, and `postinst` restarts it when it is active or enabled, including upgrades from 2.0.3 or earlier whose `prerm` already stopped it. Two seconds after the restart, `postinst` checks that the service is active and otherwise prints a visible warning pointing to `journalctl -u valerter`, without failing `dpkg`. An enabled service that was stopped on purpose is started again by the upgrade; a service that is stopped and disabled stays stopped.
+
+### Changed
+
+- **A configuration whose rules are all disabled is now refused.** `Config::validate()` reports `all rules are disabled: enable at least one rule in config.yaml or rules.d/`, so `valerter --validate` flags it and the daemon refuses to start (exit code 1) instead of starting and exiting immediately with code 0. See [MIGRATION.md](MIGRATION.md#upgrading-to-210).
+
 ## [2.0.3] - 2026-08-26
 
 Hardening release driven by a full code review. No new features, no breaking changes.

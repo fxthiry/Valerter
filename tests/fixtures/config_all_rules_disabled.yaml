@@ -1,0 +1,46 @@
+# Configuration fixture whose rules are all disabled.
+# Validation must refuse it: a daemon with no enabled rule watches nothing.
+victorialogs:
+  default:
+    url: "http://127.0.0.1:9"
+
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  default_alert:
+    title: "{{ title }}"
+    body: "{{ body }}"
+
+metrics:
+  enabled: false
+
+rules:
+  - name: "disabled_rule_1"
+    enabled: false
+    query: '_stream:{app="one"}'
+    parser:
+      json:
+        fields: ["_msg"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"
+
+  - name: "disabled_rule_2"
+    enabled: false
+    query: '_stream:{app="two"}'
+    parser:
+      json:
+        fields: ["_msg"]
+    notify:
+      template: "default_alert"
+      destinations:
+        - "test"

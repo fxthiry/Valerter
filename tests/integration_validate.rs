@@ -2,9 +2,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Once;
-
-static BUILD_ONCE: Once = Once::new();
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,28 +11,13 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn valerter_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("valerter")
-}
-
-/// Build the binary once for all tests (Fix M2)
-fn ensure_binary_built() {
-    BUILD_ONCE.call_once(|| {
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "valerter"])
-            .status()
-            .expect("Failed to build valerter");
-        assert!(status.success(), "Failed to build valerter");
-    });
+    // Built by cargo for integration tests (also under tarpaulin), no manual build needed.
+    PathBuf::from(env!("CARGO_BIN_EXE_valerter"))
 }
 
 // Test 6.5: --validate with valid config exits with code 0
 #[test]
 fn validate_valid_config_exits_success() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_valid.yaml"))
@@ -76,8 +58,6 @@ fn validate_valid_config_exits_success() {
 // Test 6.6: --validate with invalid config exits with code 1
 #[test]
 fn validate_invalid_regex_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_invalid_regex.yaml"))
@@ -103,8 +83,6 @@ fn validate_invalid_regex_exits_failure() {
 // Test: --validate with invalid template exits with code 1
 #[test]
 fn validate_invalid_template_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_invalid_template.yaml"))
@@ -123,8 +101,6 @@ fn validate_invalid_template_exits_failure() {
 // Test AC #3: --validate with disabled rule containing invalid regex exits with code 1 (Fix H2)
 #[test]
 fn validate_disabled_rule_with_invalid_regex_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_disabled_invalid.yaml"))
@@ -156,8 +132,6 @@ fn validate_disabled_rule_with_invalid_regex_exits_failure() {
 // validation happens after config compilation when creating the NotifierRegistry.
 #[test]
 fn validate_email_missing_email_body_html_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["-c"])
         .arg(fixture_path("config_email_missing_email_body_html.yaml"))
@@ -191,8 +165,6 @@ fn validate_email_missing_email_body_html_exits_failure() {
 // Test: --validate with config missing notifiers exits with code 1
 #[test]
 fn validate_no_notifiers_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_no_notifier.yaml"))
@@ -221,8 +193,6 @@ fn validate_no_notifiers_exits_failure() {
 // Test: --validate with config missing templates exits with code 1
 #[test]
 fn validate_no_templates_exits_failure() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_no_template.yaml"))
@@ -252,8 +222,6 @@ fn validate_no_templates_exits_failure() {
 // Config without notifiers should fail even if MATTERMOST_WEBHOOK is set
 #[test]
 fn validate_mattermost_env_var_ignored() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_no_notifier.yaml"))
@@ -281,8 +249,6 @@ fn validate_mattermost_env_var_ignored() {
 // Locks the canonical example against future schema drift.
 #[test]
 fn shipped_config_example_validates() {
-    ensure_binary_built();
-
     let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("config")
         .join("config.example.yaml");
@@ -308,8 +274,6 @@ fn shipped_config_example_validates() {
 // without hitting the network (--validate does not actually call any backend).
 #[test]
 fn shipped_examples_pass_validate() {
-    ensure_binary_built();
-
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples");
 
     let entries = std::fs::read_dir(&examples_dir).expect("Failed to read examples/ directory");
@@ -361,8 +325,6 @@ fn shipped_examples_pass_validate() {
 // Test: --validate with minimal config (README example) passes
 #[test]
 fn validate_minimal_config_exits_success() {
-    ensure_binary_built();
-
     let output = Command::new(valerter_binary())
         .args(["--validate", "-c"])
         .arg(fixture_path("config_minimal.yaml"))
