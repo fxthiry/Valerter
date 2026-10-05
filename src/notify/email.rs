@@ -810,6 +810,7 @@ mod tests {
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
         AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),

@@ -422,7 +422,10 @@ rules:
       destinations:                   # REQUIRED: at least one notifier
         - mattermost-ops
         - email-ops
-      mattermost_channel: "alerts"    # Optional: override Mattermost channel
+      mattermost_channel: "alerts"    # Optional: channel for Mattermost destinations
+                                      # (rule > notifier `channel` > webhook default;
+                                      # resent without channel if rejected, see
+                                      # notifiers.md#channel-per-rule)
 ```
 
 ### LogsQL query restrictions
@@ -559,7 +562,9 @@ sudo chown valerter:valerter /etc/valerter/config.yaml
 ### Alternative: Environment Variables
 
 `${VAR_NAME}` placeholders are resolved at startup in notifier secrets
-(`webhook_url`, `url`, `headers`, `bot_token`, SMTP `username`/`password`) and
+(`webhook_url`, `url`, `headers`, `bot_token`, SMTP `username`/`password`), in
+the source of the webhook `body_template` (never in values rendered from logs,
+see [Notifiers](notifiers.md#var-in-body_template)) and
 in VictoriaLogs sources (`url`, `basic_auth.username`/`password`, `headers`),
 both at daemon startup and by `valerter --validate`. An undefined variable is
 an error: they must therefore also be defined when running `--validate`.
@@ -577,7 +582,7 @@ Variables are resolved at startup from the process environment. You can use **an
 
 - `${VL_USER}`, `${VL_PASS}` - VictoriaLogs credentials
 - `${SMTP_USER}`, `${SMTP_PASSWORD}` - Email credentials
-- `${SLACK_WEBHOOK_URL}`, `${PAGERDUTY_TOKEN}` - Notification services
+- `${SLACK_WEBHOOK_URL}`, `${PAGERDUTY_ROUTING_KEY}` - Notification services
 
 ## Runtime Environment Variables
 

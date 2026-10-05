@@ -151,6 +151,57 @@ Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the qu
   ```
 - **Template render errors at send time are counted.** A webhook `body_template`, an email subject or body, or a Telegram message text that fails to render now increments `valerter_notify_errors_total` and `valerter_alerts_failed_total`; it used to be only logged. Most of these errors are now refused at startup (see [Stricter configuration validation](#stricter-configuration-validation)).
 
+### `${VAR}` is resolved in webhook `body_template`
+
+**Breaking:** until 2.0.3, a `${VAR}` written in a webhook `body_template` was sent literally, while `url` and `headers` of the same notifier were resolved from the environment. In 2.1.0, `${VAR}` placeholders of the template **source** are resolved too, once, when the notifier is built (at startup and by `valerter --validate`). An undefined variable refuses the configuration (exit code 1):
+
+```
+invalid notifier 'pagerduty': body_template: invalid configuration: undefined environment variable: PAGERDUTY_ROUTING_KEY
+```
+
+- **Find the affected templates:** search for `${` in the `body_template` of your webhook notifiers (`config.yaml` and `notifiers.d/*.yaml`). For each match, either define the variable in the service environment (and when running `--validate`), or remove the placeholder. A literal `${...}` cannot be kept: there is no escape syntax.
+- **Values rendered from logs are never resolved.** A `${HOME}` inside a log line or an event field inserted with `{{ body }}` is sent as is.
+- **The value is inserted before Jinja parses the template.** A value containing `{{`, `{%` or `"` is interpreted by Jinja or breaks the JSON body; keep such values in a header instead.
+- **Telegram and email `body_template` are unchanged** (no `${VAR}` resolution).
+
+The PagerDuty example now reads its routing key from the environment instead of storing it in the configuration file:
+
+```yaml
+# before (2.0.3: "${PAGERDUTY_ROUTING_KEY}" was sent literally)
+pagerduty:
+  type: webhook
+  url: "https://events.pagerduty.com/v2/enqueue"
+  headers:
+    Authorization: "Token token=${PAGERDUTY_TOKEN}"
+  body_template: |
+    {"routing_key": "${PAGERDUTY_ROUTING_KEY}", "event_action": "trigger",
+     "payload": {"summary": "{{ title }}", "source": "valerter", "severity": "error"}}
+
+# after (2.1.0: set PAGERDUTY_ROUTING_KEY in the service environment)
+pagerduty:
+  type: webhook
+  url: "https://events.pagerduty.com/v2/enqueue"
+  body_template: |
+    {"routing_key": "${PAGERDUTY_ROUTING_KEY}", "event_action": "trigger",
+     "payload": {"summary": {{ title | tojson }}, "source": "valerter", "severity": "error"}}
+```
+
+With the shipped systemd unit, define the variable like your other notifier secrets, e.g. in a drop-in (`sudo systemctl edit valerter`, then `Environment=PAGERDUTY_ROUTING_KEY=...` under `[Service]`).
+
+### `mattermost_channel` is now applied
+
+**Breaking:** until 2.0.3, a rule's `notify.mattermost_channel` was documented as a channel override but silently ignored: alerts went to the notifier's `channel`, or to the webhook's default channel. In 2.1.0 it is applied, so **alerts of a rule that sets it now go to that channel**. The channel is chosen in this order: the rule's `mattermost_channel`, then the notifier's `channel`, then the webhook's default channel.
+
+- **To keep the previous behavior**, remove `mattermost_channel` from the rule. Search for it in `config.yaml` and `rules.d/*.yaml`.
+- **Check the channel and the webhook.** The key was never exercised, so a misspelled channel or a webhook created with "Lock to this channel" is likely. When Mattermost rejects the rule's channel with a 4xx response other than 429, the alert is resent once **without** `channel` (to the webhook's default channel, as before the upgrade) and the WARN below is logged for every such alert, until you fix the channel name, unlock the webhook or remove the key:
+
+  ```
+  Mattermost rejected channel override, resending without channel notifier_name=<notifier> rule_name=<rule> channel=<requested channel> status=<status>
+  ```
+
+  The resend costs one extra request per alert; the alert is counted once in the metrics, as sent or failed. A 4xx on the resend fails the alert. The notifier's own `channel` keeps its behavior: a 4xx fails the alert immediately.
+- **Rules without a Mattermost destination** still log `mattermost_channel ignored - no mattermost notifier in destinations` at startup; other notifier types ignore the key.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

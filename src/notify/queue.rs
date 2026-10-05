@@ -580,6 +580,7 @@ mod tests {
 
     fn alert(rule_name: &str) -> Arc<AlertPayload> {
         Arc::new(AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: rule_name.to_string(),
                 body: String::new(),

@@ -79,7 +79,8 @@ fn build_mattermost_payload(
 ///
 /// - **5xx errors**: Retry (server temporarily unavailable)
 /// - **Network errors**: Retry (timeout, connection refused)
-/// - **4xx errors**: Do NOT retry (client error, invalid payload)
+/// - **4xx errors**: Do NOT retry (client error, invalid payload), except a
+///   rejected rule-level channel override, resent once without `channel`
 ///
 /// # Example
 ///
@@ -96,7 +97,7 @@ pub struct MattermostNotifier {
     name: String,
     /// Webhook URL for sending notifications (stored as SecretString for NFR9).
     webhook_url: SecretString,
-    /// Optional channel override.
+    /// Optional channel override (a rule's `mattermost_channel` takes precedence).
     channel: Option<String>,
     /// Optional username override.
     username: Option<String>,
@@ -152,6 +153,62 @@ impl MattermostNotifier {
             client,
         }
     }
+
+    /// POST `payload` to the webhook with the retry policy: 5xx, 429 and
+    /// network errors are retried with backoff, up to
+    /// `MATTERMOST_MAX_RETRIES` attempts; any other 4xx stops immediately.
+    async fn post_with_retries(&self, payload: &MattermostPayload) -> Delivery {
+        // Use the notifier's own webhook_url (Story 6.2)
+        let webhook_url = self.webhook_url.expose();
+
+        for attempt in 0..MATTERMOST_MAX_RETRIES {
+            match self.client.post(webhook_url).json(payload).send().await {
+                Ok(response) if response.status().is_success() => return Delivery::Sent,
+                Ok(response)
+                    if response.status().is_client_error()
+                        && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    // 4xx errors: don't retry (invalid payload, bad webhook)
+                    return Delivery::ClientError(response.status());
+                }
+                Ok(response) => {
+                    // 5xx and 429 errors: retry
+                    tracing::warn!(
+                        attempt = attempt,
+                        status = %response.status(),
+                        "Mattermost returned server error, retrying"
+                    );
+                }
+                Err(e) => {
+                    // Network errors: retry
+                    tracing::warn!(
+                        attempt = attempt,
+                        error = %e.without_url(),
+                        "Failed to send to Mattermost, retrying"
+                    );
+                }
+            }
+
+            // Apply backoff delay before next retry (except after last attempt)
+            if attempt < MATTERMOST_MAX_RETRIES - 1 {
+                let delay = backoff_delay(attempt, MATTERMOST_BACKOFF_BASE, MATTERMOST_BACKOFF_MAX);
+                tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        Delivery::RetriesExhausted
+    }
+}
+
+/// Outcome of one payload delivery, retries included.
+enum Delivery {
+    /// The webhook accepted the payload.
+    Sent,
+    /// Non-retryable client error (4xx other than 429).
+    ClientError(reqwest::StatusCode),
+    /// Every attempt failed with a retryable error.
+    RetriesExhausted,
 }
 
 #[async_trait]
@@ -172,12 +229,14 @@ impl Notifier for MattermostNotifier {
         );
 
         async {
+            // Channel priority: rule override > notifier channel > webhook default.
+            let rule_channel = alert.mattermost_channel.as_deref();
             let mattermost_payload = build_mattermost_payload(
                 &alert.message,
                 &alert.rule_name,
                 &alert.vl_source,
                 &alert.log_timestamp_formatted,
-                self.channel.as_deref(),
+                rule_channel.or(self.channel.as_deref()),
                 self.username.as_deref(),
                 self.icon_url.as_deref(),
             );
@@ -186,76 +245,55 @@ impl Notifier for MattermostNotifier {
                 "Payload built"
             );
 
-            // Use the notifier's own webhook_url (Story 6.2)
-            let webhook_url = self.webhook_url.expose();
+            let mut delivery = self.post_with_retries(&mattermost_payload).await;
 
-            for attempt in 0..MATTERMOST_MAX_RETRIES {
-                match self
-                    .client
-                    .post(webhook_url)
-                    .json(&mattermost_payload)
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        tracing::debug!("Alert sent successfully");
-                        metrics::counter!(
-                            "valerter_alerts_sent_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "mattermost",
-                        )
-                        .increment(1);
-                        return Ok(());
-                    }
-                    Ok(response)
-                        if response.status().is_client_error()
-                            && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
-                    {
-                        // 4xx errors: don't retry (invalid payload, bad webhook)
-                        let status = response.status();
-                        tracing::error!(
-                            status = %status,
-                            "Mattermost returned client error, not retrying"
-                        );
-                        record_permanent_failure(alert, &self.name, "mattermost");
-                        return Err(NotifyError::SendFailed(format!("client error: {}", status)));
-                    }
-                    Ok(response) => {
-                        // 5xx and 429 errors: retry
-                        tracing::warn!(
-                            attempt = attempt,
-                            status = %response.status(),
-                            "Mattermost returned server error, retrying"
-                        );
-                    }
-                    Err(e) => {
-                        // Network errors: retry
-                        tracing::warn!(
-                            attempt = attempt,
-                            error = %e.without_url(),
-                            "Failed to send to Mattermost, retrying"
-                        );
-                    }
-                }
-
-                // Apply backoff delay before next retry (except after last attempt)
-                if attempt < MATTERMOST_MAX_RETRIES - 1 {
-                    let delay =
-                        backoff_delay(attempt, MATTERMOST_BACKOFF_BASE, MATTERMOST_BACKOFF_MAX);
-                    tracing::debug!(delay_ms = delay.as_millis(), "Waiting before retry");
-                    tokio::time::sleep(delay).await;
-                }
+            // A rejected rule override (locked webhook, unknown channel) is
+            // resent once without `channel`, to the webhook's default channel.
+            if let (Delivery::ClientError(status), Some(channel)) = (&delivery, rule_channel) {
+                tracing::warn!(
+                    notifier_name = %self.name,
+                    rule_name = %alert.rule_name,
+                    channel = %channel,
+                    status = %status,
+                    "Mattermost rejected channel override, resending without channel"
+                );
+                let fallback_payload = MattermostPayload {
+                    channel: None,
+                    ..mattermost_payload
+                };
+                delivery = self.post_with_retries(&fallback_payload).await;
             }
 
-            // All retries exhausted
-            tracing::error!(
-                max_retries = MATTERMOST_MAX_RETRIES,
-                "Failed to send alert after all retries"
-            );
-            record_permanent_failure(alert, &self.name, "mattermost");
-            Err(NotifyError::MaxRetriesExceeded)
+            match delivery {
+                Delivery::Sent => {
+                    tracing::debug!("Alert sent successfully");
+                    metrics::counter!(
+                        "valerter_alerts_sent_total",
+                        "rule_name" => alert.rule_name.clone(),
+                        "vl_source" => alert.vl_source.clone(),
+                        "notifier_name" => self.name.clone(),
+                        "notifier_type" => "mattermost",
+                    )
+                    .increment(1);
+                    Ok(())
+                }
+                Delivery::ClientError(status) => {
+                    tracing::error!(
+                        status = %status,
+                        "Mattermost returned client error, not retrying"
+                    );
+                    record_permanent_failure(alert, &self.name, "mattermost");
+                    Err(NotifyError::SendFailed(format!("client error: {}", status)))
+                }
+                Delivery::RetriesExhausted => {
+                    tracing::error!(
+                        max_retries = MATTERMOST_MAX_RETRIES,
+                        "Failed to send alert after all retries"
+                    );
+                    record_permanent_failure(alert, &self.name, "mattermost");
+                    Err(NotifyError::MaxRetriesExceeded)
+                }
+            }
         }
         .instrument(span)
         .await
@@ -479,5 +517,244 @@ mod tests {
             notifier.icon_url,
             Some("https://example.com/icon.png".to_string())
         );
+    }
+
+    // ===================================================================
+    // Channel selection and fallback (wiremock)
+    // ===================================================================
+
+    use crate::notify::test_metrics::{counter_total, run_with_recorder};
+    use std::sync::{Arc, Mutex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_alert(rule_channel: Option<&str>) -> AlertPayload {
+        AlertPayload {
+            mattermost_channel: rule_channel.map(String::from),
+            message: RenderedMessage {
+                title: "Test Alert".to_string(),
+                body: "Something happened".to_string(),
+                email_body_html: None,
+                accent_color: None,
+            },
+            rule_name: "r".to_string(),
+            vl_source: "vlprod".to_string(),
+            destinations: vec!["mm".to_string()],
+            log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
+            log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        }
+    }
+
+    /// Log lines written by `tracing` during a test.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Outcome of `send_with_responses`.
+    struct SendOutcome {
+        result: Result<(), NotifyError>,
+        /// JSON bodies received by the webhook, in order.
+        bodies: Vec<serde_json::Value>,
+        logs: String,
+        metrics: String,
+    }
+
+    /// Send `alert` through a notifier configured with `notifier_channel`,
+    /// to a webhook answering `statuses` in order (then 200).
+    fn send_with_responses(
+        notifier_channel: Option<&str>,
+        alert: AlertPayload,
+        statuses: &[u16],
+    ) -> SendOutcome {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let notifier_channel = notifier_channel.map(String::from);
+        let statuses = statuses.to_vec();
+
+        let ((result, bodies), metrics) = run_with_recorder(|| async move {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let server = MockServer::start().await;
+            for status in &statuses {
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(ResponseTemplate::new(*status))
+                    .up_to_n_times(1)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let notifier = MattermostNotifier::with_options(
+                "mm".to_string(),
+                SecretString::new(format!("{}/hooks/secret-token", server.uri())),
+                notifier_channel,
+                None,
+                None,
+                reqwest::Client::new(),
+            );
+            let result = notifier.send(&alert).await;
+            let bodies = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect::<Vec<serde_json::Value>>();
+            (result, bodies)
+        });
+
+        SendOutcome {
+            result,
+            bodies,
+            logs: logs.text(),
+            metrics,
+        }
+    }
+
+    #[test]
+    fn rule_channel_takes_precedence_over_notifier_channel() {
+        let out = send_with_responses(Some("ops"), make_alert(Some("alerts")), &[]);
+
+        assert!(out.result.is_ok());
+        assert_eq!(out.bodies.len(), 1);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+    }
+
+    #[test]
+    fn notifier_channel_used_without_rule_channel() {
+        let out = send_with_responses(Some("ops"), make_alert(None), &[]);
+
+        assert!(out.result.is_ok());
+        assert_eq!(out.bodies.len(), 1);
+        assert_eq!(out.bodies[0]["channel"], "ops");
+    }
+
+    #[test]
+    fn channel_key_omitted_without_any_channel() {
+        let out = send_with_responses(None, make_alert(None), &[]);
+
+        assert!(out.result.is_ok());
+        assert_eq!(out.bodies.len(), 1);
+        assert!(out.bodies[0].get("channel").is_none());
+    }
+
+    #[test]
+    fn rejected_rule_channel_is_resent_without_channel() {
+        let out = send_with_responses(Some("ops"), make_alert(Some("alerts")), &[400]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 2);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+        assert!(out.bodies[1].get("channel").is_none());
+        // Same message otherwise.
+        assert_eq!(out.bodies[0]["attachments"], out.bodies[1]["attachments"]);
+
+        let warn = out
+            .logs
+            .lines()
+            .find(|l| l.contains("Mattermost rejected channel override, resending without channel"))
+            .unwrap_or_else(|| panic!("missing fallback warning in:\n{}", out.logs));
+        assert!(warn.contains("WARN"));
+        assert!(warn.contains("notifier_name=mm"));
+        assert!(warn.contains("rule_name=r"));
+        assert!(warn.contains("channel=alerts"));
+        assert!(warn.contains("status=400 Bad Request"));
+        assert!(
+            !out.logs.contains("secret-token"),
+            "webhook URL leaked:\n{}",
+            out.logs
+        );
+
+        assert_eq!(counter_total(&out.metrics, "valerter_alerts_sent_total"), 1);
+        assert_eq!(
+            counter_total(&out.metrics, "valerter_alerts_failed_total"),
+            0
+        );
+        assert_eq!(
+            counter_total(&out.metrics, "valerter_notify_errors_total"),
+            0
+        );
+    }
+
+    #[test]
+    fn rejected_fallback_is_a_permanent_failure() {
+        let out = send_with_responses(None, make_alert(Some("alerts")), &[400, 400]);
+
+        assert_eq!(out.bodies.len(), 2);
+        let err = out.result.expect_err("second 4xx must fail the alert");
+        assert_eq!(
+            err.to_string(),
+            "failed to send notification: client error: 400 Bad Request"
+        );
+        assert!(
+            out.logs
+                .contains("Mattermost returned client error, not retrying")
+        );
+        assert_eq!(counter_total(&out.metrics, "valerter_alerts_sent_total"), 0);
+        assert_eq!(
+            counter_total(&out.metrics, "valerter_alerts_failed_total"),
+            1
+        );
+        assert_eq!(
+            counter_total(&out.metrics, "valerter_notify_errors_total"),
+            1
+        );
+    }
+
+    #[test]
+    fn fallback_follows_the_retry_policy() {
+        let out = send_with_responses(None, make_alert(Some("alerts")), &[403, 500]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 3);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+        assert!(out.bodies[1].get("channel").is_none());
+        assert!(out.bodies[2].get("channel").is_none());
+        assert_eq!(counter_total(&out.metrics, "valerter_alerts_sent_total"), 1);
+    }
+
+    #[test]
+    fn notifier_channel_rejection_has_no_fallback() {
+        let out = send_with_responses(Some("ops"), make_alert(None), &[400]);
+
+        assert_eq!(out.bodies.len(), 1);
+        assert_eq!(
+            out.result.unwrap_err().to_string(),
+            "failed to send notification: client error: 400 Bad Request"
+        );
+        assert!(!out.logs.contains("resending without channel"));
+    }
+
+    #[test]
+    fn rule_channel_rate_limited_is_retried_without_fallback() {
+        let out = send_with_responses(None, make_alert(Some("alerts")), &[429]);
+
+        assert!(out.result.is_ok(), "unexpected error: {:?}", out.result);
+        assert_eq!(out.bodies.len(), 2);
+        assert_eq!(out.bodies[0]["channel"], "alerts");
+        assert_eq!(out.bodies[1]["channel"], "alerts");
+        assert!(!out.logs.contains("resending without channel"));
     }
 }

@@ -21,6 +21,7 @@ fn test_config_dir() -> std::path::PathBuf {
 
 fn make_payload(rule_name: &str) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
@@ -37,6 +38,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
 
 fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
@@ -1105,6 +1107,7 @@ fn backoff_delay_handles_overflow() {
 #[test]
 fn alert_payload_clone_works() {
     let payload = AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),

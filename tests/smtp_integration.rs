@@ -210,6 +210,7 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
 /// Create a test alert payload.
 fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: title.to_string(),
             body: body.to_string(),
@@ -396,6 +397,7 @@ async fn test_send_email_html_format() {
     // email_body_html is used for pre-rendered HTML content (from TemplateEngine)
     // This simulates what TemplateEngine produces when rendering email_body_html
     let alert = AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: "HTML Alert".to_string(),
             body: "Fallback plain text".to_string(),

@@ -212,7 +212,9 @@ notifiers:
   # WITHOUT surrounding quotes ({{ body | tojson }}, not "{{ body }}"), or a
   # quote or line break in a log line produces invalid JSON (logged as
   # "Webhook body is not valid JSON"; the request is still sent).
-  # ${VAR} references are NOT resolved inside body_template.
+  # ${VAR} references in the body_template source are resolved at startup, like
+  # url and headers (undefined variable = startup failure); values rendered from
+  # logs are never resolved. Keep values containing {{, {% or " out of it.
 
   # slack-alerts:
   #   type: webhook
@@ -227,11 +229,11 @@ notifiers:
   #   type: webhook
   #   url: "https://events.pagerduty.com/v2/enqueue"
   #   # Events API v2: the routing key in the body authenticates the event, no
-  #   # Authorization header needed. Replace the placeholder with your
-  #   # integration key (stored in clear text in this file).
+  #   # Authorization header needed. Set PAGERDUTY_ROUTING_KEY in the daemon's
+  #   # environment to your integration key.
   #   body_template: |
   #     {
-  #       "routing_key": "<your-integration-key>",
+  #       "routing_key": "${PAGERDUTY_ROUTING_KEY}",
   #       "event_action": "trigger",
   #       "payload": {
   #         "summary": {{ title | tojson }},
@@ -350,7 +352,9 @@ rules:
       regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
     notify:
       template: default_alert
-      # mattermost_channel: custom-channel # Override notifier's default channel
+      # mattermost_channel: custom-channel # Mattermost channel for this rule, over the
+      #                                    # notifier's channel; resent without channel
+      #                                    # (webhook default) if Mattermost rejects it
       destinations:
         - mattermost-ops
 

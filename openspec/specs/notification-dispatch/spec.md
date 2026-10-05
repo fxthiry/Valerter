@@ -80,7 +80,7 @@ Le système MUST vérifier au démarrage que chaque destination de chaque règle
 - **THEN** le message `All rule destinations validated successfully` est journalisé et le démarrage continue
 
 ### Requirement: Contenu du payload d'alerte
-Le système SHALL transmettre à chaque notifier, pour chaque alerte, le message rendu (`title`, `body`, `email_body_html` optionnel, `accent_color` optionnel), le nom de la règle, le nom de la source VictoriaLogs (`vl_source`), la liste des destinations de la règle, l'horodatage brut du log (`log_timestamp`, champ `_time` de l'événement) et sa version lisible (`log_timestamp_formatted`, format `DD/MM/YYYY HH:MM:SS TZ` dans le fuseau `timestamp_timezone`, secondes tronquées).
+Le système SHALL transmettre à chaque notifier, pour chaque alerte, le message rendu (`title`, `body`, `email_body_html` optionnel, `accent_color` optionnel), le nom de la règle, le nom de la source VictoriaLogs (`vl_source`), la liste des destinations de la règle, le canal Mattermost optionnel de la règle (`notify.mattermost_channel`), l'horodatage brut du log (`log_timestamp`, champ `_time` de l'événement) et sa version lisible (`log_timestamp_formatted`, format `DD/MM/YYYY HH:MM:SS TZ` dans le fuseau `timestamp_timezone`, secondes tronquées).
 
 #### Scenario: Horodatage formaté
 - **WHEN** l'événement a `_time = 2026-01-15T10:00:00Z` et `timestamp_timezone: Europe/Paris`
@@ -93,6 +93,10 @@ Le système SHALL transmettre à chaque notifier, pour chaque alerte, le message
 #### Scenario: Horodatage non analysable
 - **WHEN** `_time` n'est pas un horodatage RFC 3339 valide
 - **THEN** `log_timestamp_formatted` reprend la valeur brute inchangée
+
+#### Scenario: Canal Mattermost de la règle transmis
+- **WHEN** une règle définit `notify.mattermost_channel: alerts`
+- **THEN** chaque alerte de cette règle transporte le canal `alerts`, et une règle sans cette clé transporte un canal absent
 
 ### Requirement: File de notification bornée et non bloquante
 Le système SHALL déposer chaque alerte dans une file asynchrone propre à chacune de ses destinations, de capacité exacte 100 alertes par destination (non configurable, sans arrondi), MUST ne jamais bloquer le producteur, et SHALL renvoyer l'erreur `notification queue closed` lorsque la livraison des notifications est arrêtée ; le moteur journalise alors `Failed to send to notification queue` et l'alerte est perdue.

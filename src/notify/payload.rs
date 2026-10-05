@@ -21,6 +21,10 @@ pub struct AlertPayload {
     /// Notification destinations (notifier names).
     /// If empty, uses the default notifier.
     pub destinations: Vec<String>,
+    /// Mattermost channel override of the rule (`notify.mattermost_channel`).
+    /// Takes precedence over the notifier's `channel`; ignored by the other
+    /// notifier types.
+    pub mattermost_channel: Option<String>,
     /// Original log timestamp in ISO 8601 format (from VictoriaLogs _time field).
     /// Used for searching in VictoriaLogs.
     pub log_timestamp: String,
