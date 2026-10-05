@@ -184,18 +184,26 @@ texte brut sur rejet HTML » lorsqu'un envoi en `parse_mode` HTML reçoit un 400
 - **THEN** aucune autre requête n'est envoyée pour cette discussion et elle est comptée en échec
 
 ### Requirement: Résultat global et métriques par discussion
-Le système SHALL incrémenter `valerter_alerts_sent_total{rule_name, vl_source, notifier_name, notifier_type="telegram"}`
-pour chaque discussion réussie, et `valerter_notify_errors_total` et `valerter_alerts_failed_total` (mêmes libellés)
-pour chaque discussion en échec définitif ; le notifier MUST renvoyer un succès dès qu'au moins une discussion a réussi
-et l'erreur `all chat_ids failed` si toutes ont échoué.
+Le système SHALL considérer l'alerte comme livrée dès qu'au moins une discussion a réussi, en incrémentant une fois
+`valerter_alerts_sent_total{rule_name, vl_source, notifier_name, notifier_type="telegram"}` quel que soit le nombre de
+discussions réussies ; il SHALL incrémenter `valerter_telegram_chat_errors_total{rule_name, vl_source, notifier_name}`
+pour chaque discussion en échec définitif ; si toutes les discussions échouent, il MUST incrémenter une fois
+`valerter_notify_errors_total` et `valerter_alerts_failed_total` (mêmes libellés que `valerter_alerts_sent_total`) ;
+le notifier MUST renvoyer un succès dès qu'au moins une discussion a réussi et l'erreur `all chat_ids failed` si toutes
+ont échoué.
 
 #### Scenario: Succès partiel
 - **WHEN** sur deux discussions, l'une réussit et l'autre échoue
-- **THEN** le notifier renvoie un succès, `valerter_alerts_sent_total` augmente de 1 et `valerter_alerts_failed_total` augmente de 1
+- **THEN** le notifier renvoie un succès, `valerter_alerts_sent_total` augmente de 1 et `valerter_telegram_chat_errors_total` augmente de 1
+- **AND** `valerter_alerts_failed_total` et `valerter_notify_errors_total` restent inchangés
+
+#### Scenario: Plusieurs discussions réussies
+- **WHEN** une alerte est envoyée avec succès à trois discussions
+- **THEN** `valerter_alerts_sent_total` augmente de 1, et non de 3
 
 #### Scenario: Échec total
-- **WHEN** toutes les discussions échouent
-- **THEN** le notifier renvoie l'erreur `all chat_ids failed`
+- **WHEN** les deux discussions échouent
+- **THEN** le notifier renvoie l'erreur `all chat_ids failed`, `valerter_telegram_chat_errors_total` augmente de 2, et `valerter_notify_errors_total` et `valerter_alerts_failed_total` augmentent chacun de 1
 
 ### Requirement: Protection du jeton du bot
 Le système MUST ne jamais exposer le jeton du bot ni l'URL de l'API qui le contient : `bot_token` est rendu
