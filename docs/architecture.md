@@ -121,10 +121,13 @@ main.rs
 
 When VictoriaLogs connection fails:
 
-1. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max)
-2. **Metric update:** `valerter_victorialogs_up` set to 0 (restored to 1 on successful reconnection)
-3. **Reconnection metric:** `valerter_reconnections_total` incremented
-4. **On success:** Throttle cache is reset (prevents stale state)
+1. **Cause logged first:** `Connection failed`, `Stream read error` or `HTTP error from VictoriaLogs` is logged with the error, then `Connection failed, retrying` with the attempt number and the delay in milliseconds (`delay_ms`), all before the wait starts
+2. **Exponential backoff:** 1s → 2s → 4s → 8s → ... → 60s (max), with ±10% jitter
+3. **Metric update:** `valerter_victorialogs_up` set to 0 (restored to 1 on successful reconnection)
+4. **Reconnection metric:** `valerter_reconnections_total` incremented
+5. **On success:** Throttle cache is reset (prevents stale state)
+
+When the server ends the response cleanly (EOF without error), this is not a failure: the throttle cache is kept and the tail is reopened after ~1s if the connection received data. If the server keeps closing the stream without sending anything, the delay grows with the number of consecutive empty EOFs: ~1s, then 2s, 4s, ... up to 60s, and drops back to ~1s as soon as a connection receives data.
 
 ## Notification Queue
 

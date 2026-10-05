@@ -34,6 +34,12 @@ Run `valerter --validate -c /etc/valerter/config.yaml` before upgrading to catch
 - An enabled service that you stopped on purpose is started again by the upgrade. Disable it (`systemctl disable valerter`) if it must stay stopped.
 - When upgrading from 2.0.3 or earlier, the old package stops the service before the new one is installed. An enabled service is restarted; a service started by hand without being enabled stays stopped: run `sudo systemctl start valerter` after the upgrade.
 
+### VictoriaLogs streaming: logs, headers and discarded-lines metric
+
+- **Log field `delay_secs` renamed `delay_ms`.** The `Connection failed, retrying` warning now carries the backoff delay in milliseconds (`delay_ms=930`) instead of whole seconds (`delay_secs=0`). Update any log query, alert or dashboard that filters on `delay_secs`. The cause of the failure (`Connection failed` / `Stream read error`) is now logged before this warning instead of after the wait.
+- **A custom `Authorization` header now masks `basic_auth`.** When a source defines both `basic_auth` and `headers: { Authorization: ... }`, only the custom header is sent (previously both were sent and the server chose). A warning is logged at startup for each affected (rule, source) task. Keep only the credentials you actually want to use. Custom headers with the name of a default header (`Accept`, `Connection`) also replace it instead of being sent twice.
+- **`valerter_lines_discarded_total{reason="invalid_utf8"}` counts lines, not batches.** Only the invalid line is dropped now, and each one adds one unit, so the counter may grow faster than in 2.0.3 for the same stream. Revisit any alert threshold set on it.
+
 ## Upgrading from v1.x to v2.0.0
 
 This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it section by section. Every breaking change has a before / after snippet you can copy.

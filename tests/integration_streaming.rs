@@ -800,8 +800,8 @@ async fn test_without_auth_no_authorization_header() {
 // v2.0.3 hardening
 // =============================================================================
 
-/// Invalid UTF-8 in the stream must be dropped and streaming must continue,
-/// instead of surfacing a fatal `Utf8Error` that killed the rule task.
+/// Invalid UTF-8 in the stream must drop only the faulty line and streaming
+/// must continue, instead of killing the rule task.
 #[tokio::test]
 async fn test_invalid_utf8_line_is_dropped_not_fatal() {
     let mock_server = MockServer::start().await;
@@ -838,17 +838,52 @@ async fn test_invalid_utf8_line_is_dropped_not_fatal() {
     })
     .await;
 
-    // Must still be looping (timeout), not returned with Utf8Error.
+    // Must still be looping (timeout), not returned with an error.
     assert!(
         result.is_err(),
         "stream must not terminate on invalid UTF-8"
     );
     let lines = received_lines.lock().unwrap();
-    // The whole response arrives in one chunk: the invalid batch is discarded,
-    // but the loop reconnects and keeps going instead of dying.
-    assert!(
-        lines.iter().all(|l| !l.contains('\u{fffd}')),
-        "no replacement chars expected"
+    // Only the invalid line is dropped; its neighbours are delivered intact.
+    // The next connection only starts after ~1s, past the 800ms window.
+    assert_eq!(
+        *lines,
+        vec![r#"{"_msg":"before"}"#, r#"{"_msg":"after"}"#],
+        "valid lines around the invalid one must be kept"
+    );
+}
+
+/// A line over 1 MiB is dropped whole: its neighbours are delivered and no
+/// truncated fragment of it ever reaches the caller.
+#[tokio::test]
+async fn test_oversized_line_is_dropped_without_truncated_fragment() {
+    let mock_server = MockServer::start().await;
+
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(b"{\"_msg\":\"before\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"");
+    body.extend(std::iter::repeat_n(b'x', 1024 * 1024 + 10));
+    body.extend_from_slice(b"\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"after\"}\n");
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:oversized");
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lines,
+        vec![r#"{"_msg":"before"}"#, r#"{"_msg":"after"}"#],
+        "only the two valid lines must be received"
     );
 }
 
@@ -911,10 +946,165 @@ async fn test_clean_eof_reconnects_with_delay_not_tight_loop() {
     .await;
 
     let n = mock_server.received_requests().await.unwrap().len();
-    // Empty EOFs back off (1s, 2s, ...): at most a handful of requests in 1.2s,
-    // where the old tight loop produced hundreds.
+    // Empty EOFs back off (1s, 2s, ...): the second request arrives after ~1s
+    // and at most 3 land in 1.2s, where the old tight loop produced hundreds.
     assert!(
-        (1..=5).contains(&n),
+        (2..=3).contains(&n),
         "expected backed-off reconnects, got {n}"
+    );
+}
+
+/// Responder recording the arrival time of each request.
+struct TimedEmptyBody {
+    arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+impl wiremock::Respond for TimedEmptyBody {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(200).set_body_raw(b"", "application/x-ndjson")
+    }
+}
+
+/// The first empty EOF is followed by a ~1s delay (not 2s).
+#[tokio::test]
+async fn test_first_empty_eof_reconnects_after_about_one_second() {
+    let mock_server = MockServer::start().await;
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(TimedEmptyBody {
+            arrivals: Arc::clone(&arrivals),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:eoffirst");
+    let mut client = TailClient::new(config).unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+        client
+            .stream_with_reconnect("test_rule", "default", None, |_| async { Ok(()) })
+            .await
+    })
+    .await;
+
+    let arrivals = arrivals.lock().unwrap();
+    assert!(
+        arrivals.len() >= 2,
+        "expected a second request, got {}",
+        arrivals.len()
+    );
+    let gap = arrivals[1] - arrivals[0];
+    assert!(
+        gap >= Duration::from_millis(850) && gap <= Duration::from_millis(1200),
+        "second request after {gap:?}, expected ~1s"
+    );
+}
+
+// =============================================================================
+// URL normalization and header replacement
+// =============================================================================
+
+#[tokio::test]
+async fn test_base_url_with_trailing_slash() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_config(&mock_server, "_stream:slash");
+    config.base_url = format!("{}/", mock_server.uri());
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 1);
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/select/logsql/tail");
+}
+
+/// Values of every header with the given name in the first received request.
+async fn received_header_values(mock_server: &MockServer, name: &str) -> Vec<String> {
+    let requests = mock_server.received_requests().await.unwrap();
+    requests[0]
+        .headers
+        .get_all(name)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_custom_accept_header_replaces_default() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"\n", "application/x-ndjson"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "accept".to_string(),
+        SecretString::new("application/json".to_string()),
+    );
+    let config = create_config_with_headers(&mock_server, headers);
+    let mut client = TailClient::new(config).unwrap();
+    client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        received_header_values(&mock_server, "accept").await,
+        vec!["application/json"]
+    );
+}
+
+#[tokio::test]
+async fn test_custom_authorization_replaces_basic_auth() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"\n", "application/x-ndjson"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_config_with_basic_auth(&mock_server, "admin", "secret");
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        SecretString::new("Bearer abc".to_string()),
+    );
+    config.headers = Some(headers);
+    assert!(config.custom_authorization_overrides_basic_auth());
+
+    let mut client = TailClient::new(config).unwrap();
+    client
+        .connect_and_receive("test_rule", "default")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        received_header_values(&mock_server, "authorization").await,
+        vec!["Bearer abc"]
     );
 }
