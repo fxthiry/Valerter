@@ -93,9 +93,9 @@ defaults:
 
 templates:
   default_alert:
-    title: "{{ title | default('Alert') }}"
-    body: "{{ body }}"
-    email_body_html: "<p>{{ body }}</p>"
+    title: "{{ rule_name }}"
+    body: "{{ _msg }}"
+    email_body_html: "<p>{{ _msg }}</p>"
 
 rules:
   - name: "error_alert"

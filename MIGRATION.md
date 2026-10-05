@@ -33,6 +33,8 @@ Run `valerter --validate -c /etc/valerter/config.yaml` before upgrading to catch
 
 - An enabled service that you stopped on purpose is started again by the upgrade. Disable it (`systemctl disable valerter`) if it must stay stopped.
 - When upgrading from 2.0.3 or earlier, the old package stops the service before the new one is installed. An enabled service is restarted; a service started by hand without being enabled stays stopped: run `sudo systemctl start valerter` after the upgrade.
+- **Containers and chroots.** The maintainer scripts now touch the service only when systemd is the running init (`/run/systemd/system` exists). Installing or upgrading the package in a container or a chroot runs no `systemctl` command and no longer prints `valerter failed to start after upgrade`; start valerter the way your image does.
+- **Removal.** `dpkg -r valerter` now stops the service whatever its state (including `activating (auto-restart)` between two restarts) and disables it before the package files are removed. Configuration and the `valerter` user are kept, as before.
 
 ### VictoriaLogs streaming: logs, headers and discarded-lines metric
 
@@ -69,6 +71,7 @@ valerter --validate -c /etc/valerter/config.yaml
 |---|---|---|
 | `defaults.throttle.count: 0` accepted with a runtime warning: every rule without its own `throttle` sent at most its first alert | `defaults.throttle.count must be >= 1 (0 would suppress every alert)` | Set `count` to 1 or more |
 | `defaults.throttle.window: 0s` accepted with a runtime warning: throttling silently disabled | `defaults.throttle.window must be > 0 (0s disables throttling)` | Set a positive `window` (e.g. `60s`) |
+| The same notifier listed twice in a rule's `notify.destinations`: every alert delivered twice to it | `rule '<rule>': notify.destinations contains duplicate entry '<name>' (each notifier may appear at most once)` (also for disabled rules) | Remove the duplicate |
 | Unknown filter, test or function in `throttle.key` (rule or `defaults`): every event of the rule fell back to the single key `<rule>:error` | `invalid template in rule '<rule>': throttle.key render: ...` / `defaults.throttle.key render: ...` | Fix or remove the filter; syntax errors in `defaults.throttle.key` are now reported too (`defaults.throttle.key: ...`) |
 | Unknown filter, test or function in a webhook, Telegram or email `body_template` (inline, `body_template_file` or default): every send failed | `Notifier configuration error` with `invalid notifier '<name>': body_template render: ...` | Fix the template; the error names the filter |
 | Invalid header name (space, `:`...) or value (line break) in `victorialogs.<source>.headers`: endless reconnection loop | `victorialogs.<source>.headers: invalid header name '<name>'` / `invalid value for header '<name>'` (the value is never printed) | Fix the header name, or the value or variable it resolves to |
@@ -76,7 +79,11 @@ valerter --validate -c /etc/valerter/config.yaml
 | VictoriaLogs source `url` resolving to a value still containing `${`: accepted without any check | `victorialogs.<source>.url: invalid URL: ...` | Give the variable an `http(s)://` URL |
 | Webhook `url` or Mattermost `webhook_url` built from a `${VAR}` that resolves to a wrong scheme or a non-URL: every send failed | `invalid notifier '<name>': url: invalid URL: ...` / `webhook_url: invalid URL: ...` (the URL is never printed) | Fix the variable's value |
 
-The test render of templates is also more accurate: conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency | float) > 1.5 }}`, `{{ count + 1 }}`), wrongly refused until 2.0.3, are now accepted in templates, `throttle.key`, `subject_template` and `body_template`.
+The test render of templates is also more accurate, in templates, `throttle.key`, `subject_template` and `body_template`:
+
+- **Accepted now:** conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency | float) > 1.5 }}`, `{{ count + 1 }}`) and a division between two plain identifiers (`{{ total/count }}`), wrongly refused until 2.0.3.
+- **Refused now:** an unknown filter, test or function placed after a built-in filter applied to a field (`{{ status | int }}-{{ host | truncat(10) }}`, `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch, in `{% if not x %}`, under `is not defined` or in a `{% for %}` body. The test render runs twice, once with every condition true and every loop over a field iterating one element, once with every condition false, every loop empty and `is defined` false. Such templates were accepted by early 2.1.0 builds and failed at runtime (a `throttle.key` falling back to `<rule>:error`, sends failing); fix the reported filter.
+- **Still not checked:** the part of a template after arithmetic on a raw field (`{{ count + 1 }}` stops the check of that pass; write `{{ count | int + 1 }}`, which also works at runtime since VictoriaLogs fields are strings) and the body of an `elif`. See [docs/configuration.md](docs/configuration.md#template-validation).
 
 ### Custom throttle keys are now shared across a rule's sources
 
@@ -117,8 +124,8 @@ Until 2.0.3, every alert went through a single queue consumed by a single worker
 
 Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the queue. In 2.1.0, on SIGTERM/SIGINT the rule tasks stop first, then every destination delivers its in-flight and queued alerts before the process exits, within 20 seconds. No configuration change is needed; the visible changes are:
 
-- **A shutdown can take up to ~27 s** (about 20 s more than before) when alerts are queued or an endpoint is slow. With empty queues the process still exits at once. If the 20 s expire, the WARN `Shutdown drain timeout reached, alerts not delivered` gives the number of alerts lost (`undelivered`) and the exit code stays 0.
-- **Package upgrades can block `dpkg`/`apt` for up to ~27 s.** The `systemctl restart` run by the Debian `postinst` waits for the old process to drain its queues. This is expected: do not interrupt the upgrade. The shipped unit (`TimeoutStopSec=30`) needs no change.
+- **A shutdown can take up to ~20 s** (about 20 s more than before) when alerts are queued or an endpoint is slow. With empty queues the process still exits at once. If the 20 s expire, the WARN `Shutdown drain timeout reached, alerts not delivered` gives the number of alerts lost (`undelivered`) and the exit code stays 0.
+- **Package upgrades can block `dpkg`/`apt` for up to ~20 s.** The `systemctl restart` run by the Debian `postinst` waits for the old process to drain its queues. This is expected: do not interrupt the upgrade. The shipped unit (`TimeoutStopSec=30`) needs no change.
 - **Raise the stop timeout of container runtimes to 30 s** to benefit from the drain: `docker stop --stop-timeout 30 valerter`, or `stop_grace_period: 30s` in Docker Compose. Docker's default of 10 s kills the process before the drain ends (alerts are then lost, as before 2.1.0). Use the same value for any other supervisor that sends SIGKILL after a delay.
 - **A second SIGTERM/SIGINT forces an immediate exit** (e.g. a second Ctrl+C), whatever the shutdown phase. It logs `Second shutdown signal received, forcing immediate exit` and exits with code **1**, since queued alerts may be lost.
 
@@ -149,6 +156,7 @@ Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the qu
   ```yaml
   expr: increase(valerter_telegram_chat_errors_total[15m]) > 0
   ```
+- **`valerter_vl_source_up` only exists for sources targeted by an enabled rule.** Until 2.0.3 every declared source got the gauge at 0, and a source no enabled rule tails stayed at 0 forever, firing `valerter_vl_source_up == 0` alerts for a source nobody watches. Such a source now has no series; `min(valerter_vl_source_up) == 0` and per-source alerts keep working for the sources that are tailed.
 - **Template render errors at send time are counted.** A webhook `body_template`, an email subject or body, or a Telegram message text that fails to render now increments `valerter_notify_errors_total` and `valerter_alerts_failed_total`; it used to be only logged. Most of these errors are now refused at startup (see [Stricter configuration validation](#stricter-configuration-validation)).
 
 ### `${VAR}` is resolved in webhook `body_template`
@@ -159,9 +167,10 @@ Until 2.0.3, a `systemctl stop` or `restart` dropped every alert still in the qu
 invalid notifier 'pagerduty': body_template: invalid configuration: undefined environment variable: PAGERDUTY_ROUTING_KEY
 ```
 
-- **Find the affected templates:** search for `${` in the `body_template` of your webhook notifiers (`config.yaml` and `notifiers.d/*.yaml`). For each match, either define the variable in the service environment (and when running `--validate`), or remove the placeholder. A literal `${...}` cannot be kept: there is no escape syntax.
+- **Find the affected templates:** search for `${` in the `body_template` of your webhook notifiers (`config.yaml` and `notifiers.d/*.yaml`). For each match, either define the variable in the service environment (and when running `--validate`), or remove the placeholder. To keep a literal `${...}`, write `{{ '$' }}{VAR}`: the substitution does not recognize it and the render produces `${VAR}`.
 - **Values rendered from logs are never resolved.** A `${HOME}` inside a log line or an event field inserted with `{{ body }}` is sent as is.
-- **The value is inserted before Jinja parses the template.** A value containing `{{`, `{%` or `"` is interpreted by Jinja or breaks the JSON body; keep such values in a header instead.
+- **The value is inserted before Jinja parses the template.** A value containing `{{`, `{%` or `"` is interpreted by Jinja or breaks the JSON body; keep such values in a header instead. The resolved template is never logged, but a syntax error caused by such a value may quote a fragment of it in the error message.
+- **Substitution is a single pass**, in `body_template` as in every other resolved field: a variable whose value contains `${...}` is inserted as is, never resolved again.
 - **Telegram and email `body_template` are unchanged** (no `${VAR}` resolution).
 
 The PagerDuty example now reads its routing key from the environment instead of storing it in the configuration file:
@@ -193,10 +202,10 @@ With the shipped systemd unit, define the variable like your other notifier secr
 **Breaking:** until 2.0.3, a rule's `notify.mattermost_channel` was documented as a channel override but silently ignored: alerts went to the notifier's `channel`, or to the webhook's default channel. In 2.1.0 it is applied, so **alerts of a rule that sets it now go to that channel**. The channel is chosen in this order: the rule's `mattermost_channel`, then the notifier's `channel`, then the webhook's default channel.
 
 - **To keep the previous behavior**, remove `mattermost_channel` from the rule. Search for it in `config.yaml` and `rules.d/*.yaml`.
-- **Check the channel and the webhook.** The key was never exercised, so a misspelled channel or a webhook created with "Lock to this channel" is likely. When Mattermost rejects the rule's channel with a 4xx response other than 429, the alert is resent once **without** `channel` (to the webhook's default channel, as before the upgrade) and the WARN below is logged for every such alert, until you fix the channel name, unlock the webhook or remove the key:
+- **Check the channel and the webhook.** The key was never exercised, so a misspelled channel or a webhook created with "Lock to this channel" is likely. When Mattermost rejects the rule's channel with a 4xx response other than 429, the alert is resent once to the notifier's `channel` if it has one (and it differs from the rule's), otherwise **without** `channel` (to the webhook's default channel): in both cases where the alert went before the upgrade. The WARN below is logged for every such alert, until you fix the channel name, unlock the webhook or remove the key (`fallback_channel` is absent when the resend has no `channel`):
 
   ```
-  Mattermost rejected channel override, resending without channel notifier_name=<notifier> rule_name=<rule> channel=<requested channel> status=<status>
+  Mattermost rejected channel override, resending to notifier default notifier_name=<notifier> rule_name=<rule> channel=<requested channel> fallback_channel=<notifier channel> status=<status>
   ```
 
   The resend costs one extra request per alert; the alert is counted once in the metrics, as sent or failed. A 4xx on the resend fails the alert. The notifier's own `channel` keeps its behavior: a 4xx fails the alert immediately.

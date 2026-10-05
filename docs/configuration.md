@@ -104,8 +104,8 @@ name '...'`, `duplicate notifier name '...'`), whether the collision is between
 ```yaml
 victorialogs:    # VictoriaLogs connection (REQUIRED)
 metrics:         # Prometheus metrics (optional)
-notifiers:       # Named notification channels (recommended)
-defaults:        # Default throttle and notify settings (REQUIRED)
+notifiers:       # Named notification channels (REQUIRED, at least one)
+defaults:        # Default throttle, timestamp timezone and stream cap (REQUIRED)
 templates:       # Message templates (REQUIRED)
 rules:           # Alert rules (REQUIRED, at least one)
 ```
@@ -156,6 +156,10 @@ victorialogs:
   header value nor the credentials). Headers with another name, such as
   `X-Tenant` or `Authorization-Token`, are sent together with Basic Auth.
 - Header values and the Basic Auth password are never written to the logs.
+  The source URL (which may carry credentials or a token resolved from
+  `${VAR}`) only appears masked in the streaming logs
+  (`http://***@vl:9428/select/logsql/tail?***`, the LogsQL query being logged
+  in a separate `query` field), and transport errors are logged without it.
 
 The configuration is refused at load time (and by `valerter --validate`) when,
 after `${VAR}` substitution:
@@ -306,9 +310,9 @@ Message templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via m
 ```yaml
 templates:
   default_alert:
-    title: "{{ title | default('Alert') }}"           # REQUIRED
-    body: "{{ body }}"                                 # REQUIRED
-    email_body_html: "<p>{{ body }}</p>"                     # REQUIRED for email destinations
+    title: "{{ rule_name }}"                           # REQUIRED
+    body: "{{ _msg }}"                                 # REQUIRED
+    email_body_html: "<p>{{ _msg }}</p>"               # REQUIRED for email destinations
     accent_color: "#ff0000"                            # Optional: hex color
 ```
 
@@ -358,34 +362,64 @@ with bracket notation:
 
 `valerter --validate` detects this pattern and prints the rewritten expression.
 
-A **top-level** field whose name contains `/` (e.g. `io/username`, with no dot
+A **top-level** field whose name contains `/` (e.g. `io/user-name`, with no dot
 before it) has no parent object to index, so it cannot be referenced from a
 template. Rename it in the rule query with the LogsQL `rename` pipe, then use
 the new name:
 
 ```yaml
-query: '_stream:{app="oauth"} | rename "io/username" as io_username'
-# template: {{ io_username }}
+query: '_stream:{app="oauth"} | rename "io/user-name" as io_user_name'
+# template: {{ io_user_name }}
 ```
 
-`valerter --validate` suggests this rename for `{{ io/username }}`.
+`valerter --validate` suggests this rename for `{{ io/user-name }}`. A `/`
+between two plain identifiers (`{{ total/count }}`) is read as a division and
+accepted: it cannot be told apart from a field named `total/count`, so a
+top-level field like `io/username` (no `.`, `-` or `/` in its last part) is not
+detected and must be renamed the same way.
 
 ### Template validation
 
 Templates (`title`, `body`, `email_body_html`, `throttle.key`, and the notifier
 `subject_template`/`body_template`) are checked for syntax, then test-rendered
-with placeholder values where every field is defined and every condition is
-true. The test render refuses only errors that do not depend on the event's
-values:
+twice with placeholder values where every field is defined:
+
+1. every condition on a field is true and every loop over a field iterates one
+   element, so `{% if %}` bodies and `{% for %}` bodies are checked;
+2. every condition on a field is false, every loop is empty and `is defined` is
+   false for a field, so `{% else %}` branches, `{% if not x %}` and
+   `{% if x is not defined %}` bodies are checked.
+
+The test render refuses only errors that do not depend on the event's values,
+in either pass:
 
 - an unknown filter, test, function or method (`{{ _msg | truncate(50) }}`,
-  `{% if host is nosuchtest %}`), reported as `<field> render: ...`;
+  `{% if host is nosuchtest %}`), reported as `<field> render: ...`, including
+  after a built-in filter applied to a field
+  (`{{ status | int }}-{{ host | truncat(10) }}`,
+  `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch
+  or in a loop body (`{% for k, v in m | items %}{{ v | nosuch }}{% endfor %}`);
 - the `/` operator applied to a field path (see above).
 
 Conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency |
 float) > 1.5 }}`, `{{ ratio | round }}`, `{{ count + 1 }}`) are accepted: their
-outcome depends on the real values. An error of that kind at runtime falls back
-to a generic message (templates) or to the `<rule>:error` key (throttle).
+outcome depends on the real values. A built-in filter applied to a field
+(`| int`, `| float`, `| round`, `| split`, `| upper`, `| items`...) does not
+stop the check: the rest of the template is still verified. An error of that
+kind at runtime falls back to a generic message (templates) or to the
+`<rule>:error` key (throttle).
+
+Limits of the test render (these parts are not checked):
+
+- **Arithmetic on a raw field** (`{{ count + 1 }}`) stops the current pass
+  without error: what follows it is not checked in that pass. VictoriaLogs
+  fields are strings, so this expression also fails at runtime: write
+  `{{ count | int + 1 }}`, which is checked and works.
+- **The body of an `elif`** is reached by neither pass (the first takes the
+  `if`, the second the `else`).
+- **A loop nested over a loop item** (`{% for y in x %}` inside
+  `{% for x in items %}`) does not iterate, and unpacking an item without
+  `| items` (`{% for a, b in x %}`) stops the pass.
 
 ### email_body_html Requirement
 
@@ -419,14 +453,21 @@ rules:
 
     notify:                           # REQUIRED
       template: "custom_template"     # REQUIRED: template name
-      destinations:                   # REQUIRED: at least one notifier
+      destinations:                   # REQUIRED: at least one notifier, each at most once
         - mattermost-ops
         - email-ops
       mattermost_channel: "alerts"    # Optional: channel for Mattermost destinations
                                       # (rule > notifier `channel` > webhook default;
-                                      # resent without channel if rejected, see
+                                      # if rejected, resent to the notifier `channel`
+                                      # or the webhook default, see
                                       # notifiers.md#channel-per-rule)
 ```
+
+`notify.destinations` must list each notifier at most once: a duplicate, which
+would deliver every alert twice to the same notifier, refuses the configuration
+at load time and in `--validate`, for enabled and disabled rules alike
+(`rule '<rule>': notify.destinations contains duplicate entry '<name>' (each
+notifier may appear at most once)`).
 
 ### LogsQL query restrictions
 
@@ -616,7 +657,7 @@ valerter --validate -c /etc/valerter/config.yaml
 
 `--validate` runs every blocking check of the daemon startup, with the same error messages and exit code 1 on failure:
 
-1. **Loading** — YAML syntax, unknown fields, `config.d/` merge, `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
+1. **Loading** — YAML syntax, unknown fields, `rules.d/`, `templates.d/` and `notifiers.d/` merge, `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
 2. **Validation** — required fields, regexes, template syntax and [test render](#template-validation) (including `throttle.key`), source names, URLs and headers, `defaults.throttle`, `max_streams` cap, at least one enabled rule
 3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, resolved webhook and Mattermost URLs are checked, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids`, Telegram `parse_mode` and notifier templates (syntax and test render) are checked
 4. **Rule destinations** — every rule destination (enabled or not) names a declared notifier

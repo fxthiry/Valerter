@@ -157,14 +157,14 @@ templates:
   # ── Example: Severity-based template ───────────────────────────────────────
   #
   # critical_alert:
-  #   title: "🔴 CRITICAL: {{ title }}"
+  #   title: "🔴 CRITICAL: {{ rule_name }}"
   #   body: |
   #     **Host:** {{ host }}
-  #     **Message:** {{ message }}
+  #     **Message:** {{ message | default(_msg) }}
   #   email_body_html: |
-  #     <h2 style="color: red;">{{ title }}</h2>
+  #     <h2 style="color: red;">{{ rule_name }}</h2>
   #     <p><strong>Host:</strong> {{ host }}</p>
-  #     <p>{{ message }}</p>
+  #     <p>{{ message | default(_msg) }}</p>
   #   accent_color: "#e74c3c"
 
 
@@ -353,8 +353,9 @@ rules:
     notify:
       template: default_alert
       # mattermost_channel: custom-channel # Mattermost channel for this rule, over the
-      #                                    # notifier's channel; resent without channel
-      #                                    # (webhook default) if Mattermost rejects it
+      #                                    # notifier's channel; if Mattermost rejects it,
+      #                                    # resent to the notifier's channel (or the
+      #                                    # webhook default when it has none)
       destinations:
         - mattermost-ops
 
@@ -389,8 +390,15 @@ metrics:
 # ENVIRONMENT VARIABLES
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Use ${VAR_NAME} syntax anywhere in this file to reference environment variables.
+# Use ${VAR_NAME} syntax to reference environment variables in these fields
+# (elsewhere, ${...} is kept as is):
+#   - victorialogs.<source>: url, basic_auth.username, basic_auth.password,
+#     headers values
+#   - notifier secrets: Mattermost webhook_url; webhook url and headers values;
+#     email smtp.username and smtp.password; Telegram bot_token
+#   - webhook body_template source (write {{ '$' }}{VAR} for a literal ${VAR})
 # Any variable from the process environment can be used (no predefined list).
+# Substitution is a single pass: a value containing ${...} is not resolved again.
 #
 # Examples used in this file:
 #   ${VL_USER}, ${VL_PASS}     - VictoriaLogs credentials
