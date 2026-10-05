@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
@@ -52,8 +53,26 @@ use crate::throttle::{
     DEFAULT_MAX_CAPACITY, ThrottleResult, ThrottleStore, Throttler, key_references_vl_source,
 };
 
-/// Delay before restarting a rule after panic (AD-07 inspired).
-const PANIC_RESTART_DELAY: Duration = Duration::from_secs(5);
+/// Delay before restarting a task after its first consecutive panic.
+const PANIC_RESTART_BASE_DELAY: Duration = Duration::from_secs(5);
+
+/// Upper bound of the restart delay after repeated panics.
+const PANIC_RESTART_MAX_DELAY: Duration = Duration::from_secs(300);
+
+/// Run time after which a task that panics again starts a new panic series.
+const PANIC_STABLE_RUN_RESET: Duration = Duration::from_secs(600);
+
+/// Restart delay after the `consecutive_panics`-th consecutive panic of a
+/// task: 5 s, doubled per panic, capped at 5 min (saturating, so any count is
+/// safe).
+fn panic_restart_delay(consecutive_panics: u32) -> Duration {
+    let factor = 2u32
+        .checked_pow(consecutive_panics.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    PANIC_RESTART_BASE_DELAY
+        .saturating_mul(factor)
+        .min(PANIC_RESTART_MAX_DELAY)
+}
 
 /// Resolve the set of `(source_name, source_config)` pairs to spawn for a rule.
 ///
@@ -118,6 +137,21 @@ impl RuleSpawnContext {
     }
 }
 
+/// Supervision state of one running (or restart-pending) `(rule, source)`
+/// task, keyed by its Tokio task ID.
+struct TrackedTask {
+    rule_name: String,
+    vl_source: String,
+    ctx: RuleSpawnContext,
+    /// Consecutive panics that led to this spawn (0 for the initial spawn).
+    consecutive_panics: u32,
+    /// When the task starts running, i.e. once its restart delay has elapsed.
+    started_at: Instant,
+}
+
+/// Tasks supervised by the engine, by Tokio task ID.
+type TaskMap = HashMap<tokio::task::Id, TrackedTask>;
+
 /// Custom throttle key of a rule whose counter is shared across its sources.
 ///
 /// Returns the key template when the rule targets at least two sources and
@@ -158,7 +192,7 @@ fn default_rule_runner() -> RuleRunner {
 /// them using `JoinSet`. This provides:
 /// - Task isolation (one rule's error doesn't affect others)
 /// - Panic detection and logging
-/// - Automatic restart after panic (AC #4)
+/// - Automatic restart after panic, with exponential backoff (AC #4)
 /// - Graceful shutdown via cancellation token
 pub struct RuleEngine {
     /// Runtime configuration with compiled rules.
@@ -202,7 +236,7 @@ impl RuleEngine {
     /// Handles:
     /// - Normal task completion (shouldn't happen - rules run forever)
     /// - Fatal errors (logged, task not restarted)
-    /// - Panics (logged as CRITICAL, task restarted after delay)
+    /// - Panics (logged as CRITICAL, task restarted after a backoff delay)
     /// - Cancellation (graceful shutdown)
     ///
     /// # Arguments
@@ -218,10 +252,9 @@ impl RuleEngine {
     /// watching nothing.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), RuleError> {
         let mut tasks: JoinSet<(String, String, Result<(), RuleError>)> = JoinSet::new();
-        // Map AbortHandle ID to (rule_name, vl_source_name, spawn_context) for
-        // respawn after panic. Each `(rule, source)` pair is a distinct task.
-        let mut handle_to_context: HashMap<tokio::task::Id, (String, String, RuleSpawnContext)> =
-            HashMap::new();
+        // Map task ID to the `(rule, source)` pair, its spawn context and its
+        // panic history, for respawn after panic. Each pair is a distinct task.
+        let mut handle_to_context = TaskMap::new();
 
         // Spawn a task per (enabled rule, resolved source) pair
         let spawned_count =
@@ -248,7 +281,7 @@ impl RuleEngine {
     fn spawn_rule_tasks(
         &self,
         tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
+        handle_to_context: &mut TaskMap,
         cancel: CancellationToken,
     ) -> usize {
         let mut count = 0;
@@ -318,8 +351,9 @@ impl RuleEngine {
                     tasks,
                     handle_to_context,
                     &self.runner,
-                    &ctx,
+                    ctx,
                     cancel.clone(),
+                    0,
                 );
                 count += 1;
             }
@@ -329,21 +363,43 @@ impl RuleEngine {
     }
 
     /// Spawn a single `(rule, source)` task and track its handle.
+    ///
+    /// After a panic (`consecutive_panics > 0`) the task first waits its
+    /// restart delay, so the supervision loop never sleeps: the pending task
+    /// stays in the `JoinSet` (it counts as active) and a cancellation ends
+    /// the wait at once, without running the rule.
     fn spawn_single_rule(
         tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
+        handle_to_context: &mut TaskMap,
         runner: &RuleRunner,
-        ctx: &RuleSpawnContext,
+        ctx: RuleSpawnContext,
         cancel: CancellationToken,
+        consecutive_panics: u32,
     ) {
-        let rule_name_owned = ctx.rule.name.clone();
-        let vl_source_owned = ctx.vl_source_name.clone();
+        let delay = if consecutive_panics == 0 {
+            Duration::ZERO
+        } else {
+            panic_restart_delay(consecutive_panics)
+        };
         let ctx_clone = ctx.clone();
         let runner = Arc::clone(runner);
 
         let abort_handle = tasks.spawn(async move {
             let rule_name_for_return = ctx_clone.rule.name.clone();
             let vl_source_for_return = ctx_clone.vl_source_name.clone();
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => {
+                        return (rule_name_for_return, vl_source_for_return, Ok(()));
+                    }
+                }
+                info!(
+                    rule_name = %rule_name_for_return,
+                    vl_source = %vl_source_for_return,
+                    "Rule-source task respawned after panic"
+                );
+            }
             // Build the future inside the task so a panic in the factory is
             // caught by the JoinSet like any other task panic.
             let result = runner(ctx_clone, cancel).await;
@@ -353,7 +409,13 @@ impl RuleEngine {
         // Track context by task ID for respawn
         handle_to_context.insert(
             abort_handle.id(),
-            (rule_name_owned, vl_source_owned, ctx.clone()),
+            TrackedTask {
+                rule_name: ctx.rule.name.clone(),
+                vl_source: ctx.vl_source_name.clone(),
+                ctx,
+                consecutive_panics,
+                started_at: Instant::now() + delay,
+            },
         );
     }
 
@@ -361,7 +423,7 @@ impl RuleEngine {
     async fn supervise_tasks(
         &self,
         tasks: &mut JoinSet<(String, String, Result<(), RuleError>)>,
-        handle_to_context: &mut HashMap<tokio::task::Id, (String, String, RuleSpawnContext)>,
+        handle_to_context: &mut TaskMap,
         cancel: CancellationToken,
     ) -> Result<(), RuleError> {
         loop {
@@ -391,7 +453,8 @@ impl RuleEngine {
                         }
                         Err(join_error) if join_error.is_panic() => {
                             let task_id = join_error.id();
-                            if let Some((rule_name, vl_source, ctx)) = handle_to_context.remove(&task_id) {
+                            if let Some(tracked) = handle_to_context.remove(&task_id) {
+                                let TrackedTask { rule_name, vl_source, ctx, .. } = &tracked;
                                 error!(
                                     rule_name = %rule_name,
                                     vl_source = %vl_source,
@@ -406,24 +469,30 @@ impl RuleEngine {
                                 ).increment(1);
 
                                 if !cancel.is_cancelled() {
+                                    // A task that ran long enough starts a new
+                                    // panic series; there is no restart limit.
+                                    let consecutive_panics = if tracked.started_at.elapsed()
+                                        >= PANIC_STABLE_RUN_RESET
+                                    {
+                                        1
+                                    } else {
+                                        tracked.consecutive_panics.saturating_add(1)
+                                    };
                                     info!(
                                         rule_name = %rule_name,
                                         vl_source = %vl_source,
-                                        delay_secs = PANIC_RESTART_DELAY.as_secs(),
+                                        delay_secs = panic_restart_delay(consecutive_panics).as_secs(),
+                                        consecutive_panics,
                                         "Respawning rule-source task after panic delay"
                                     );
-                                    tokio::time::sleep(PANIC_RESTART_DELAY).await;
-
-                                    if !cancel.is_cancelled() {
-                                        Self::spawn_single_rule(
-                                            tasks,
-                                            handle_to_context,
-                                            &self.runner,
-                                            &ctx,
-                                            cancel.clone(),
-                                        );
-                                        info!(rule_name = %rule_name, vl_source = %vl_source, "Rule-source task respawned after panic");
-                                    }
+                                    Self::spawn_single_rule(
+                                        tasks,
+                                        handle_to_context,
+                                        &self.runner,
+                                        ctx.clone(),
+                                        cancel.clone(),
+                                        consecutive_panics,
+                                    );
                                 }
                             } else {
                                 error!(
@@ -445,6 +514,8 @@ impl RuleEngine {
                         }
                     }
 
+                    // A task waiting for its restart delay is still in the
+                    // set, so it keeps this check from firing.
                     if tasks.is_empty() && !cancel.is_cancelled() {
                         error!("All rule tasks completed unexpectedly");
                         return Err(RuleError::AllTasksStopped);
@@ -1110,6 +1181,324 @@ mod tests {
     }
 
     // ===================================================================
+    // Restart after panic (virtual time)
+    // ===================================================================
+
+    /// One run of a scripted `(rule, source)` task. Once a source's script is
+    /// exhausted, its task runs until cancelled.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// Panic as soon as the task starts.
+        Panic,
+        /// Run for the given time, then panic.
+        PanicAfter(Duration),
+        /// Run for the given time, then fail fatally.
+        FailAfter(Duration),
+    }
+
+    /// Per-source script of a [`scripted_runner`] and the start time of every
+    /// task it ran.
+    #[derive(Default)]
+    struct Script {
+        steps: std::sync::Mutex<HashMap<String, std::collections::VecDeque<Step>>>,
+        starts: std::sync::Mutex<Vec<(String, Instant)>>,
+    }
+
+    impl Script {
+        /// Start times of the tasks run for `source`, in order.
+        fn starts_of(&self, source: &str) -> Vec<Instant> {
+            self.starts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| s == source)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+    }
+
+    /// Runner that follows a script per source name (panic, fatal error or
+    /// idle until cancelled) and records when each task starts.
+    fn scripted_runner(steps: &[(&str, &[Step])]) -> (RuleRunner, Arc<Script>) {
+        let script = Arc::new(Script::default());
+        *script.steps.lock().unwrap() = steps
+            .iter()
+            .map(|(source, steps)| (source.to_string(), steps.iter().copied().collect()))
+            .collect();
+        let shared = Arc::clone(&script);
+        let runner: RuleRunner = Arc::new(move |ctx, cancel| {
+            let script = Arc::clone(&shared);
+            Box::pin(async move {
+                let source = ctx.vl_source_name.clone();
+                script
+                    .starts
+                    .lock()
+                    .unwrap()
+                    .push((source.clone(), Instant::now()));
+                let step = script
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .get_mut(&source)
+                    .and_then(|steps| steps.pop_front());
+                match step {
+                    Some(Step::Panic) => panic!("scripted panic"),
+                    Some(Step::PanicAfter(after)) => {
+                        tokio::time::sleep(after).await;
+                        panic!("scripted panic");
+                    }
+                    Some(Step::FailAfter(after)) => {
+                        tokio::time::sleep(after).await;
+                        Err(RuleError::Stream(
+                            crate::error::StreamError::ConnectionFailed(
+                                "scripted failure".to_string(),
+                            ),
+                        ))
+                    }
+                    None => {
+                        cancel.cancelled().await;
+                        Ok(())
+                    }
+                }
+            })
+        });
+        (runner, script)
+    }
+
+    /// Engine running `rule1` on the given sources with `runner`.
+    fn engine_on_sources(sources: &[&str], runner: RuleRunner) -> RuleEngine {
+        let mut config = make_test_runtime_config(vec![make_test_rule("rule1", true)]);
+        config.victorialogs = sources_map(sources);
+        RuleEngine::new(config, make_test_client(), make_test_queue()).with_runner(runner)
+    }
+
+    /// Prometheus recorder installed for the current thread (the tests below
+    /// run on a current-thread runtime, so every task records into it).
+    fn local_recorder() -> (
+        metrics::LocalRecorderGuard<'static>,
+        metrics_exporter_prometheus::PrometheusHandle,
+    ) {
+        let recorder: &'static _ = Box::leak(Box::new(
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder(),
+        ));
+        let handle = recorder.handle();
+        (metrics::set_default_local_recorder(recorder), handle)
+    }
+
+    #[test]
+    fn panic_restart_delay_doubles_up_to_five_minutes() {
+        let delays: Vec<u64> = (1..=9).map(|n| panic_restart_delay(n).as_secs()).collect();
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(panic_restart_delay(33).as_secs(), 300);
+        assert_eq!(panic_restart_delay(u32::MAX).as_secs(), 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervision_keeps_running_during_panic_restart_delay() {
+        let (_guard, metrics) = local_recorder();
+        let (runner, script) = scripted_runner(&[
+            ("vla", &[Step::Panic]),
+            ("vlb", &[Step::FailAfter(Duration::from_secs(1))]),
+        ]);
+        let engine = engine_on_sources(&["vla", "vlb"], runner);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        // vla waits for its 5 s restart delay; vlb's fatal error at 1 s is
+        // handled meanwhile.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .contains("valerter_rule_errors_total{rule_name=\"rule1\",vl_source=\"vlb\"} 1"),
+            "fatal error not handled during the restart delay:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("valerter_rule_panics_total{rule_name=\"rule1\",vl_source=\"vla\"} 1"),
+            "panic not counted:\n{rendered}"
+        );
+
+        // Shutdown during the delay returns at once, without a restart.
+        let before = Instant::now();
+        cancel.cancel();
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "cancelled engine should return Ok");
+        assert_eq!(Instant::now(), before, "shutdown waited for the delay");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            script.starts_of("vla").len(),
+            1,
+            "task restarted after shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn simultaneous_panics_restart_after_their_own_delay() {
+        let (runner, script) = scripted_runner(&[("vla", &[Step::Panic]), ("vlb", &[Step::Panic])]);
+        let engine = engine_on_sources(&["vla", "vlb"], runner);
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let restarted = t0 + Duration::from_secs(5);
+        assert_eq!(script.starts_of("vla"), [t0, restarted]);
+        assert_eq!(script.starts_of("vlb"), [t0, restarted]);
+
+        cancel.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn task_waiting_for_restart_counts_as_active() {
+        let (runner, script) = scripted_runner(&[
+            ("vla", &[Step::Panic]),
+            ("vlb", &[Step::FailAfter(Duration::from_secs(1))]),
+        ]);
+        let engine = engine_on_sources(&["vla", "vlb"], runner);
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        // At 2 s vlb has stopped and vla only waits for its restart.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!handle.is_finished(), "engine reported all tasks stopped");
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(script.starts_of("vla"), [t0, t0 + Duration::from_secs(5)]);
+        assert!(!handle.is_finished());
+
+        cancel.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_panics_back_off_exponentially_without_limit() {
+        let (_guard, metrics) = local_recorder();
+        let (runner, script) = scripted_runner(&[("vla", &[Step::Panic; 12])]);
+        let engine = engine_on_sources(&["vla"], runner);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        // 5+10+20+40+80+160 s, then 6 × 300 s: 2115 s for 12 panics.
+        tokio::time::sleep(Duration::from_secs(2200)).await;
+        let starts = script.starts_of("vla");
+        let delays: Vec<u64> = starts.windows(2).map(|w| (w[1] - w[0]).as_secs()).collect();
+        assert_eq!(
+            delays,
+            [5, 10, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300]
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .contains("valerter_rule_panics_total{rule_name=\"rule1\",vl_source=\"vla\"} 12"),
+            "expected 12 panics:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("valerter_rule_errors_total"),
+            "panics must not count as errors:\n{rendered}"
+        );
+
+        cancel.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stable_run_resets_panic_backoff() {
+        let (runner, script) = scripted_runner(&[
+            // Runs 10 min after its second restart: the next panic is a first one.
+            (
+                "vla",
+                &[
+                    Step::Panic,
+                    Step::Panic,
+                    Step::PanicAfter(Duration::from_secs(600)),
+                    Step::Panic,
+                ],
+            ),
+            // Runs 1 s less: the backoff keeps growing.
+            (
+                "vlb",
+                &[
+                    Step::Panic,
+                    Step::Panic,
+                    Step::PanicAfter(Duration::from_secs(599)),
+                ],
+            ),
+        ]);
+        let engine = engine_on_sources(&["vla", "vlb"], runner);
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        tokio::time::sleep(Duration::from_secs(700)).await;
+        let secs = |starts: Vec<Instant>| -> Vec<u64> {
+            starts.iter().map(|at| (*at - t0).as_secs()).collect()
+        };
+        // vla: panics at 615 s after 600 s of run, restarts 5 s later, then
+        // its next immediate panic waits 10 s.
+        assert_eq!(secs(script.starts_of("vla")), [0, 5, 15, 620, 630]);
+        // vlb: panics at 614 s, third consecutive panic, restarts 20 s later.
+        assert_eq!(secs(script.starts_of("vlb")), [0, 5, 15, 634]);
+
+        cancel.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn respawn_after_panic_keeps_the_throttle_store() {
+        let stores: Arc<std::sync::Mutex<Vec<Arc<ThrottleStore>>>> = Arc::default();
+        let runner: RuleRunner = {
+            let stores = Arc::clone(&stores);
+            Arc::new(move |ctx, cancel| {
+                let first = {
+                    let mut stores = stores.lock().unwrap();
+                    stores.push(Arc::clone(&ctx.throttle_store));
+                    stores.len() == 1
+                };
+                Box::pin(async move {
+                    assert!(!first, "scripted panic");
+                    cancel.cancelled().await;
+                    Ok(())
+                })
+            })
+        };
+        let engine = engine_on_sources(&["vla"], runner);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run(cancel).await }
+        });
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        {
+            let stores = stores.lock().unwrap();
+            assert_eq!(stores.len(), 2, "task not restarted");
+            assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+        }
+
+        cancel.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    // ===================================================================
     // Task 2: Tests for process_log_line
     // ===================================================================
 
@@ -1369,7 +1758,7 @@ mod tests {
 
         let mut contexts: Vec<RuleSpawnContext> = handle_to_context
             .into_values()
-            .map(|(_, _, ctx)| ctx)
+            .map(|tracked| tracked.ctx)
             .collect();
         contexts.sort_by(|a, b| a.vl_source_name.cmp(&b.vl_source_name));
         contexts

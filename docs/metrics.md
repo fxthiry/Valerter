@@ -37,7 +37,7 @@ metrics:
 | `valerter_notify_errors_total` | `rule_name`, `vl_source`, `notifier_name`, `notifier_type` | Notification send errors (including a notifier panic during the send, and `notifier_type="unknown"` for a destination missing from the registry) |
 | `valerter_parse_errors_total` | `rule_name`, `vl_source`, `error_type` | Parsing errors |
 | `valerter_reconnections_total` | `rule_name`, `vl_source` | VictoriaLogs reconnections |
-| `valerter_rule_panics_total` | `rule_name`, `vl_source` | Rule task panics (auto-restarted) |
+| `valerter_rule_panics_total` | `rule_name`, `vl_source` | Rule task panics. The task is auto-restarted with exponential backoff (5 s to 5 min), never abandoned: a steady increase means a task panicking in a loop |
 | `valerter_rule_errors_total` | `rule_name`, `vl_source` | Fatal rule errors |
 
 ### Gauges
@@ -144,14 +144,15 @@ groups:
           summary: "Valerter dropping alerts for {{ $labels.notifier_name }}"
           description: "The queue of {{ $labels.notifier_name }} is full: its oldest alerts are dropped"
 
-      # Rule panics (indicates bugs)
+      # Rule panics (indicates bugs). Panicked tasks are restarted forever
+      # with a 5 s to 5 min backoff, so a looping panic shows up here.
       - alert: ValerterRulePanic
         expr: increase(valerter_rule_panics_total[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "Valerter rule {{ $labels.rule_name }} panicked"
-          description: "Rule panicked and was auto-restarted. Check logs for details."
+          summary: "Valerter rule {{ $labels.rule_name }} panicked on {{ $labels.vl_source }}"
+          description: "{{ $value }} panics in the last hour; the task is auto-restarted with backoff. Check logs for 'Rule task panicked - CRITICAL'."
 ```
 
 ## Key Metrics to Monitor
