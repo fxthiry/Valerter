@@ -443,6 +443,11 @@ async fn run(runtime_config: valerter::config::RuntimeConfig) -> Result<()> {
     let engine_cancel = cancel.clone();
     let engine_result = engine.run(engine_cancel).await;
 
+    // Whatever made the engine return (signal, no task, all tasks stopped),
+    // stop the worker, metrics server and uptime updater now instead of
+    // letting the timeouts below expire. Idempotent after a signal.
+    cancel.cancel();
+
     // Wait for worker to finish
     info!("Waiting for notification worker to drain queue...");
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;

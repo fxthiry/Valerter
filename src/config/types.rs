@@ -698,6 +698,13 @@ impl Config {
             errors.push(ConfigError::ValidationError(
                 "no rules defined: add rules in config.yaml or rules.d/".to_string(),
             ));
+        } else if !self.rules.iter().any(|r| r.enabled) {
+            // A daemon with no enabled rule would watch nothing: refuse it at
+            // validation so both `--validate` and startup report it.
+            errors.push(ConfigError::ValidationError(
+                "all rules are disabled: enable at least one rule in config.yaml or rules.d/"
+                    .to_string(),
+            ));
         }
 
         // ===== Rule validations =====

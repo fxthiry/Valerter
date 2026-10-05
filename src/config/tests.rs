@@ -180,6 +180,126 @@ rules: []
         matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no rules defined"))
     });
     assert!(has_no_rules_error);
+    // The "all rules are disabled" error is exclusive with "no rules defined".
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.to_string().contains("all rules are disabled")),
+        "Expected only 'no rules defined', got: {:?}",
+        errors
+    );
+}
+
+/// Build a config whose rules have the given `enabled` flags.
+fn config_with_rule_flags(flags: &[bool], notify_template: &str) -> Config {
+    let mut yaml = String::from(
+        r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+rules:
+"#,
+    );
+    for (i, enabled) in flags.iter().enumerate() {
+        yaml.push_str(&format!(
+            "  - name: rule{i}\n    enabled: {enabled}\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: {notify_template}\n      destinations: [test]\n"
+        ));
+    }
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn validate_all_rules_disabled_fails() {
+    let config = config_with_rule_flags(&[false, false], "test");
+    let errors = config.validate().unwrap_err();
+    let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains(
+            "all rules are disabled: enable at least one rule in config.yaml or rules.d/"
+        )),
+        "Expected 'all rules are disabled' error, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("no rules defined")),
+        "'no rules defined' must not be reported when rules exist, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn validate_all_rules_disabled_is_reported_with_other_errors() {
+    // Exhaustive validation: the disabled-rules error joins the other errors.
+    let config = config_with_rule_flags(&[false], "missing_template");
+    let errors = config.validate().unwrap_err();
+    let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("all rules are disabled")),
+        "Expected 'all rules are disabled' error, got: {:?}",
+        messages
+    );
+    assert!(
+        messages.len() >= 2,
+        "Expected the missing template error as well, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn validate_one_enabled_rule_among_disabled_passes() {
+    let config = config_with_rule_flags(&[false, true, false], "test");
+    config
+        .validate()
+        .expect("one enabled rule is enough to pass validation");
+}
+
+#[test]
+fn validate_rule_enabled_by_default_counts_as_enabled() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+rules:
+  - name: off
+    enabled: false
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: test, destinations: [test] }
+  - name: on_by_default
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: test, destinations: [test] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    config
+        .validate()
+        .expect("a rule without `enabled` is enabled by default");
 }
 
 #[test]

@@ -38,9 +38,29 @@ case "$1" in
         # Reload systemd (if available)
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
-            # Restart service on upgrade (not on fresh install)
-            if [ -n "$2" ] && systemctl is-active --quiet valerter; then
-                systemctl restart valerter || true
+            # Restart service on upgrade (not on fresh install) when it is
+            # active or enabled. The enabled check also covers upgrades from
+            # <= 2.0.3, whose prerm already stopped the service.
+            if [ -n "$2" ]; then
+                if systemctl is-active --quiet valerter 2>/dev/null \
+                    || systemctl is-enabled --quiet valerter 2>/dev/null; then
+                    systemctl restart valerter || true
+                    # Give an invalid config time to make the process exit,
+                    # then warn loudly without failing dpkg.
+                    sleep 2
+                    if ! systemctl is-active --quiet valerter 2>/dev/null; then
+                        cat >&2 <<'WARN'
+
+############################################################
+WARNING: valerter failed to start after upgrade
+The service is not running: no alerts are being sent.
+Check the logs with: journalctl -u valerter
+Then fix the configuration and run: systemctl restart valerter
+############################################################
+
+WARN
+                    fi
+                fi
             fi
         fi
         ;;

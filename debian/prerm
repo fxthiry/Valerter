@@ -2,8 +2,10 @@
 set -e
 
 case "$1" in
-    remove|upgrade|deconfigure)
-        # Stop service before removal (if systemd available)
+    remove|deconfigure)
+        # Stop service before removal (if systemd available).
+        # Not on upgrade: the running process keeps the old binary mapped
+        # and postinst restarts it, so downtime is limited to the restart.
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet valerter 2>/dev/null; then
                 systemctl stop valerter || true
