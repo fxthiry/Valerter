@@ -19,6 +19,8 @@ Valerter is built with these key technical choices:
 - **Docker** (for SMTP integration tests with Mailhog)
 - **cargo-tarpaulin** (optional, for coverage): `cargo install cargo-tarpaulin`
 
+With Nix, `nix develop` (or [direnv](https://direnv.net/) with the provided `.envrc`) gives a shell with the Rust toolchain, cargo-deb and cargo-tarpaulin. Release builds (musl static binary, `.deb`) are produced by CI.
+
 ## Contribution Workflow
 
 1. **Fork** the repository (external contributors) or **create a branch** directly (collaborators)
