@@ -27,3 +27,9 @@ CLAUDE.md
 
 # direnv cache (use flake)
 .direnv/
+
+# Documentation site (Jekyll)
+_site/
+.jekyll-cache/
+.bundle/
+vendor/

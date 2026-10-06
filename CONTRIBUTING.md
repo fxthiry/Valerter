@@ -97,6 +97,21 @@ cargo tarpaulin --timeout 120 --out xml --output-dir coverage --exclude-files 't
 
 The coverage target is 80%: new code should come with tests that keep the project at or above it.
 
+## Documentation Site
+
+The Markdown files of the repository are published at
+<https://fxthiry.github.io/Valerter/> by `.github/workflows/pages.yml`
+(Jekyll 4, `_config.yml`), on every push to `main`. Page content is never
+rendered with Liquid, so Jinja examples (`{{ rule_name }}`, `{% if %}`) are
+shown as written. To preview the site locally (no Ruby needed), run Docker
+from the repository root and open <http://localhost:4000/Valerter/>:
+
+```bash
+docker run --rm -p 4000:4000 --user "$(id -u):$(id -g)" -e HOME=/tmp -e BUNDLE_PATH=/tmp/bundle \
+  -v "$PWD":/site -w /site ruby:3.3 \
+  sh -c 'bundle install && bundle exec jekyll serve --host 0.0.0.0'
+```
+
 ## Naming Conventions
 
 Following [RFC 430](https://rust-lang.github.io/rfcs/0430-finalizing-naming-conventions.html):

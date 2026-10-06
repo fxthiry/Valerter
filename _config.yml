@@ -1,0 +1,150 @@
+# GitHub Pages site (https://fxthiry.github.io/Valerter/), built by
+# .github/workflows/pages.yml with Jekyll 4.
+#
+# Page content is never rendered with Liquid: the documentation is full of
+# Jinja examples ({{ rule_name }}, {% if %}) that must be shown as written.
+# Only the layouts of the theme use Liquid.
+
+title: Valerter
+description: Real-time log alerting for VictoriaLogs
+url: https://fxthiry.github.io
+baseurl: /Valerter
+
+theme: just-the-docs
+color_scheme: light
+search_enabled: true
+heading_anchors: true
+aux_links:
+  GitHub: https://github.com/fxthiry/valerter
+aux_links_new_tab: true
+
+plugins:
+  - jekyll-optional-front-matter   # Markdown files have no front matter
+  - jekyll-readme-index            # README.md files become index pages
+  - jekyll-titles-from-headings    # page titles from the first heading
+  - jekyll-relative-links          # links to .md files point to the .html pages
+
+optional_front_matter:
+  remove_originals: true
+readme_index:
+  enabled: true
+  remove_originals: true
+titles_from_headings:
+  enabled: true
+  strip_title: false
+  collections: false
+relative_links:
+  enabled: true
+  collections: false
+
+defaults:
+  # Every Markdown page of the repository (the theme's own files keep Liquid).
+  - scope:
+      path: "**/*.md"
+    values:
+      render_with_liquid: false
+      layout: default
+  - scope:
+      path: "README.md"
+    values:
+      title: Home
+      nav_order: 1
+  - scope:
+      path: "docs/getting-started.md"
+    values:
+      nav_order: 2
+  - scope:
+      path: "docs/configuration.md"
+    values:
+      nav_order: 3
+  - scope:
+      path: "docs/templates.md"
+    values:
+      nav_order: 4
+  - scope:
+      path: "docs/notifiers.md"
+    values:
+      nav_order: 5
+  - scope:
+      path: "docs/operations.md"
+    values:
+      nav_order: 6
+  - scope:
+      path: "docs/metrics.md"
+    values:
+      nav_order: 7
+  - scope:
+      path: "docs/performance.md"
+    values:
+      nav_order: 8
+  - scope:
+      path: "docs/architecture.md"
+    values:
+      nav_order: 9
+  - scope:
+      path: "templates/README.md"
+    values:
+      nav_order: 10
+  - scope:
+      path: "examples"
+    values:
+      nav_order: 11
+  - scope:
+      path: "examples/cisco-switches"
+    values:
+      parent: Examples
+  - scope:
+      path: "examples/multi-source"
+    values:
+      parent: Examples
+  - scope:
+      path: "MIGRATION.md"
+    values:
+      nav_order: 12
+  - scope:
+      path: "CHANGELOG.md"
+    values:
+      nav_order: 13
+  - scope:
+      path: "CONTRIBUTING.md"
+    values:
+      nav_order: 14
+
+# Rendered although jekyll-optional-front-matter skips these names by default.
+include:
+  - CONTRIBUTING.md
+  - CODE_OF_CONDUCT.md
+  - config/config.example.yaml
+
+# Everything that is not documentation stays out of the site.
+exclude:
+  - assets/README.md
+  - config/*           # local configurations: only config.example.yaml is published
+  - .cargo/
+  - .claude/
+  - .codecov.yml
+  - .direnv/
+  - .envrc
+  - .github/
+  - .gitignore
+  - .jekyll-cache/
+  - CLAUDE.md
+  - Cargo.lock
+  - Cargo.toml
+  - Gemfile
+  - Gemfile.lock
+  - debian/
+  - flake.lock
+  - flake.nix
+  - openspec/
+  - result
+  - rust-toolchain.toml
+  - scripts/
+  - src/
+  - systemd/
+  - tarpaulin-report.html
+  - tarpaulin-report.json
+  - target/
+  - tests/
+  - tools/
+  - vendor/
