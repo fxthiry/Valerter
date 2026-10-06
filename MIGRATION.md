@@ -4,6 +4,33 @@ This guide covers the breaking and operationally visible changes between release
 
 ## Upgrading to 2.1.0
 
+### Before you upgrade
+
+1. **Validate the production configuration with the new binary**, with the
+   environment variables of the notifiers defined (dummy values are fine), and
+   fix every reported error: validation is stricter (see
+   [Stricter configuration validation](#stricter-configuration-validation)).
+
+   ```bash
+   sudo MATTERMOST_WEBHOOK="https://mattermost.example.com/hooks/dummy" \
+     ./valerter --validate -c /etc/valerter/config.yaml
+   ```
+
+2. **Keep your configuration when dpkg asks.** `/etc/valerter/config.yaml` is a
+   conffile: dpkg asks what to do with your modified version. Answer `N` (keep
+   it), or upgrade non-interactively with `--force-confold`; answering `Y`
+   replaces it with the example configuration. See
+   [Upgrading the .deb package](docs/operations.md#upgrading-the-deb-package).
+3. **Expect the upgrade to block for up to ~20 s**: the restart now waits for
+   the queued alerts to be delivered (see
+   [Queued alerts are delivered on shutdown](#queued-alerts-are-delivered-on-shutdown)).
+   Containers need a 30 s stop timeout.
+4. **Review your PromQL** (see
+   [Prometheus metrics: label sets and counting](#prometheus-metrics-label-sets-and-counting)
+   and [One notification queue per destination](#one-notification-queue-per-destination)).
+
+The sections below detail every change visible to an operator.
+
 ### A configuration with all rules disabled is now refused
 
 Until 2.0.3, a configuration whose rules were all `enabled: false` passed validation; the daemon then started, found nothing to watch and exited with code 0. It is now a validation error, reported by `valerter --validate` and at startup (exit code 1):
@@ -82,8 +109,8 @@ valerter --validate -c /etc/valerter/config.yaml
 The test render of templates is also more accurate, in templates, `throttle.key`, `subject_template` and `body_template`:
 
 - **Accepted now:** conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency | float) > 1.5 }}`, `{{ count + 1 }}`) and a division between two plain identifiers (`{{ total/count }}`), wrongly refused until 2.0.3.
-- **Refused now:** an unknown filter, test or function placed after a built-in filter applied to a field (`{{ status | int }}-{{ host | truncat(10) }}`, `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch, in `{% if not x %}`, under `is not defined` or in a `{% for %}` body. The test render runs twice, once with every condition true and every loop over a field iterating one element, once with every condition false, every loop empty and `is defined` false. Such templates were accepted by early 2.1.0 builds and failed at runtime (a `throttle.key` falling back to `<rule>:error`, sends failing); fix the reported filter.
-- **Still not checked:** the part of a template after arithmetic on a raw field (`{{ count + 1 }}` stops the check of that pass; write `{{ count | int + 1 }}`, which also works at runtime since VictoriaLogs fields are strings) and the body of an `elif`. See [docs/configuration.md](docs/configuration.md#template-validation).
+- **Refused now:** an unknown filter, test or function placed after a built-in filter applied to a field (`{{ status | int }}-{{ host | truncat(10) }}`, `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch, in `{% if not x %}`, under `is not defined` or in a `{% for %}` body. The test render runs twice, once with every condition true and every loop over a field iterating one element, once with every condition false, every loop empty and `is defined` false. Such templates failed at runtime (a `throttle.key` falling back to `<rule>:error`, sends failing); fix the reported filter.
+- **Still not checked:** the part of a template after arithmetic on a raw field (`{{ count + 1 }}` stops the check of that pass; write `{{ count | int + 1 }}`, which also works at runtime since VictoriaLogs fields are strings) and the body of an `elif`. See [docs/templates.md](docs/templates.md#template-validation).
 
 ### Custom throttle keys are now shared across a rule's sources
 
@@ -211,12 +238,14 @@ With the shipped systemd unit, define the variable like your other notifier secr
   The resend costs one extra request per alert; the alert is counted once in the metrics, as sent or failed. A 4xx on the resend fails the alert. The notifier's own `channel` keeps its behavior: a 4xx fails the alert immediately.
 - **Rules without a Mattermost destination** still log `mattermost_channel ignored - no mattermost notifier in destinations` at startup; other notifier types ignore the key.
 
-### Log fields in notifier templates
+### New features (no action required)
 
-**No action required:** existing templates render exactly as before. 2.1.0 adds:
+Existing templates render as before. 2.1.0 adds:
 
+- **Markdown bodies.** With `body_format: markdown`, the `body` of a rule template is written once in Markdown and rendered for each notifier: Markdown for Mattermost, HTML for Telegram and email (no `email_body_html` needed), plain text for a webhook by default. Values of the log are escaped automatically. See [Markdown bodies](docs/templates.md#markdown-bodies-body_format).
+- **`format` per notifier**, to choose the rendering of a Markdown body (`plain`, `markdown` or `html` for a webhook, `telegram_html` or `plain` for Telegram). See [Output format per notifier](docs/notifiers.md#output-format-per-notifier).
 - **The `log` variable** in notifier templates (webhook, Telegram and email `body_template`, email `subject_template`): every field of the event, `{{ log.host }}`, `{{ log["k8s.pod"] }}` or `{{ log.k8s.pod }}`, `{{ log | tojson }}` for the whole event. Rule templates (`title`, `body`, `email_body_html`, `throttle.key`) are unchanged and keep reading fields at the top level (`{{ host }}`); an event field named `log` stays available there as `{{ log }}`.
-- **The `md_escape` and `mdv2_escape` filters**, to escape a value for Markdown (Mattermost) and Telegram MarkdownV2, next to `| e` for HTML. See [docs/configuration.md](docs/configuration.md#valerter-filters).
+- **Filters and functions:** `md_escape` and `mdv2_escape` (escape a value for Mattermost Markdown and Telegram MarkdownV2, next to `| e` for HTML), `code`, `codeblock` and `md_link` (build Markdown from values), and minijinja's `urlencode`. See [valerter filters and functions](docs/templates.md#valerter-filters-and-functions).
 - **A possible new warning at startup and in `--validate`:** `Notifier template references unknown variable notifier=<name> field=<body_template|subject_template> variable=<name>`. Such a variable already rendered empty; the warning points at it, usually a log field written `{{ host }}` instead of `{{ log.host }}`. Fix the template, or remove the variable, to silence it. The exit code is unchanged.
 
 **Telegram: move the markup from `body` to `body_template`.** Until now the documentation advised writing Telegram HTML tags in the rule template's `body`. With the default Telegram `body_template` (`<b>{{ title|e }}</b>\n{{ body|e }}`), `body` is escaped and those tags were shown literally; a custom `{{ body }}` without `|e` displayed them, but then a `<` or `&` from the log line broke the message. Write the markup in the Telegram `body_template` and escape each value there:
@@ -250,7 +279,31 @@ notifiers:
       Host: <code>{{ log.host|e }}</code>
 ```
 
-The other notifiers of the rule keep receiving the plain `body`. See [docs/notifiers.md](docs/notifiers.md#formatting-messages).
+The other notifiers of the rule keep receiving the plain `body`. See [docs/notifiers.md](docs/notifiers.md#formatting-messages). A [Markdown body](docs/templates.md#markdown-bodies-body_format) is the other option: written once, it reaches Telegram as HTML.
+
+### Other behavior changes
+
+No configuration change is needed for these, but they may change what you see:
+
+- **Webhook requests carry `Content-Type: application/json`** unless `headers` defines a `Content-Type`. Set one explicitly if your endpoint expects another type. A body that is not valid JSON while the `Content-Type` is JSON now logs the WARN `Webhook body is not valid JSON` (the request is still sent): insert values with `| tojson`.
+- **SMTP `5xx` replies are no longer retried** (`503`, `530`, `541`... were retried three times); `4xx` replies and network, TLS or timeout errors are retried. The decision depends on the reply code only.
+- **Fatal errors are logged once**, at ERROR, in the configured log format: the extra unstructured `Error: ...` line on stderr is gone. Update anything that parsed it.
+- **Text logs have no ANSI color codes** in journald or a file (colors only on a terminal).
+- **A task that panics is restarted after 5 s, doubled at each consecutive panic up to 5 min** (instead of every 5 s forever); it is never abandoned. Alert on `valerter_rule_panics_total`.
+- **Rules of `rules.d/` keep a stable order**: the rules of `config.yaml` in their declared order, then the `rules.d/` rules sorted by file path, then by rule name within a file. This shows in the logs and the `--validate` summary.
+- **Telegram:** a message rejected with `can't parse entities` in HTML mode is resent once as plain text instead of being lost (WARN `Telegram rejected HTML message, resending as plain text`), and the truncation to 4096 characters counts only the visible text and never cuts a tag or an entity. See [Telegram](docs/notifiers.md#message-length).
+- **Email:** the plain `body` inserted in an email body template (the message sent when a rule template fails to render) is now escaped as HTML.
+
+### Rolling back to 2.0.3
+
+There is no on-disk state: install the 2.0.3 package (or binary) again. Before that, undo the configuration changes 2.0.3 does not know, or it refuses to start:
+
+- `body_format` in a template and `format` in a notifier are unknown fields for 2.0.3 (configuration refused at load time);
+- the `md_escape`, `mdv2_escape`, `code`, `codeblock` filters, the `md_link` function and the `urlencode` filter are unknown to 2.0.3 (templates refused);
+- `log` renders empty in the notifier templates of 2.0.3, and a `${VAR}` in a webhook `body_template` is sent literally;
+- a rule's `mattermost_channel` is ignored again.
+
+Prometheus queries rewritten for 2.1.0 (`notifier_name`, `valerter_destination_queue_size`, `valerter_stream_ends_total`, `valerter_telegram_chat_errors_total`) find no series under 2.0.3.
 
 ## Upgrading from v1.x to v2.0.0
 
@@ -258,38 +311,40 @@ This section covers upgrading from Valerter **v1.x** to **v2.0.0**. Follow it se
 
 If you only need a one-line summary: **the `victorialogs` section is now a map of named sources, every per-rule Prometheus metric gained a `vl_source` label, and `valerter_victorialogs_up` was renamed.**
 
-## 1. Pre-Upgrade Checklist
+A typical single-source v1.x configuration needs two edits: move the `victorialogs` settings under a source named `default` (see [Config Migration](#2-config-migration)), and, when coming from a release before 1.2.0, rename the template field `body_html` to `email_body_html`. `valerter --validate` names every place to change. Then follow [Upgrading to 2.1.0](#upgrading-to-210), which applies on top.
+
+### 1. Pre-Upgrade Checklist
 
 Walk through this before you flip the binary. Each bullet is a concrete file or query you should touch.
 
-### Configuration
+#### Configuration
 
 - [ ] Open every `config.yaml`, `rules.d/*.yaml`, and `notifiers.d/*.yaml` you ship.
 - [ ] Find the top-level `victorialogs:` block. If it has a direct `url:` key, you must rewrite it (see Section 2).
 - [ ] Decide on your source name(s). Names must match `^[a-zA-Z0-9_]+$`. If you have only one backend today, pick `default`.
 - [ ] Decide if any rule should pin to a subset of sources via `vl_sources: [name, ...]`. By default, rules fan out across every configured source.
 
-### Prometheus Dashboards
+#### Prometheus Dashboards
 
 - [ ] Search every Grafana dashboard JSON for `valerter_victorialogs_up`. Every match must move to `valerter_vl_source_up` (see Section 3).
 - [ ] Search for PromQL queries that group by `rule_name` only (e.g. `sum by (rule_name) (valerter_alerts_sent_total)`). They keep working but now silently aggregate across sources. If that is not what you want, add `vl_source` to the `by` clause.
 - [ ] Verify panels on per-source overlays will not collapse if a rule fans out to multiple sources.
 
-### Prometheus Alerts
+#### Prometheus Alerts
 
 - [ ] Find every `alert:` rule that referenced `valerter_victorialogs_up{rule_name=...}`. Migrate the label key from `rule_name` to `vl_source` (see Section 3 for examples).
 - [ ] Re-evaluate cardinality. Per-rule alerts now multiply by the number of sources you tail.
 
-### Notifier Output
+#### Notifier Output
 
 - [ ] If you parse the Mattermost footer string downstream, expect a 4-segment `valerter | <rule> | <source> | <timestamp>` instead of the 3-segment v1.x format (see Section 4).
 - [ ] If you consume the default webhook payload, expect a new top-level `vl_source` field.
 
-## 2. Config Migration
+### 2. Config Migration
 
 The `victorialogs` section is now a **map of named sources**. The v1.x single-URL shape is rejected at load with an actionable error.
 
-### Before (v1.x)
+#### Before (v1.x)
 
 ```yaml
 victorialogs:
@@ -299,7 +354,7 @@ victorialogs:
     password: "p"
 ```
 
-### After (v2.0.0)
+#### After (v2.0.0)
 
 ```yaml
 victorialogs:
@@ -312,58 +367,64 @@ victorialogs:
 
 The minimum-effort migration is one new key (`default:`) and one extra indent level. Credentials, TLS, and headers move under each source, self-contained.
 
-### Targeting sources per rule
+#### Targeting sources per rule
 
 Add `vl_sources: [name, ...]` to a rule to restrict it to a subset of sources. Omit the field to fan out across every configured source:
 
 ```yaml
 rules:
   - name: "prod_only_alert"
-    query: '...'
+    query: '_stream:{app="api"} level:error'
     vl_sources: [prod]      # only the `prod` source
-    notify: { template: "...", destinations: ["..."] }
+    parser: {}
+    notify: { template: "default_alert", destinations: ["mattermost-ops"] }
 
   - name: "all_envs_alert"
-    query: '...'
+    query: '_stream:{app="auth"} "login failed"'
     # no vl_sources → fans out across every source
-    notify: { template: "...", destinations: ["..."] }
+    parser: {}
+    notify: { template: "default_alert", destinations: ["mattermost-ops"] }
 ```
 
 See [`examples/multi-source/`](examples/multi-source/) for a complete reference with prod + staging.
 
-### Source name format
+#### Source name format
 
 Source names must match `^[a-zA-Z0-9_]+$`. No dashes, dots, colons, or spaces. The constraint avoids ambiguity in the default throttle key format below. Validation runs at load time.
 
-### Default throttle key change
+#### Default throttle key change
 
 The default throttle key changed from the literal string `<rule_name>:global` (v1.x) to `<rule_name>-<vl_source>:global` (v2.0.0). These angle-bracket placeholders are descriptive notation, not template syntax. Multi-source deployments get isolated throttle buckets per source automatically. If you want **cross-source dedup** (one bucket shared across sources for the same rule), set `throttle.key` explicitly:
 
 ```yaml
 rules:
   - name: "shared_bucket_alert"
+    query: '_stream:{app="api"} level:error'
+    parser: {}
     throttle:
       key: "{{ rule_name }}"   # back to v1.x semantics
-    # ...
+      count: 5
+      window: 60s
+    notify: { template: "default_alert", destinations: ["mattermost-ops"] }
 ```
 
 Cross-source dedup with a custom key is effective since 2.1.0; in 2.0.x each source still counted separately. See [Custom throttle keys are now shared across a rule's sources](#custom-throttle-keys-are-now-shared-across-a-rules-sources).
 
-### `defaults.max_streams` cap
+#### `defaults.max_streams` cap
 
 A new cap on total `(rule, source)` pairs spawned, default `50`. Disabled rules do not contribute. Breaching the cap fails the config at load with both the actual count and the cap value. Tune via `defaults.max_streams: <usize>` if you fan out many rules across many sources.
 
-## 3. Prometheus Migration
+### 3. Prometheus Migration
 
-### Removed: `valerter_victorialogs_up{rule_name}`
+#### Removed: `valerter_victorialogs_up{rule_name}`
 
 This per-rule gauge was replaced by a per-source gauge. Reachability is a property of the **source**, not the rule (every rule that tails the same backend reports the same up/down state).
 
-### Added: `valerter_vl_source_up{vl_source}`
+#### Added: `valerter_vl_source_up{vl_source}`
 
-One value per configured source, regardless of how many rules tail it. Initialized to 0 at startup; flipped to 1 on tail connect success and back to 0 on permanent failure or stream error. The label key is `vl_source` (not `rule_name`), and the cardinality drops from `|rules|` to `|sources|`.
+One value per source, regardless of how many rules tail it: 1 once a tail connection succeeds, 0 after 3 consecutive connection failures of a task. Since 2.1.0, only sources targeted by an enabled rule have the gauge. The label key is `vl_source` (not `rule_name`), and the cardinality drops from `|rules|` to `|sources|`.
 
-#### PromQL migration examples
+##### PromQL migration examples
 
 ```promql
 # v1.x (per-rule):     valerter_victorialogs_up{rule_name="nginx-5xx"} == 0
@@ -373,15 +434,15 @@ One value per configured source, regardless of how many rules tail it. Initializ
 # v2.0.0 (any source):  min(valerter_vl_source_up) == 0
 ```
 
-### `vl_source` label added to every per-rule metric
+#### `vl_source` label added to every per-rule metric
 
 Affected counters: `valerter_alerts_sent_total`, `valerter_alerts_throttled_total`, `valerter_alerts_passed_total`, `valerter_alerts_failed_total`, `valerter_email_recipient_errors_total`, `valerter_lines_discarded_total`, `valerter_logs_matched_total`, `valerter_notify_errors_total`, `valerter_parse_errors_total`, `valerter_reconnections_total`, `valerter_rule_panics_total`, `valerter_rule_errors_total`.
 
 Affected gauge / histogram: `valerter_last_query_timestamp`, `valerter_query_duration_seconds`.
 
-Dashboards and alerts that grouped by `rule_name` alone keep working but now get an extra `vl_source` dimension. PromQL using `sum by (rule_name) (...)` still rolls up correctly across sources. `valerter_queue_size` stays unlabeled (the queue is shared, not per-source).
+Dashboards and alerts that grouped by `rule_name` alone keep working but now get an extra `vl_source` dimension. PromQL using `sum by (rule_name) (...)` still rolls up correctly across sources. `valerter_queue_size` stays unlabeled (since 2.1.0 it sums the queues of every destination; per-destination values are in `valerter_destination_queue_size`).
 
-### Per-rule alert example
+#### Per-rule alert example
 
 ```yaml
 # v1.x
@@ -397,9 +458,9 @@ Dashboards and alerts that grouped by `rule_name` alone keep working but now get
     summary: "Source {{ $labels.vl_source }} unreachable"
 ```
 
-## 4. Notifier Output Changes
+### 4. Notifier Output Changes
 
-### Mattermost footer
+#### Mattermost footer
 
 The footer now carries 4 segments instead of 3:
 
@@ -410,7 +471,7 @@ v2.0.0: valerter | <rule> | <source> | <timestamp>
 
 If you parse the footer string downstream, update the split logic.
 
-### Default webhook payload
+#### Default webhook payload
 
 The default webhook payload (used when `body_template` is omitted) gained a top-level `vl_source` field:
 
@@ -427,17 +488,17 @@ The default webhook payload (used when `body_template` is omitted) gained a top-
 }
 ```
 
-### Templates
+#### Templates
 
-The `{{ vl_source }}` template variable is available everywhere `{{ rule_name }}` is: layer 1 templates (`title`, `body`, `email_body_html`), `throttle.key`, and notifier-level layer 2 contexts (`subject_template`, `body_template`). Always non-empty, equal to the source name currently processing the event.
+The `{{ vl_source }}` template variable is available everywhere `{{ rule_name }}` is: rule templates (`title`, `body`, `email_body_html`), `throttle.key`, and notifier templates (`subject_template`, `body_template`). Always non-empty, equal to the source name currently processing the event.
 
 If an event field is literally named `vl_source`, the synthetic value wins (matches the `rule_name` collision policy).
 
-## 5. Rollback
+### 5. Rollback
 
 If something goes wrong after the upgrade, you can roll back to **v1.2.1** with no state migration required. The Prometheus metric labels are additive at the storage layer, except for the removed `valerter_victorialogs_up` gauge (which simply stops being produced when v2.0.0 runs).
 
-### Debian / Ubuntu
+#### Debian / Ubuntu
 
 ```bash
 # Pin v1.2.1
@@ -446,7 +507,7 @@ sudo dpkg -i valerter_1.2.1_amd64.deb
 sudo systemctl restart valerter
 ```
 
-### Static binary
+#### Static binary
 
 ```bash
 curl -LO https://github.com/fxthiry/valerter/releases/download/v1.2.1/valerter-linux-x86_64.tar.gz
@@ -456,7 +517,7 @@ tar -xzf valerter-linux-x86_64.tar.gz
 
 You will need to revert the v2.0.0 config rewrite (the v1.x binary will reject the map shape). Keep a `config.yaml.v1` backup before you upgrade.
 
-### Notes
+#### Notes
 
 - No on-disk state to migrate: throttle buckets are in-memory only.
 - Prometheus historical data with the new `vl_source` label remains valid (the label simply becomes empty for older samples in TSDB).
@@ -464,7 +525,8 @@ You will need to revert the v2.0.0 config rewrite (the v1.x binary will reject t
 
 ## See Also
 
-- [`CHANGELOG.md`](CHANGELOG.md) : full v2.0.0 release notes
+- [`CHANGELOG.md`](CHANGELOG.md) : full release notes
 - [`examples/multi-source/`](examples/multi-source/) : complete working multi-source reference
 - [`docs/configuration.md`](docs/configuration.md) : full configuration reference
+- [`docs/operations.md`](docs/operations.md) : service, upgrades, shutdown
 - [`docs/metrics.md`](docs/metrics.md) : Prometheus metric catalog
