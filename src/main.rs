@@ -1,4 +1,4 @@
-//! Valerter - Real-time alerting from VictoriaLogs to Mattermost.
+//! Valerter - Real-time alerting from VictoriaLogs to Mattermost, Telegram, email or webhooks.
 
 use std::io::IsTerminal;
 use std::sync::Arc;

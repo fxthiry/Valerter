@@ -1,6 +1,6 @@
 # Multi-Source VictoriaLogs Example
 
-Demonstrates the v2.0.0 multi-source feature: a single Valerter instance tails two VictoriaLogs backends (`prod` and `staging`) and routes alerts per source.
+A single Valerter instance tails two VictoriaLogs backends (`prod` and `staging`) and routes alerts per source.
 
 ## Routing Matrix
 
@@ -42,4 +42,4 @@ valerter -c examples/multi-source/config.yaml
 
 ## Observability
 
-The new `valerter_vl_source_up{vl_source}` gauge reports per-source reachability (initialized to 0, flipped to 1 on tail connect success). All per-rule metrics now also carry a `vl_source` label so dashboards can group or filter by source. See [`MIGRATION.md`](../../MIGRATION.md) for the full Prometheus migration guide.
+The `valerter_vl_source_up{vl_source}` gauge reports per-source reachability. It exists only for the sources targeted by at least one enabled rule: it starts at 0, goes to 1 on the first successful tail connection, and goes back to 0 only after 3 consecutive connection failures, so a single transient error does not flip it. All per-rule metrics carry a `vl_source` label so dashboards can group or filter by source. See [docs/metrics.md](../../docs/metrics.md) for the metrics reference, and [`MIGRATION.md`](../../MIGRATION.md) to migrate v1.x dashboards and alerts.

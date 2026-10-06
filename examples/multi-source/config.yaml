@@ -1,9 +1,8 @@
 # Valerter Configuration - Multi-Source VictoriaLogs Example
 # ===========================================================
 #
-# Demonstrates the v2.0.0 multi-source feature: a single valerter instance
-# tails two VictoriaLogs backends (`prod` and `staging`) and routes alerts
-# per source.
+# A single valerter instance tails two VictoriaLogs backends (`prod` and
+# `staging`) and routes alerts per source.
 #
 # Three rules cover the routing matrix:
 #   1. `prod_critical_errors` — pinned to `prod` only.
@@ -11,7 +10,7 @@
 #   3. `auth_failures_all_envs` — fan-out across both sources (no `vl_sources`).
 #
 # Each `(rule, source)` pair runs as an isolated task. A flapping `staging`
-# source does not stop alerts on `prod`. Default throttle keys are now
+# source does not stop alerts on `prod`. The default throttle key is
 # `{rule}-{source}:global`, so per-source buckets are isolated automatically.
 #
 # Source names must match `^[a-zA-Z0-9_]+$` (no dashes, dots, or colons).

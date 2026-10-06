@@ -2,6 +2,7 @@
 name = "valerter"
 version = "2.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"
 
@@ -73,7 +74,8 @@ copyright = "2026, François-Xavier THIRY"
 license-file = ["LICENSE", "0"]
 extended-description = """
 Real-time alerting daemon that monitors VictoriaLogs streams
-and sends notifications to Mattermost, Email, or any webhook endpoint.
+and sends notifications to Mattermost, Telegram, email (SMTP) or any
+webhook endpoint.
 Features: regex/JSON parsing, throttling, templating, multi-destination routing."""
 depends = ""
 section = "admin"
