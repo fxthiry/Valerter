@@ -11,13 +11,38 @@
 //! - **minijinja**: Template rendering for dynamic throttle keys
 //! - **Atomic counters**: Lock-free counting within cache entries
 //!
+//! # Scope
+//!
+//! State is split in two:
+//! - [`ThrottleStore`]: one per rule, shared by every `(rule, source)` task of
+//!   that rule. Two sources rendering the same key increment the same counter,
+//!   so `throttle.key: "{{ rule_name }}"` dedups across sources. The default
+//!   key `<rule>-<source>:global` embeds the source name, which keeps
+//!   per-source isolation without any configuration.
+//! - [`Throttler`]: one per task, a view on the rule's store that carries the
+//!   task's `vl_source` (render context, default key, metric labels).
+//!
+//! # Window
+//!
+//! The window is fixed, not sliding: a key's counter is created by its first
+//! event and expires `window` later (moka `time_to_live`), whatever happened
+//! in between.
+//!
+//! # Reset on reconnection
+//!
+//! [`Throttler::reset`] only drops the counters fed exclusively by the task's
+//! own source. Counters another source has contributed to are kept, so one
+//! source reconnecting does not wipe the dedup state of the others.
+//!
 //! # Example
 //!
 //! ```ignore
-//! use valerter::throttle::{Throttler, ThrottleResult};
+//! use std::sync::Arc;
+//! use valerter::throttle::{ThrottleResult, ThrottleStore, Throttler};
 //! use serde_json::json;
 //!
-//! let throttler = Throttler::new(Some(&config), "my_rule");
+//! let store = Arc::new(ThrottleStore::new(config.window, 10_000));
+//! let throttler = Throttler::with_store(store, Some(&config), "my_rule", "vlprod");
 //! let fields = json!({"host": "SW-01", "port": "Gi0/1"});
 //!
 //! match throttler.check(&fields) {
@@ -31,11 +56,15 @@ use minijinja::Environment;
 use moka::sync::Cache;
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-/// Default maximum capacity for throttle cache to prevent OOM (FR25).
-const DEFAULT_MAX_CAPACITY: u64 = 10_000;
+/// Maximum number of throttle keys per source of a rule, to prevent OOM
+/// (FR25). A rule's store holds `DEFAULT_MAX_CAPACITY * source_count` keys.
+pub(crate) const DEFAULT_MAX_CAPACITY: u64 = 10_000;
+
+/// Window used by a pass-through throttler (no throttle config).
+const PASS_THROUGH_WINDOW: Duration = Duration::from_secs(60);
 
 /// Result of throttle check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,34 +75,88 @@ pub enum ThrottleResult {
     Throttled,
 }
 
-/// Throttler for a single rule, using moka LRU cache with TTL.
+/// One throttle key's state within its current window.
+#[derive(Debug)]
+pub struct ThrottleEntry {
+    /// Alerts seen for this key in the current window.
+    count: AtomicU32,
+    /// Source whose event created the entry.
+    owner: Arc<str>,
+    /// Set once a source other than `owner` has hit the entry. A shared entry
+    /// survives the owner's reconnection reset.
+    shared: AtomicBool,
+}
+
+impl ThrottleEntry {
+    fn new(owner: Arc<str>) -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            owner,
+            shared: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Throttle state of one rule, shared by all its `(rule, source)` tasks.
 ///
 /// Moka handles expiration automatically - when an entry's TTL expires,
 /// it's evicted and the next alert for that key starts fresh.
+pub struct ThrottleStore {
+    /// Cache: rendered key -> entry for the current window.
+    cache: Cache<String, Arc<ThrottleEntry>>,
+}
+
+impl ThrottleStore {
+    /// Create a store whose entries live `window` after their first event,
+    /// holding at most `max_capacity` keys (AD-25 / FR25).
+    pub fn new(window: Duration, max_capacity: u64) -> Self {
+        let cache = Cache::builder()
+            .time_to_live(window)
+            .max_capacity(max_capacity)
+            .support_invalidation_closures()
+            .build();
+        Self { cache }
+    }
+
+    /// Maximum number of keys the store holds (tests only).
+    #[cfg(test)]
+    pub(crate) fn max_capacity(&self) -> Option<u64> {
+        self.cache.policy().max_capacity()
+    }
+}
+
+impl std::fmt::Debug for ThrottleStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThrottleStore")
+            .field("entry_count", &self.cache.entry_count())
+            .finish()
+    }
+}
+
+/// Per-task view on a rule's [`ThrottleStore`].
 ///
 /// # Thread Safety
 ///
 /// The throttler is thread-safe and can be shared across async tasks.
-/// It uses `Arc<AtomicU32>` for lock-free counter increments.
+/// Counters are atomics inside the cache entries, so increments are lock-free.
 pub struct Throttler {
-    /// Cache: key -> current count in window.
-    /// Using Arc<AtomicU32> for thread-safe increment with proper sharing.
-    cache: Cache<String, Arc<AtomicU32>>,
+    /// Throttle state of the rule, shared with the rule's other sources.
+    store: Arc<ThrottleStore>,
     /// Jinja template for generating throttle key.
     key_template: Option<String>,
     /// Maximum alerts per window.
     max_count: u32,
     /// Rule name for logging and metrics (Arc to avoid cloning).
     rule_name: Arc<str>,
-    /// VL source name bound to this throttler (per-task). Threaded into every
-    /// rendered key so the `(rule, source)` bucket is isolated by default.
+    /// VL source name bound to this throttler (per-task). Part of the default
+    /// key, owner of the entries this task creates, and metric label.
     vl_source: Arc<str>,
     /// Pre-created Jinja environment for template rendering (H1 fix).
     jinja_env: Environment<'static>,
 }
 
 impl Throttler {
-    /// Create a new Throttler from compiled config.
+    /// Create a Throttler backed by a private store.
     ///
     /// # Arguments
     ///
@@ -86,7 +169,7 @@ impl Throttler {
         Self::with_capacity(config, rule_name, vl_source, DEFAULT_MAX_CAPACITY)
     }
 
-    /// Create a new Throttler with custom max capacity (for testing).
+    /// Create a Throttler backed by a private store of custom capacity (for testing).
     ///
     /// # Arguments
     ///
@@ -100,12 +183,35 @@ impl Throttler {
         vl_source: &str,
         max_capacity: u64,
     ) -> Self {
-        let (key_template, max_count, window) = match config {
-            Some(t) => (t.key_template.clone(), t.count, t.window),
-            None => (None, u32::MAX, Duration::from_secs(60)),
+        let window = config.map_or(PASS_THROUGH_WINDOW, |t| t.window);
+        let store = Arc::new(ThrottleStore::new(window, max_capacity));
+        Self::with_store(store, config, rule_name, vl_source)
+    }
+
+    /// Create a Throttler for one `(rule, source)` task on the rule's shared store.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Throttle state of the rule, shared by all its sources. Its
+    ///   window must match `config.window`.
+    /// * `config` - Optional throttle configuration. If None, creates a pass-through throttler.
+    /// * `rule_name` - Name of the rule for logging and metrics.
+    /// * `vl_source` - VL source name bound to this task.
+    pub fn with_store(
+        store: Arc<ThrottleStore>,
+        config: Option<&CompiledThrottle>,
+        rule_name: &str,
+        vl_source: &str,
+    ) -> Self {
+        let (key_template, max_count) = match config {
+            Some(t) => (t.key_template.clone(), t.count),
+            None => (None, u32::MAX),
         };
 
-        // M1: Validate configuration - log warning for edge cases
+        // M1: `Config::validate()` rejects `count == 0` and a zero `window`, for
+        // rule throttles and `defaults.throttle` alike, so these warnings are
+        // unreachable from a loaded configuration. They stay as a guard for
+        // programmatic callers that build a `CompiledThrottle` directly.
         if let Some(t) = config {
             if t.count == 0 {
                 tracing::warn!(
@@ -123,17 +229,12 @@ impl Throttler {
             }
         }
 
-        // Configure moka cache with TTL and max capacity (AD-25 / FR25)
-        let cache = Cache::builder()
-            .time_to_live(window)
-            .max_capacity(max_capacity)
-            .build();
-
         // H1 fix: Pre-create Jinja environment once
-        let jinja_env = Environment::new();
+        let mut jinja_env = Environment::new();
+        crate::template::filters::register(&mut jinja_env);
 
         Self {
-            cache,
+            store,
             key_template,
             max_count,
             rule_name: Arc::from(rule_name),
@@ -155,11 +256,16 @@ impl Throttler {
         let key = self.render_key(fields);
         tracing::trace!(throttle_key = %key, "Checking throttle");
 
-        // Get or create entry in cache
-        let entry = self
-            .cache
-            .get_with(key.clone(), || Arc::new(AtomicU32::new(0)));
-        let count = entry.fetch_add(1, Ordering::SeqCst) + 1;
+        // Get or create entry in the rule's cache. `get_with` serializes
+        // concurrent initialization of a key, so two sources never create two
+        // counters for the same key.
+        let entry = self.store.cache.get_with(key.clone(), || {
+            Arc::new(ThrottleEntry::new(Arc::clone(&self.vl_source)))
+        });
+        if entry.owner != self.vl_source && !entry.shared.load(Ordering::Relaxed) {
+            entry.shared.store(true, Ordering::Relaxed);
+        }
+        let count = entry.count.fetch_add(1, Ordering::SeqCst) + 1;
         tracing::trace!(
             count = count,
             max_count = self.max_count,
@@ -193,8 +299,8 @@ impl Throttler {
                 "Alert throttled"
             );
 
-            // Increment metric (FR23, FR24); gains `vl_source` to disambiguate
-            // throttle hot-spots per source.
+            // Increment metric (FR23, FR24); labelled with the source whose
+            // event was blocked, even when the counter is shared.
             metrics::counter!(
                 "valerter_alerts_throttled_total",
                 "rule_name" => rule_name_str,
@@ -247,14 +353,43 @@ impl Throttler {
         }
     }
 
-    /// Reset all throttle entries for this rule.
+    /// Reset the throttle entries fed only by this task's source.
     ///
     /// Called after VictoriaLogs reconnection (FR7) to clear stale state.
+    /// Entries another source of the rule has contributed to are kept, so the
+    /// reconnection of one source does not drop the others' dedup state.
     pub fn reset(&self) {
-        let entry_count = self.cache.entry_count();
-        self.cache.invalidate_all();
-        tracing::debug!(rule_name = %self.rule_name, entries_cleared = entry_count, "Throttle cache reset");
+        let vl_source = Arc::clone(&self.vl_source);
+        let result = self.store.cache.invalidate_entries_if(move |_, entry| {
+            entry.owner == vl_source && !entry.shared.load(Ordering::Relaxed)
+        });
+        if let Err(e) = result {
+            // Unreachable: every store enables invalidation closures.
+            tracing::warn!(
+                rule_name = %self.rule_name,
+                vl_source = %self.vl_source,
+                error = %e,
+                "Failed to reset throttle cache"
+            );
+            return;
+        }
+        tracing::debug!(
+            rule_name = %self.rule_name,
+            vl_source = %self.vl_source,
+            "Throttle cache reset"
+        );
     }
+}
+
+/// Whether a `throttle.key` template references the `vl_source` variable.
+///
+/// Static analysis of the template's undeclared variables, no render: a
+/// literal string containing `vl_source` does not count, `{{ vl_source | upper }}`
+/// does. Returns `None` when the template does not compile.
+pub fn key_references_vl_source(key_template: &str) -> Option<bool> {
+    let env = Environment::new();
+    let template = env.template_from_str(key_template).ok()?;
+    Some(template.undeclared_variables(false).contains("vl_source"))
 }
 
 /// Unflatten dotted event keys (issue #25) then inject the synthetic
@@ -287,7 +422,7 @@ impl std::fmt::Debug for Throttler {
             .field("key_template", &self.key_template)
             .field("max_count", &self.max_count)
             .field("rule_name", &self.rule_name)
-            .field("cache_entry_count", &self.cache.entry_count())
+            .field("cache_entry_count", &self.store.cache.entry_count())
             .finish()
     }
 }
@@ -318,6 +453,16 @@ mod tests {
         let key = throttler.render_key(&fields);
 
         assert_eq!(key, "SW-01");
+    }
+
+    #[test]
+    fn render_key_applies_valerter_filters() {
+        let config = make_config(Some("{{ host | md_escape }}"), 3, 60);
+        let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
+
+        let key = throttler.render_key(&json!({"host": "web_01"}));
+
+        assert_eq!(key, r"web\_01");
     }
 
     // ===================================================================
@@ -429,7 +574,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Sync moka's internal state (run_pending_tasks is needed for sync cache)
-        throttler.cache.run_pending_tasks();
+        throttler.store.cache.run_pending_tasks();
 
         // After TTL, entry should be evicted and counter reset
         assert_eq!(throttler.check(&fields), ThrottleResult::Pass);
@@ -455,7 +600,7 @@ mod tests {
         }
 
         // Sync moka's internal state
-        throttler.cache.run_pending_tasks();
+        throttler.store.cache.run_pending_tasks();
 
         // Now add more keys - this should trigger eviction of old keys
         for i in 5..10 {
@@ -464,10 +609,10 @@ mod tests {
         }
 
         // Sync again
-        throttler.cache.run_pending_tasks();
+        throttler.store.cache.run_pending_tasks();
 
         // Cache size should be bounded (may be slightly over due to async eviction)
-        let entry_count = throttler.cache.entry_count();
+        let entry_count = throttler.store.cache.entry_count();
         assert!(
             entry_count <= 10,
             "Cache should be bounded, got {} entries",
@@ -704,14 +849,185 @@ mod tests {
 
     #[test]
     fn template_error_uses_fallback_key() {
-        // Invalid template syntax that minijinja can't render
-        let config = make_config(Some("{{ nonexistent_filter | bad_filter }}"), 3, 60);
+        // Unknown filters are rejected at load time; only errors that depend
+        // on the event's values reach the fallback, e.g. arithmetic on a
+        // string field.
+        let config = make_config(Some("{{ port + 1 }}"), 3, 60);
         let throttler = Throttler::new(Some(&config), "test_rule", "vlprod");
 
-        let fields = json!({"host": "SW-01"});
+        let fields = json!({"host": "SW-01", "port": "Gi0/1"});
         let key = throttler.render_key(&fields);
 
         // Should use error fallback
         assert_eq!(key, "test_rule:error");
+    }
+
+    // ===================================================================
+    // Per-rule store shared by the rule's (rule, source) tasks
+    // ===================================================================
+
+    /// Two task views on one rule store, as the engine builds them.
+    fn shared_pair(config: &CompiledThrottle) -> (Throttler, Throttler) {
+        let store = Arc::new(ThrottleStore::new(config.window, DEFAULT_MAX_CAPACITY * 2));
+        let prod = Throttler::with_store(Arc::clone(&store), Some(config), "VM_OFF", "vlprod");
+        let dev = Throttler::with_store(store, Some(config), "VM_OFF", "vldev");
+        (prod, dev)
+    }
+
+    #[test]
+    fn shared_store_rule_name_key_dedups_across_sources() {
+        let config = make_config(Some("{{ rule_name }}"), 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let fields = json!({"host": "SW-01"});
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Throttled);
+    }
+
+    #[test]
+    fn shared_store_default_key_isolates_sources() {
+        let config = make_config(None, 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let fields = json!({"host": "SW-01"});
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Pass);
+        assert_eq!(prod.check(&fields), ThrottleResult::Throttled);
+        assert_eq!(dev.check(&fields), ThrottleResult::Throttled);
+    }
+
+    #[test]
+    fn shared_store_custom_key_without_vl_source_is_shared() {
+        let config = make_config(Some("{{ host }}"), 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let fields = json!({"host": "SW-01"});
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Throttled);
+    }
+
+    #[test]
+    fn shared_store_custom_key_with_vl_source_is_isolated() {
+        let config = make_config(Some("{{ vl_source }}-{{ host }}"), 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let fields = json!({"host": "SW-01"});
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Pass);
+    }
+
+    #[test]
+    fn distinct_rule_stores_never_share_counters() {
+        let config = make_config(Some("{{ host }}"), 1, 60);
+        let r1 = Throttler::new(Some(&config), "r1", "vlprod");
+        let r2 = Throttler::new(Some(&config), "r2", "vlprod");
+
+        let fields = json!({"host": "SW-01"});
+        assert_eq!(r1.check(&fields), ThrottleResult::Pass);
+        assert_eq!(r2.check(&fields), ThrottleResult::Pass);
+    }
+
+    #[test]
+    fn reset_drops_only_keys_fed_exclusively_by_the_source() {
+        let config = make_config(Some("{{ host }}"), 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let prod_only = json!({"host": "prod-only"});
+        let dev_only = json!({"host": "dev-only"});
+        let both = json!({"host": "both"});
+
+        assert_eq!(prod.check(&prod_only), ThrottleResult::Pass);
+        assert_eq!(dev.check(&dev_only), ThrottleResult::Pass);
+        assert_eq!(prod.check(&both), ThrottleResult::Pass);
+        assert_eq!(dev.check(&both), ThrottleResult::Throttled);
+
+        prod.reset();
+
+        // Fed by vlprod only: dropped, so the next event passes.
+        assert_eq!(prod.check(&prod_only), ThrottleResult::Pass);
+        // Opened by vldev: kept, so vlprod is still blocked.
+        assert_eq!(prod.check(&dev_only), ThrottleResult::Throttled);
+        // Fed by both sources: kept.
+        assert_eq!(prod.check(&both), ThrottleResult::Throttled);
+        assert_eq!(dev.check(&both), ThrottleResult::Throttled);
+    }
+
+    #[test]
+    fn reset_with_default_key_keeps_other_sources_buckets() {
+        let config = make_config(None, 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let fields = json!({});
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Pass);
+
+        prod.reset();
+
+        // `VM_OFF-vlprod:global` dropped, `VM_OFF-vldev:global` kept.
+        assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+        assert_eq!(dev.check(&fields), ThrottleResult::Throttled);
+    }
+
+    #[test]
+    fn throttled_metric_carries_the_blocked_source() {
+        let config = make_config(Some("{{ rule_name }}"), 1, 60);
+        let (prod, dev) = shared_pair(&config);
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let fields = json!({});
+            assert_eq!(prod.check(&fields), ThrottleResult::Pass);
+            assert_eq!(dev.check(&fields), ThrottleResult::Throttled);
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "valerter_alerts_throttled_total{rule_name=\"VM_OFF\",vl_source=\"vldev\"} 1"
+            ),
+            "missing throttled series for vldev in:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(
+                "valerter_alerts_throttled_total{rule_name=\"VM_OFF\",vl_source=\"vlprod\"}"
+            ),
+            "unexpected throttled series for vlprod in:\n{rendered}"
+        );
+    }
+
+    // ===================================================================
+    // Static detection of `vl_source` in a throttle key
+    // ===================================================================
+
+    #[test]
+    fn key_references_vl_source_detects_variable_references() {
+        assert_eq!(key_references_vl_source("{{ rule_name }}"), Some(false));
+        assert_eq!(key_references_vl_source("{{ host }}"), Some(false));
+        assert_eq!(
+            key_references_vl_source("{{ vl_source }}-{{ host }}"),
+            Some(true)
+        );
+        assert_eq!(
+            key_references_vl_source("{{ vl_source | upper }}"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn key_references_vl_source_ignores_literal_text() {
+        assert_eq!(
+            key_references_vl_source("vl_source-{{ host }}"),
+            Some(false)
+        );
+        assert_eq!(
+            key_references_vl_source("{{ \"vl_source\" }}-{{ host }}"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn key_references_vl_source_returns_none_on_invalid_template() {
+        assert_eq!(key_references_vl_source("{{ host "), None);
     }
 }

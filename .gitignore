@@ -21,11 +21,9 @@ config/minimal/
 # Coverage reports
 tarpaulin-report.*
 
-# BMAD - excluded from public repo
-_bmad/
-_bmad-output/
-
 # Claude Code settings
 .claude/
-.agent/
 CLAUDE.md
+
+# direnv cache (use flake)
+.direnv/

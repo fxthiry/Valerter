@@ -2,7 +2,10 @@
 
 use super::notifiers::{NotifiersConfig, default_true};
 use super::secret::SecretString;
-use super::validation::{validate_hex_color, validate_jinja_template, validate_url};
+use super::validation::{
+    validate_hex_color, validate_jinja_template, validate_markdown_template_render,
+    validate_resolved_url, validate_template_render, validate_url,
+};
 use crate::error::ConfigError;
 use regex::Regex;
 use serde::Deserialize;
@@ -114,6 +117,25 @@ where
 /// avoids collisions when rule and source names share the `-` separator.
 fn is_valid_source_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validates the custom headers of a VictoriaLogs source, by sorted name for a
+/// stable error order. Values are checked after `${VAR}` resolution and are
+/// never echoed (they usually carry tokens); names are not secret.
+fn validate_source_headers(headers: &HashMap<String, SecretString>) -> Vec<String> {
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    let mut sorted: Vec<_> = headers.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut errors = Vec::new();
+    for (name, value) in sorted {
+        if HeaderName::from_bytes(name.as_bytes()).is_err() {
+            errors.push(format!("invalid header name '{name}'"));
+        } else if HeaderValue::from_str(value.expose()).is_err() {
+            errors.push(format!("invalid value for header '{name}'"));
+        }
+    }
+    errors
 }
 
 /// Basic Auth configuration for VictoriaLogs connection.
@@ -233,6 +255,91 @@ pub struct ThrottleConfig {
     pub window: Duration,
 }
 
+/// Source format of a template's `body`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyFormat {
+    /// The body is sent as rendered, without any escaping.
+    #[default]
+    Text,
+    /// The body is Markdown: inserted values are Markdown-escaped, and the
+    /// result is rendered in each notifier's [`OutputFormat`].
+    Markdown,
+}
+
+/// Format in which a notifier receives the body of a Markdown alert
+/// (`format` key of a notifier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// Text without any markup.
+    Plain,
+    /// Markdown escaped for Mattermost's engine.
+    Markdown,
+    /// HTML (email).
+    Html,
+    /// The HTML subset of the Telegram Bot API (`parse_mode: HTML`).
+    TelegramHtml,
+}
+
+impl OutputFormat {
+    /// Every format, in the order of their render cache slots.
+    pub const ALL: [OutputFormat; 4] = [
+        OutputFormat::Plain,
+        OutputFormat::Markdown,
+        OutputFormat::Html,
+        OutputFormat::TelegramHtml,
+    ];
+
+    /// The name used in the configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Plain => "plain",
+            OutputFormat::Markdown => "markdown",
+            OutputFormat::Html => "html",
+            OutputFormat::TelegramHtml => "telegram_html",
+        }
+    }
+
+    /// Whether a rendered body in this format is already escaped for an HTML
+    /// notifier template (`| e` leaves it intact).
+    pub fn is_safe(self) -> bool {
+        matches!(self, OutputFormat::Html | OutputFormat::TelegramHtml)
+    }
+
+    /// Resolves the `format` key of a notifier: `configured`, or `default`
+    /// when absent; a format outside `accepted` is refused with
+    /// `invalid notifier '<name>': format '<f>' is not supported for <kind>
+    /// notifiers (expected <list>)`.
+    pub fn resolve(
+        configured: Option<OutputFormat>,
+        default: OutputFormat,
+        accepted: &[OutputFormat],
+        notifier: &str,
+        kind: &str,
+    ) -> Result<OutputFormat, ConfigError> {
+        let format = configured.unwrap_or(default);
+        if accepted.contains(&format) {
+            return Ok(format);
+        }
+        let expected: Vec<&str> = accepted.iter().map(|f| f.as_str()).collect();
+        Err(ConfigError::InvalidNotifier {
+            name: notifier.to_string(),
+            message: format!(
+                "format '{}' is not supported for {kind} notifiers (expected {})",
+                format.as_str(),
+                expected.join(", ")
+            ),
+        })
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Template configuration for message formatting.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +350,8 @@ pub struct TemplateConfig {
     pub email_body_html: Option<String>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default)]
+    pub body_format: BodyFormat,
 }
 
 /// Alert rule configuration.
@@ -332,9 +441,12 @@ use super::notifiers::NotifierConfig;
 /// Load rules from a `.d/` directory.
 /// Returns a HashMap of rule name → (RuleConfig, source path) for collision detection.
 fn load_rules_directory(dir: &Path) -> Result<HashMap<String, (RuleConfig, PathBuf)>, ConfigError> {
-    load_directory_generic::<RuleConfigWithoutName, RuleConfig>(dir, "rules.d", |name, config| {
-        config.into_rule_config(name)
-    })
+    load_directory_generic::<RuleConfigWithoutName, RuleConfig>(
+        dir,
+        "rules.d",
+        "rule",
+        |name, config| config.into_rule_config(name),
+    )
 }
 
 /// Load templates from a `.d/` directory.
@@ -342,7 +454,12 @@ fn load_rules_directory(dir: &Path) -> Result<HashMap<String, (RuleConfig, PathB
 fn load_templates_directory(
     dir: &Path,
 ) -> Result<HashMap<String, (TemplateConfig, PathBuf)>, ConfigError> {
-    load_directory_generic::<TemplateConfig, TemplateConfig>(dir, "templates.d", |_, config| config)
+    load_directory_generic::<TemplateConfig, TemplateConfig>(
+        dir,
+        "templates.d",
+        "template",
+        |_, config| config,
+    )
 }
 
 /// Load notifiers from a `.d/` directory.
@@ -350,13 +467,23 @@ fn load_templates_directory(
 fn load_notifiers_directory(
     dir: &Path,
 ) -> Result<HashMap<String, (NotifierConfig, PathBuf)>, ConfigError> {
-    load_directory_generic::<NotifierConfig, NotifierConfig>(dir, "notifiers.d", |_, config| config)
+    load_directory_generic::<NotifierConfig, NotifierConfig>(
+        dir,
+        "notifiers.d",
+        "notifier",
+        |_, config| config,
+    )
 }
 
 /// Generic function to load configs from a `.d/` directory.
+///
+/// `dir_name` (`rules.d`) prefixes parse errors; `resource_type` (`rule`,
+/// singular) names the resource in collision errors, as for collisions with
+/// the main file.
 fn load_directory_generic<D, T>(
     dir: &Path,
     dir_name: &str,
+    resource_type: &str,
     convert: fn(String, D) -> T,
 ) -> Result<HashMap<String, (T, PathBuf)>, ConfigError>
 where
@@ -412,7 +539,7 @@ where
             // Check for collision within .d/ directory (across files)
             if let Some((_, existing_path)) = result.get(&name) {
                 return Err(ConfigError::DuplicateName {
-                    resource_type: dir_name.trim_end_matches(".d").to_string(),
+                    resource_type: resource_type.to_string(),
                     name,
                     source1: existing_path.display().to_string(),
                     source2: path.display().to_string(),
@@ -442,7 +569,13 @@ fn merge_rules(
         merged.push(rule);
     }
 
-    // Then, add rules from .d/ directory, checking for collisions
+    // Then, add rules from .d/ directory, checking for collisions. `from_dir`
+    // is a HashMap: sort by (file path, rule name) so the rule order is the
+    // same on every load (rule names are unique, so the order is total).
+    let mut from_dir: Vec<_> = from_dir.into_iter().collect();
+    from_dir.sort_by(|(a_name, (_, a_path)), (b_name, (_, b_path))| {
+        a_path.cmp(b_path).then_with(|| a_name.cmp(b_name))
+    });
     for (name, (rule, source_path)) in from_dir {
         if let Some(first_source) = seen.get(&name) {
             return Err(ConfigError::DuplicateName {
@@ -597,13 +730,20 @@ impl Config {
             ));
         }
 
-        // Validate each source's URL and name format.
+        // Validate each source's URL, headers and name format. `${VAR}`
+        // placeholders were resolved by `load()`, so the URL is checked
+        // without the placeholder exception of notifier URLs.
         for (source_name, source) in &self.victorialogs {
-            if let Err(e) = validate_url(&source.url) {
+            if let Err(e) = validate_resolved_url(&source.url) {
                 errors.push(ConfigError::ValidationError(format!(
                     "victorialogs.{}.url: {}",
                     source_name, e
                 )));
+            }
+            if let Some(headers) = &source.headers {
+                errors.extend(validate_source_headers(headers).into_iter().map(|e| {
+                    ConfigError::ValidationError(format!("victorialogs.{source_name}.headers: {e}"))
+                }));
             }
             if !is_valid_source_name(source_name) {
                 errors.push(ConfigError::ValidationError(format!(
@@ -637,9 +777,11 @@ impl Config {
             }
         }
 
-        // Validate notifier URLs
+        // Validate notifier URLs (by sorted name, for a stable error order)
         if let Some(notifiers) = &self.notifiers {
-            for (name, notifier) in notifiers {
+            let mut sorted: Vec<_> = notifiers.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, notifier) in sorted {
                 match notifier {
                     super::notifiers::NotifierConfig::Mattermost(cfg) => {
                         if let Err(e) = validate_url(cfg.webhook_url.expose()) {
@@ -698,6 +840,41 @@ impl Config {
             errors.push(ConfigError::ValidationError(
                 "no rules defined: add rules in config.yaml or rules.d/".to_string(),
             ));
+        } else if !self.rules.iter().any(|r| r.enabled) {
+            // A daemon with no enabled rule would watch nothing: refuse it at
+            // validation so both `--validate` and startup report it.
+            errors.push(ConfigError::ValidationError(
+                "all rules are disabled: enable at least one rule in config.yaml or rules.d/"
+                    .to_string(),
+            ));
+        }
+
+        // ===== Default throttle =====
+        // Same bounds and key checks as a rule throttle: `RuleEngine` applies
+        // it to every rule without its own `throttle` block.
+        let defaults_throttle = &self.defaults.throttle;
+        if defaults_throttle.count == 0 {
+            errors.push(ConfigError::ValidationError(
+                "defaults.throttle.count must be >= 1 (0 would suppress every alert)".to_string(),
+            ));
+        }
+        if defaults_throttle.window.is_zero() {
+            errors.push(ConfigError::ValidationError(
+                "defaults.throttle.window must be > 0 (0s disables throttling)".to_string(),
+            ));
+        }
+        if let Some(ref key_template) = defaults_throttle.key {
+            if let Err(e) = validate_jinja_template(key_template) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "defaults.throttle.key: {}",
+                    e
+                )));
+            } else if let Err(e) = validate_template_render(key_template) {
+                errors.push(ConfigError::ValidationError(format!(
+                    "defaults.throttle.key render: {}",
+                    e
+                )));
+            }
         }
 
         // ===== Rule validations =====
@@ -743,12 +920,18 @@ impl Config {
 
             if let Some(ref throttle) = rule.throttle
                 && let Some(ref key_template) = throttle.key
-                && let Err(e) = validate_jinja_template(key_template)
             {
-                errors.push(ConfigError::InvalidTemplate {
-                    rule: rule.name.clone(),
-                    message: format!("throttle.key: {}", e),
-                });
+                if let Err(e) = validate_jinja_template(key_template) {
+                    errors.push(ConfigError::InvalidTemplate {
+                        rule: rule.name.clone(),
+                        message: format!("throttle.key: {}", e),
+                    });
+                } else if let Err(e) = validate_template_render(key_template) {
+                    errors.push(ConfigError::InvalidTemplate {
+                        rule: rule.name.clone(),
+                        message: format!("throttle.key render: {}", e),
+                    });
+                }
             }
 
             // Validate template exists
@@ -769,10 +952,26 @@ impl Config {
                     rule.name
                 )));
             }
+
+            // Validate destinations contain no duplicates (each would be
+            // delivered twice to the same notifier)
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for destination in &rule.notify.destinations {
+                if !seen.insert(destination.as_str()) {
+                    errors.push(ConfigError::ValidationError(format!(
+                        "rule '{}': notify.destinations contains duplicate entry '{}' (each notifier may appear at most once)",
+                        rule.name, destination
+                    )));
+                }
+            }
         }
 
+        // Templates are checked by sorted name, for a stable error order.
+        let mut templates: Vec<_> = self.templates.iter().collect();
+        templates.sort_by(|a, b| a.0.cmp(b.0));
+
         // Validate named templates (syntax)
-        for (name, template) in &self.templates {
+        for &(name, template) in &templates {
             if let Err(e) = validate_jinja_template(&template.title) {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
@@ -796,21 +995,25 @@ impl Config {
         }
 
         // Validate named templates (render test)
-        for (name, template) in &self.templates {
-            if let Err(e) = super::validation::validate_template_render(&template.title) {
+        for &(name, template) in &templates {
+            if let Err(e) = validate_template_render(&template.title) {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
                     message: format!("title render: {}", e),
                 });
             }
-            if let Err(e) = super::validation::validate_template_render(&template.body) {
+            let body_render = match template.body_format {
+                BodyFormat::Text => validate_template_render(&template.body),
+                BodyFormat::Markdown => validate_markdown_template_render(&template.body),
+            };
+            if let Err(e) = body_render {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
                     message: format!("body render: {}", e),
                 });
             }
             if let Some(email_body_html) = &template.email_body_html
-                && let Err(e) = super::validation::validate_template_render(email_body_html)
+                && let Err(e) = validate_template_render(email_body_html)
             {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
@@ -820,7 +1023,7 @@ impl Config {
         }
 
         // Validate accent_color hex format
-        for (name, template) in &self.templates {
+        for &(name, template) in &templates {
             if let Some(accent_color) = &template.accent_color
                 && let Err(e) = validate_hex_color(accent_color)
             {

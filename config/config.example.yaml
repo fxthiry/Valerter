@@ -131,6 +131,14 @@ defaults:
 #                                             (notifier-level templates only)
 #      log_timestamp_formatted                human timestamp (defaults.timestamp_timezone)
 #                                             (notifier-level templates only)
+#      log                                    every field of the event, in
+#                                             notifier-level templates only:
+#                                             {{ log.host }}, {{ log["k8s.pod"] }}
+#                                             (in rule templates, fields are
+#                                             top-level: {{ host }})
+#
+#    Escaping filters (any template): `| e` (HTML), `| md_escape` (Markdown
+#    for Mattermost), `| mdv2_escape` (Telegram MarkdownV2).
 #
 # 2. Template OUTPUT KEYS that you define below (left-hand side). These are
 #    the slots valerter fills and hands off to notifiers:
@@ -138,9 +146,12 @@ defaults:
 #      body          Alert body, plain text or Markdown (required)
 #      email_body_html     HTML-enriched version used ONLY by the email notifier
 #                    (Telegram, Mattermost, and webhook all read `body` and
-#                    ignore `email_body_html`). To format a Telegram alert, put
-#                    `<b>`/`<i>`/`<code>` inline in `body` — `parse_mode: HTML`
-#                    is Telegram's default.
+#                    ignore `email_body_html`). Do not put HTML in `body` for
+#                    Telegram: its default body_template escapes `body`, so the
+#                    tags show literally. Write the markup in the Telegram
+#                    `body_template` and escape each value there
+#                    (`<code>{{ log.host|e }}</code>`), see the Telegram
+#                    notifier below and docs/notifiers.md.
 #      accent_color  Hex color for visual indicators (optional, e.g., "#ff0000")
 #
 # Note: `title` and `body` are NOT variables you can reference on the right.
@@ -157,15 +168,35 @@ templates:
   # ── Example: Severity-based template ───────────────────────────────────────
   #
   # critical_alert:
-  #   title: "🔴 CRITICAL: {{ title }}"
+  #   title: "🔴 CRITICAL: {{ rule_name }}"
   #   body: |
   #     **Host:** {{ host }}
-  #     **Message:** {{ message }}
+  #     **Message:** {{ message | default(_msg) }}
   #   email_body_html: |
-  #     <h2 style="color: red;">{{ title }}</h2>
+  #     <h2 style="color: red;">{{ rule_name }}</h2>
   #     <p><strong>Host:</strong> {{ host }}</p>
-  #     <p>{{ message }}</p>
+  #     <p>{{ message | default(_msg) }}</p>
   #   accent_color: "#e74c3c"
+
+  # ── Example: Markdown body, rendered for each notifier ─────────────────────
+  # body_format: markdown (default: text) makes `body` a Markdown source:
+  # every {{ value }} is escaped, | tojson included (| safe, and only it,
+  # inserts trusted Markdown), and the body is rendered per notifier
+  # (Mattermost: Markdown, Telegram: HTML, email: HTML, so no email_body_html
+  # is needed; webhook: plain text by default, see the `format` key of
+  # notifiers). Raw HTML and tables are shown as text. `code`, `codeblock` and
+  # `md_link` build Markdown from values and keep them literal wherever they
+  # are written; never write {{ value }} inside backticks or a ``` fence (use
+  # them instead). Encode values put in a URL with | urlencode.
+  # See docs/configuration.md#markdown-bodies-body_format.
+  #
+  # markdown_alert:
+  #   title: "{{ rule_name }} on {{ host }}"
+  #   body_format: markdown
+  #   body: |
+  #     **{{ host }}** reported an error at {{ _time }}
+  #     {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
+  #     {{ _msg | codeblock }}
 
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
@@ -180,7 +211,8 @@ notifiers:
   # Incoming webhook integration.
   #
   # Required: webhook_url
-  # Optional: channel (override default), username, icon_url
+  # Optional: channel (override default), username, icon_url,
+  #           format (body of a Markdown alert; only value: markdown)
 
   mattermost-ops:
     type: mattermost
@@ -193,7 +225,10 @@ notifiers:
   # Send alerts to any HTTP endpoint (Slack, PagerDuty, custom APIs).
   #
   # Required: url
-  # Optional: method (default: POST), headers, body_template
+  # Optional: method (default: POST), headers, body_template,
+  #           format (body of a Markdown alert: plain (default), markdown or
+  #           html; markdown for Mattermost through a generic webhook or
+  #           another CommonMark engine, html for Teams; Discord: plain)
   #
   # Default payload when body_template is omitted:
   # {
@@ -206,35 +241,59 @@ notifiers:
   #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"
   # }
 
+  #
+  # Requests carry "Content-Type: application/json" unless headers set one.
+  # Values are inserted without escaping: in JSON bodies, use the tojson filter
+  # WITHOUT surrounding quotes ({{ body | tojson }}, not "{{ body }}"), or a
+  # quote or line break in a log line produces invalid JSON (logged as
+  # "Webhook body is not valid JSON"; the request is still sent).
+  # ${VAR} references in the body_template source are resolved at startup, like
+  # url and headers (undefined variable = startup failure); values rendered from
+  # logs are never resolved. Keep values containing {{, {% or " out of it.
+
   # slack-alerts:
   #   type: webhook
   #   url: "${SLACK_WEBHOOK_URL}"
+  #   body_template: |
+  #     {
+  #       "text": {{ ("*" ~ title ~ "*\n" ~ body) | tojson }},
+  #       "username": "Valerter"
+  #     }
 
   # pagerduty:
   #   type: webhook
   #   url: "https://events.pagerduty.com/v2/enqueue"
-  #   headers:
-  #     Authorization: "Token token=${PAGERDUTY_TOKEN}"
-  #     Content-Type: "application/json"
+  #   # Events API v2: the routing key in the body authenticates the event, no
+  #   # Authorization header needed. Set PAGERDUTY_ROUTING_KEY in the daemon's
+  #   # environment to your integration key.
+  #   # custom_details lists event fields read from `log` (null when absent).
   #   body_template: |
   #     {
   #       "routing_key": "${PAGERDUTY_ROUTING_KEY}",
   #       "event_action": "trigger",
   #       "payload": {
-  #         "summary": "{{ title }}",
-  #         "source": "valerter",
+  #         "summary": {{ title | tojson }},
+  #         "source": {{ log.host | default("valerter") | tojson }},
   #         "severity": "error",
   #         "custom_details": {
-  #           "body": "{{ body }}",
-  #           "rule": "{{ rule_name }}"
+  #           "rule": {{ rule_name | tojson }},
+  #           "vl_source": {{ vl_source | tojson }},
+  #           "log_time": {{ log._time | tojson }},
+  #           "message": {{ log._msg | tojson }},
+  #           "pod": {{ log["k8s.pod"] | tojson }}
   #         }
+  #         {#- Or send every field of the event (dotted keys appear twice,
+  #             flat and expanded, and secrets in the log line go along):
+  #         "custom_details": {{ log | tojson }}
+  #         #}
   #       }
   #     }
 
   # ── Email (SMTP) ───────────────────────────────────────────────────────────
   # Required: smtp.host, smtp.port, from, to, subject_template
   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify,
-  #           body_template (inline), body_template_file (path)
+  #           body_template (inline), body_template_file (path),
+  #           format (body of a Markdown alert; only value: html)
   #
   # TLS modes:
   #   none     - No encryption (port 25, internal networks only)
@@ -267,7 +326,9 @@ notifiers:
   #
   # Required: bot_token, chat_ids (non-empty)
   # Optional: parse_mode (default: HTML), disable_notification,
-  #           disable_web_page_preview, body_template
+  #           disable_web_page_preview, body_template,
+  #           format (body of a Markdown alert: telegram_html, the default
+  #           with parse_mode HTML, or plain, the default otherwise)
   #
   # The endpoint URL is built internally and never logged (contains the token).
   # Each chat_id triggers one sequential HTTP call; a 429 response honors
@@ -284,8 +345,12 @@ notifiers:
   #   parse_mode: HTML                       # Default: HTML (also: MarkdownV2)
   #   disable_notification: false            # Default: not set (Telegram default = false)
   #   disable_web_page_preview: true         # Default: not set
-  #   body_template: |                       # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}"
+  #   # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}". Write the
+  #   # markup here and escape every inserted value with |e: `body` and the
+  #   # event fields (`log`) may contain <, > or &.
+  #   body_template: |
   #     <b>{{ title|e }}</b>
+  #     Host: <code>{{ log.host|e }}</code>
   #     {{ body|e }}
 
 
@@ -337,7 +402,10 @@ rules:
       regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
     notify:
       template: default_alert
-      # mattermost_channel: custom-channel # Override notifier's default channel
+      # mattermost_channel: custom-channel # Mattermost channel for this rule, over the
+      #                                    # notifier's channel; if Mattermost rejects it,
+      #                                    # resent to the notifier's channel (or the
+      #                                    # webhook default when it has none)
       destinations:
         - mattermost-ops
 
@@ -372,15 +440,21 @@ metrics:
 # ENVIRONMENT VARIABLES
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Use ${VAR_NAME} syntax anywhere in this file to reference environment variables.
+# Use ${VAR_NAME} syntax to reference environment variables in these fields
+# (elsewhere, ${...} is kept as is):
+#   - victorialogs.<source>: url, basic_auth.username, basic_auth.password,
+#     headers values
+#   - notifier secrets: Mattermost webhook_url; webhook url and headers values;
+#     email smtp.username and smtp.password; Telegram bot_token
+#   - webhook body_template source (write {{ '$' }}{VAR} for a literal ${VAR})
 # Any variable from the process environment can be used (no predefined list).
+# Substitution is a single pass: a value containing ${...} is not resolved again.
 #
 # Examples used in this file:
 #   ${VL_USER}, ${VL_PASS}     - VictoriaLogs credentials
 #   ${VL_TOKEN}                - Bearer token for VictoriaLogs
 #   ${SMTP_USER}, ${SMTP_PASSWORD} - Email credentials
 #   ${SLACK_WEBHOOK_URL}       - Slack webhook
-#   ${PAGERDUTY_TOKEN}         - PagerDuty API token
 #
 # Runtime variables (not substituted in config, read directly by the process):
 #   RUST_LOG   - Log level: error, warn, info (default), debug, trace

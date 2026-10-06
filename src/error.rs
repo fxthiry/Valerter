@@ -37,10 +37,6 @@ pub enum ConfigError {
 pub enum StreamError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
-    #[error("invalid UTF-8 in stream: {0}")]
-    Utf8Error(String),
-    #[error("line too large: {0} bytes exceeds maximum of {1} bytes")]
-    LineTooLarge(usize, usize),
 }
 
 /// Errors related to log line parsing (regex and JSON extraction).
@@ -74,7 +70,7 @@ pub enum TemplateError {
 }
 
 /// Errors related to notification queue operations.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
     #[error("notification queue closed")]
     Closed,
@@ -85,14 +81,16 @@ pub enum QueueError {
 pub enum RuleError {
     #[error("stream error: {0}")]
     Stream(#[from] StreamError),
-    #[error("parse error: {0}")]
-    Parse(#[from] ParseError),
-    #[error("template error: {0}")]
-    Template(#[from] TemplateError),
-    #[error("queue error: {0}")]
-    Queue(#[from] QueueError),
-    #[error("rule panicked")]
-    Panic,
+    /// The engine was started without any `(rule, source)` task to run.
+    ///
+    /// Defensive guard: a configuration whose rules are all disabled is
+    /// already rejected by `Config::validate()`, so the daemon never reaches
+    /// it; the engine, public in the library, still refuses to run idle.
+    #[error("no enabled rules: the engine has nothing to watch")]
+    NoEnabledRules,
+    /// Every `(rule, source)` task ended without a shutdown request.
+    #[error("all rule tasks stopped unexpectedly: the engine no longer watches anything")]
+    AllTasksStopped,
 }
 
 #[cfg(test)]
@@ -168,15 +166,6 @@ mod tests {
     fn stream_error_display() {
         let err = StreamError::ConnectionFailed("timeout".to_string());
         assert_eq!(err.to_string(), "connection failed: timeout");
-
-        let err = StreamError::Utf8Error("invalid sequence".to_string());
-        assert_eq!(err.to_string(), "invalid UTF-8 in stream: invalid sequence");
-
-        let err = StreamError::LineTooLarge(1048577, 1048576);
-        assert_eq!(
-            err.to_string(),
-            "line too large: 1048577 bytes exceeds maximum of 1048576 bytes"
-        );
     }
 
     #[test]
@@ -224,19 +213,22 @@ mod tests {
 
     #[test]
     fn rule_error_display() {
-        let err = RuleError::Panic;
-        assert_eq!(err.to_string(), "rule panicked");
-
         let err = RuleError::Stream(StreamError::ConnectionFailed("network error".to_string()));
         assert_eq!(
             err.to_string(),
             "stream error: connection failed: network error"
         );
+    }
 
-        let err = RuleError::Parse(ParseError::NoMatch);
-        assert_eq!(err.to_string(), "parse error: regex did not match");
-
-        let err = RuleError::Queue(QueueError::Closed);
-        assert_eq!(err.to_string(), "queue error: notification queue closed");
+    #[test]
+    fn rule_error_engine_exit_display() {
+        assert_eq!(
+            RuleError::NoEnabledRules.to_string(),
+            "no enabled rules: the engine has nothing to watch"
+        );
+        assert_eq!(
+            RuleError::AllTasksStopped.to_string(),
+            "all rule tasks stopped unexpectedly: the engine no longer watches anything"
+        );
     }
 }

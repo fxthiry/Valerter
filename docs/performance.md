@@ -195,7 +195,7 @@ To ensure that if someone misconfigures valerter (no throttle, or throttle too h
 
 Even without throttle:
 - **No crash** under any load tested
-- **Memory bounded** at ~22 MB (queue has fixed size)
+- **Memory bounded** at ~22 MB (each destination queue has a fixed size)
 - **Graceful degradation** (FIFO drops, not OOM)
 
 ---
@@ -243,7 +243,14 @@ Tests that valerter recovers from VictoriaLogs outages.
 | With throttle (any load) | ~18-20 MB |
 | Without throttle (extreme) | ~22 MB |
 
-Memory is **always bounded** regardless of load.
+Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied): with ordinary log lines (a few hundred bytes), even dozens of notifiers keep the pending alerts within a few MB.
+
+The size of a pending alert grows with its log line (at most 1 MiB). For a line of L bytes:
+
+- the fields of the event (the `log` variable of notifier templates) take up to 2L: the flat keys, plus a copy of each dotted key expanded into objects;
+- a `body_format: markdown` body that inserts the line once takes up to 2L for its source (a backslash before each punctuation character), then, only for the formats used by its destinations: up to L for `plain`, 4L for `markdown` (`<` written `&lt;`), 6L for `html` (`"` written `&quot;`) and 5L for `telegram_html` (`&` written `&amp;`). Each rendering is computed once and shared.
+
+That is about 20 MiB per alert in the worst case (a 1 MiB line of such characters, every format used), times the number of times the body inserts the line. The leading blanks and empty lines of a value are the exception: in a Markdown body, a leading space becomes a no-break space (2 bytes), a leading tab four (8 bytes) and an empty line one, which multiplies these figures for a value made of them. A text body keeps its rendered text only (about L per insertion).
 
 ---
 
@@ -253,7 +260,8 @@ Memory is **always bounded** regardless of load.
 # The metrics that matter in production
 valerter_alerts_sent_total          # Notifications actually delivered
 valerter_alerts_throttled_total     # Logs matched but throttled (expected)
-valerter_alerts_dropped_total       # Queue overflow (should be 0 with throttle)
+valerter_alerts_dropped_total       # Queue overflow, all destinations (should be 0 with throttle)
+valerter_destination_alerts_dropped_total{notifier_name}  # Which destination overflows
 valerter_vl_source_up{vl_source}    # Connection health (per source; v1.x: valerter_victorialogs_up)
 ```
 

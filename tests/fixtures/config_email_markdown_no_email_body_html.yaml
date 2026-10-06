@@ -1,0 +1,43 @@
+# Fixture: a `body_format: markdown` template routed to an email notifier
+# without email_body_html. Valid: the html rendering of the body is the email
+# body.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ host }}"
+    body: |
+      **{{ host }}** reported an error
+      {{ _msg | codeblock }}
+      {{ md_link("Logs", "https://vl.example.com/select?q=" ~ ("host:" ~ host) | urlencode) }}
+    body_format: markdown
+
+notifiers:
+  email-alerts:
+    type: email
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+    from: "alerts@example.com"
+    to:
+      - "team@example.com"
+    subject_template: "[Alert] {{ title }}"
+
+rules:
+  - name: "error_alert"
+    enabled: true
+    query: '_stream:{level="error"}'
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "alert"
+      destinations:
+        - email-alerts

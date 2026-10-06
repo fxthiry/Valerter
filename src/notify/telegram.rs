@@ -5,13 +5,18 @@
 //! so batching would not help. The notifier returns `Ok(())` as soon as at
 //! least one chat succeeds (partial success); `Err` only when all fail.
 
-use crate::config::{SecretString, TelegramNotifierConfig, resolve_env_vars};
+use crate::config::{
+    BodyFormat, OutputFormat, SecretString, TelegramNotifierConfig, resolve_env_vars,
+    validate_notifier_template,
+};
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::http_body::read_body_prefix;
+use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
-use minijinja::{Environment, context};
+use minijinja::context;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::Instrument;
@@ -47,62 +52,216 @@ const DEFAULT_BODY_TEMPLATE: &str = "<b>{{ title|e }}</b>\n{{ body|e }}";
 /// Default `parse_mode` sent to Telegram when none is configured.
 const DEFAULT_PARSE_MODE: &str = "HTML";
 
+/// `parse_mode` values accepted by the Bot API, in canonical form.
+const SUPPORTED_PARSE_MODES: [&str; 3] = ["HTML", "MarkdownV2", "Markdown"];
+
+/// Returns the canonical form of a `parse_mode` (`html` → `HTML`), compared
+/// case-insensitively, or `None` when the Bot API does not support it.
+fn normalize_parse_mode(value: &str) -> Option<&'static str> {
+    SUPPORTED_PARSE_MODES
+        .into_iter()
+        .find(|mode| mode.eq_ignore_ascii_case(value))
+}
+
 /// Payload serialized as the body of a `sendMessage` request.
 #[derive(Debug, Serialize)]
 struct TelegramPayload<'a> {
     chat_id: &'a str,
     text: &'a str,
-    parse_mode: &'a str,
+    /// Omitted when resending as plain text after an HTML rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disable_notification: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disable_web_page_preview: Option<bool>,
 }
 
+/// Unit of a Telegram HTML text: a tag (no visible character) or a visible
+/// character (an entity counts as one).
+enum HtmlUnit<'a> {
+    Open(&'a str),
+    Close(&'a str),
+    /// A tag that opens nothing (`<br/>`, `<>`).
+    Empty,
+    Visible,
+}
+
+/// Name of a tag (`b` in `<b>`, `a` in `<a href="…">`, `b` in `</b>`).
+fn tag_name(tag: &str) -> &str {
+    let tag = tag.strip_prefix('/').unwrap_or(tag);
+    let end = tag
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(tag.len());
+    &tag[..end]
+}
+
+/// Length of the entity starting `rest` (after its `&`, `;` included), if
+/// any: `#` and 1 to 7 digits, `#x` and 1 to 6 hexadecimal digits, or a
+/// letter and up to 31 letters or digits.
+fn entity_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let end = match bytes.first() {
+        Some(b'#') => match bytes.get(1) {
+            Some(b'x' | b'X') => {
+                let n = bytes[2..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit())
+                    .count();
+                (1..=6).contains(&n).then_some(2 + n)
+            }
+            _ => {
+                let n = bytes[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                (1..=7).contains(&n).then_some(1 + n)
+            }
+        },
+        Some(b) if b.is_ascii_alphabetic() => {
+            let n = bytes
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count();
+            (n <= 32).then_some(n)
+        }
+        _ => None,
+    }?;
+    (bytes.get(end) == Some(&b';')).then_some(end + 1)
+}
+
+/// The unit starting `text` and its length in bytes. A `<` followed by a
+/// `>` is a tag; a `<` without one is a visible character (malformed text,
+/// which Telegram rejects: the plain-text resend handles it).
+fn html_unit(text: &str) -> (HtmlUnit<'_>, usize) {
+    match text.as_bytes()[0] {
+        b'<' => {
+            if let Some(end) = text.find('>') {
+                let tag = &text[1..end];
+                let name = tag_name(tag);
+                let unit = if tag.starts_with('/') {
+                    HtmlUnit::Close(name)
+                } else if tag.ends_with('/') || name.is_empty() {
+                    HtmlUnit::Empty
+                } else {
+                    HtmlUnit::Open(name)
+                };
+                return (unit, end + 1);
+            }
+            (HtmlUnit::Visible, 1)
+        }
+        b'&' => (
+            HtmlUnit::Visible,
+            entity_len(&text[1..]).map_or(1, |n| n + 1),
+        ),
+        _ => {
+            let len = text.chars().next().map_or(1, char::len_utf8);
+            (HtmlUnit::Visible, len)
+        }
+    }
+}
+
 /// Truncate `text` so that it does not exceed [`TELEGRAM_TEXT_MAX_CODEPOINTS`]
 /// Unicode codepoints. When truncation happens, a single `…` (U+2026) is
-/// appended so the final codepoint count is exactly the limit.
-fn truncate_text(text: &str) -> (String, bool) {
-    if text.chars().count() <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+/// appended so the final count is exactly the limit.
+///
+/// With `html` (`parse_mode: HTML`), only the visible text is counted: a tag
+/// counts zero, an entity one. The cut never falls in a tag or an entity,
+/// and the tags still open after the `…` are closed, innermost first.
+fn truncate_text(text: &str, html: bool) -> (String, bool) {
+    if !html {
+        if text.chars().count() <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+            return (text.to_string(), false);
+        }
+        let mut out: String = text
+            .chars()
+            .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
+            .collect();
+        out.push('…');
+        return (out, true);
+    }
+
+    let mut visible = 0;
+    let mut i = 0;
+    while i < text.len() && visible <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+        let (unit, len) = html_unit(&text[i..]);
+        if matches!(unit, HtmlUnit::Visible) {
+            visible += 1;
+        }
+        i += len;
+    }
+    if visible <= TELEGRAM_TEXT_MAX_CODEPOINTS {
         return (text.to_string(), false);
     }
-    let mut out: String = text
-        .chars()
-        .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
-        .collect();
+
+    let mut open: Vec<&str> = Vec::new();
+    let mut visible = 0;
+    let mut i = 0;
+    while visible < TELEGRAM_TEXT_MAX_CODEPOINTS - 1 {
+        let (unit, len) = html_unit(&text[i..]);
+        match unit {
+            HtmlUnit::Visible => visible += 1,
+            HtmlUnit::Open(name) => open.push(name),
+            HtmlUnit::Close(name) => {
+                if let Some(at) = open.iter().rposition(|o| o.eq_ignore_ascii_case(name)) {
+                    open.truncate(at);
+                }
+            }
+            HtmlUnit::Empty => {}
+        }
+        i += len;
+    }
+    let mut out = String::with_capacity(i + 64);
+    out.push_str(&text[..i]);
     out.push('…');
+    for name in open.iter().rev() {
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
     (out, true)
 }
 
-/// Validate a `body_template` at configuration time so startup fails fast on
-/// malformed Jinja.
-fn validate_body_template(source: &str) -> Result<(), ConfigError> {
-    let mut env = Environment::new();
-    env.add_template("_validate", source)
-        .map_err(|e| ConfigError::InvalidTemplate {
-            rule: "telegram.body_template".to_string(),
-            message: e.to_string(),
-        })?;
-    Ok(())
+/// Text of an alert, rendered and truncated once before the fan-out to chats.
+#[derive(Debug)]
+struct Prepared {
+    /// Text sent with the configured `parse_mode`.
+    text: String,
+    /// Whether `text` was truncated.
+    truncated: bool,
+    /// Text resent without `parse_mode` after an HTML rejection, when it
+    /// differs from `text`: for a Markdown alert in `parse_mode: HTML`, the
+    /// title and the `plain` rendering of the body (raw truncation).
+    plain: Option<String>,
 }
 
-/// Render a body template with alert context.
-fn render_body_template(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
-    let mut env = Environment::new();
-    env.add_template("body", source)
-        .map_err(|e| NotifyError::TemplateError(e.to_string()))?;
-    let tmpl = env
-        .get_template("body")
-        .map_err(|e| NotifyError::TemplateError(e.to_string()))?;
-    tmpl.render(context! {
-        title => &alert.message.title,
-        body => &alert.message.body,
-        rule_name => &alert.rule_name,
-        vl_source => &alert.vl_source,
-        log_timestamp => &alert.log_timestamp,
-        log_timestamp_formatted => &alert.log_timestamp_formatted,
+/// Render the compiled body template with alert context.
+fn render_body_template(
+    template: &NotifierTemplate,
+    alert: &AlertPayload,
+    format: OutputFormat,
+) -> Result<String, NotifyError> {
+    template
+        .render(context! {
+            title => &alert.message.title,
+            body => alert.message.body_for(format).to_value(),
+            rule_name => &alert.rule_name,
+            vl_source => &alert.vl_source,
+            log_timestamp => &alert.log_timestamp,
+            log_timestamp_formatted => &alert.log_timestamp_formatted,
+            log => &alert.log,
+        })
+        .map_err(|e| NotifyError::TemplateError(e.to_string()))
+}
+
+/// Compile the configured `body_template`, or the default one. The source
+/// has already been validated, so an error here is unexpected.
+fn compile_body_template(
+    name: &str,
+    source: Option<&str>,
+) -> Result<NotifierTemplate, ConfigError> {
+    let source = source.unwrap_or(DEFAULT_BODY_TEMPLATE);
+    NotifierTemplate::compile(source.to_string(), false).map_err(|e| ConfigError::InvalidNotifier {
+        name: name.to_string(),
+        message: format!("body_template: {e}"),
     })
-    .map_err(|e| NotifyError::TemplateError(e.to_string()))
 }
 
 /// Strips tags like `<b>`, `<i></i>` from a rendered Telegram HTML body.
@@ -207,6 +366,37 @@ async fn parse_retry_after(response: reqwest::Response, attempt: u32) -> Duratio
     extract_retry_after(header.as_deref(), &body, attempt)
 }
 
+/// Bytes of a 400 response body read at most to find its `description`.
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+
+/// `description` field of a Bot API error body, if the body is JSON.
+fn error_description(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        description: Option<String>,
+    }
+    serde_json::from_slice::<ErrorBody>(body).ok()?.description
+}
+
+/// Whether a 400 description reports malformed HTML markup (`Bad Request:
+/// can't parse entities: ...`), the only rejection a plain-text resend fixes.
+fn is_entity_parse_error(description: &str) -> bool {
+    description.to_lowercase().contains("can't parse entities")
+}
+
+/// Why a `sendMessage` request to one chat failed for good.
+#[derive(Debug)]
+enum ChatSendError {
+    /// 4xx other than 429: the request itself was rejected, not retried.
+    /// `description` is the Bot API error description, read for a 400 only.
+    Client {
+        status: reqwest::StatusCode,
+        description: Option<String>,
+    },
+    /// 5xx, 429 and network errors until the retry pool was exhausted.
+    RetriesExhausted,
+}
+
 /// Telegram Bot notifier. One instance per configured `notifiers.<name>` entry.
 pub struct TelegramNotifier {
     name: String,
@@ -219,7 +409,12 @@ pub struct TelegramNotifier {
     parse_mode: String,
     disable_notification: Option<bool>,
     disable_web_page_preview: Option<bool>,
-    body_template_source: Option<String>,
+    /// Whether `body_template` is configured (else the default is used).
+    has_body_template: bool,
+    /// `body_template` or the default template, compiled once.
+    body_template: NotifierTemplate,
+    /// Format of the body of a Markdown alert.
+    format: OutputFormat,
 }
 
 impl TelegramNotifier {
@@ -261,11 +456,48 @@ impl TelegramNotifier {
         }
 
         if let Some(template) = &config.body_template {
-            validate_body_template(template).map_err(|e| ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("body_template: {}", e),
+            validate_notifier_template("body_template", template).map_err(|message| {
+                ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message,
+                }
             })?;
         }
+
+        let parse_mode = match config.parse_mode.as_deref() {
+            None => DEFAULT_PARSE_MODE,
+            Some(value) => {
+                normalize_parse_mode(value).ok_or_else(|| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message: format!(
+                        "parse_mode '{value}' is not supported (expected HTML, MarkdownV2 or Markdown)"
+                    ),
+                })?
+            }
+        };
+
+        // `telegram_html` needs Telegram to parse the text as HTML; another
+        // parse mode gets plain text by default (the template escapes it).
+        if config.format == Some(OutputFormat::TelegramHtml) && parse_mode != "HTML" {
+            return Err(ConfigError::InvalidNotifier {
+                name: name.to_string(),
+                message: "format 'telegram_html' requires parse_mode HTML".to_string(),
+            });
+        }
+        let format = OutputFormat::resolve(
+            config.format,
+            if parse_mode == "HTML" {
+                OutputFormat::TelegramHtml
+            } else {
+                OutputFormat::Plain
+            },
+            &[OutputFormat::TelegramHtml, OutputFormat::Plain],
+            name,
+            "telegram",
+        )?;
+
+        let body_template = compile_body_template(name, config.body_template.as_deref())?;
+        body_template.warn_unknown_variables(name, "body_template", &CONTEXT_VARIABLES);
 
         let endpoint = format!("https://api.telegram.org/bot{}/sendMessage", resolved_token);
 
@@ -274,23 +506,19 @@ impl TelegramNotifier {
             endpoint: SecretString::new(endpoint),
             client,
             chat_ids: config.chat_ids.clone(),
-            parse_mode: config
-                .parse_mode
-                .clone()
-                .unwrap_or_else(|| DEFAULT_PARSE_MODE.to_string()),
+            parse_mode: parse_mode.to_string(),
             disable_notification: config.disable_notification,
             disable_web_page_preview: config.disable_web_page_preview,
-            body_template_source: config.body_template.clone(),
+            has_body_template: config.body_template.is_some(),
+            body_template,
+            format,
         })
     }
 
-    /// Render and truncate the message text once, before fan-out to chats.
-    fn prepare_text(&self, alert: &AlertPayload) -> Result<(String, bool), NotifyError> {
-        let template = self
-            .body_template_source
-            .as_deref()
-            .unwrap_or(DEFAULT_BODY_TEMPLATE);
-        let rendered = render_body_template(template, alert)?;
+    /// Render and truncate the message text once, before fan-out to chats,
+    /// with the text of the plain-text resend (see [`Prepared`]).
+    fn prepare_text(&self, alert: &AlertPayload) -> Result<Prepared, NotifyError> {
+        let rendered = render_body_template(&self.body_template, alert, self.format)?;
         let guarded = if let Some((fallback, reason)) = fallback_if_empty(&rendered, alert) {
             tracing::warn!(
                 rule_name = %alert.rule_name,
@@ -302,32 +530,106 @@ impl TelegramNotifier {
         } else {
             rendered
         };
-        Ok(truncate_text(&guarded))
+        let html = self.parse_mode == "HTML";
+        let (text, truncated) = truncate_text(&guarded, html);
+        let plain = (html && alert.message.body_format == BodyFormat::Markdown).then(|| {
+            let message = &alert.message;
+            let body = message.body_for(OutputFormat::Plain).text;
+            let plain = if message.title.is_empty() {
+                body.to_string()
+            } else {
+                format!("{}\n{body}", message.title)
+            };
+            truncate_text(&plain, false).0
+        });
+        Ok(Prepared {
+            text,
+            truncated,
+            plain,
+        })
     }
 
     /// Send the prepared text to a single chat_id with retry. Returns `Ok` on
     /// success, `Err` on permanent failure (retries exhausted or 4xx other
     /// than 429).
+    ///
+    /// A 400 `can't parse entities` on an HTML message (malformed markup: an
+    /// unescaped `<` or `&` in a custom template) is resent once as plain
+    /// text (`plain`, or `text` itself), so the alert is delivered rather
+    /// than lost. Any other 400 (`chat not found`, `message text is empty`…)
+    /// fails the chat at once.
     async fn send_to_chat(
         &self,
         alert: &AlertPayload,
         chat_id: &str,
-        text: &str,
+        prepared: &Prepared,
     ) -> Result<(), NotifyError> {
-        let payload = TelegramPayload {
+        let mut payload = TelegramPayload {
             chat_id,
-            text,
-            parse_mode: &self.parse_mode,
+            text: &prepared.text,
+            parse_mode: Some(&self.parse_mode),
             disable_notification: self.disable_notification,
             disable_web_page_preview: self.disable_web_page_preview,
         };
 
+        let result = match self.post_with_retry(chat_id, &payload).await {
+            Err(ChatSendError::Client {
+                status,
+                description: Some(description),
+            }) if status == reqwest::StatusCode::BAD_REQUEST
+                && self.parse_mode.eq_ignore_ascii_case("HTML")
+                && is_entity_parse_error(&description) =>
+            {
+                tracing::warn!(
+                    notifier_name = %self.name,
+                    rule_name = %alert.rule_name,
+                    chat_id = %chat_id,
+                    status = %status,
+                    "Telegram rejected HTML message, resending as plain text"
+                );
+                payload.parse_mode = None;
+                payload.text = prepared.plain.as_deref().unwrap_or(&prepared.text);
+                self.post_with_retry(chat_id, &payload).await
+            }
+            other => other,
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(ChatSendError::Client { status, .. }) => {
+                tracing::error!(
+                    chat_id = %chat_id,
+                    status = %status,
+                    "Telegram returned client error, not retrying"
+                );
+                Err(NotifyError::SendFailed(format!("client error: {}", status)))
+            }
+            Err(ChatSendError::RetriesExhausted) => {
+                tracing::error!(
+                    chat_id = %chat_id,
+                    max_retries = TELEGRAM_MAX_RETRIES,
+                    rule_name = %alert.rule_name,
+                    "Telegram send exhausted retries"
+                );
+                Err(NotifyError::MaxRetriesExceeded)
+            }
+        }
+    }
+
+    /// POST one `sendMessage` payload, retrying 5xx, 429 and network errors
+    /// up to [`TELEGRAM_MAX_RETRIES`] attempts. A 4xx other than 429 stops
+    /// immediately.
+    async fn post_with_retry(
+        &self,
+        chat_id: &str,
+        payload: &TelegramPayload<'_>,
+    ) -> Result<(), ChatSendError> {
         for attempt in 0..TELEGRAM_MAX_RETRIES {
             let result = self
                 .client
                 .post(self.endpoint.expose())
                 .timeout(TELEGRAM_HTTP_TIMEOUT)
-                .json(&payload)
+                .json(payload)
                 .send()
                 .await;
 
@@ -351,12 +653,21 @@ impl TelegramNotifier {
                 }
                 Ok(response) if response.status().is_client_error() => {
                     let status = response.status();
-                    tracing::error!(
-                        chat_id = %chat_id,
-                        status = %status,
-                        "Telegram returned client error, not retrying"
-                    );
-                    return Err(NotifyError::SendFailed(format!("client error: {}", status)));
+                    // Only a 400 can trigger the plain-text fallback: read
+                    // its description, within a size limit (the duration is
+                    // bounded by the request timeout).
+                    let description = if status == reqwest::StatusCode::BAD_REQUEST {
+                        let body =
+                            read_body_prefix(response, ERROR_BODY_MAX_BYTES, TELEGRAM_HTTP_TIMEOUT)
+                                .await;
+                        error_description(&body)
+                    } else {
+                        None
+                    };
+                    return Err(ChatSendError::Client {
+                        status,
+                        description,
+                    });
                 }
                 Ok(response) => {
                     tracing::warn!(
@@ -385,13 +696,7 @@ impl TelegramNotifier {
             }
         }
 
-        tracing::error!(
-            chat_id = %chat_id,
-            max_retries = TELEGRAM_MAX_RETRIES,
-            rule_name = %alert.rule_name,
-            "Telegram send exhausted retries"
-        );
-        Err(NotifyError::MaxRetriesExceeded)
+        Err(ChatSendError::RetriesExhausted)
     }
 }
 
@@ -405,6 +710,10 @@ impl Notifier for TelegramNotifier {
         "telegram"
     }
 
+    fn output_format(&self) -> OutputFormat {
+        self.format
+    }
+
     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
         let span = tracing::info_span!(
             "send_telegram",
@@ -414,8 +723,16 @@ impl Notifier for TelegramNotifier {
         );
 
         async {
-            let (text, truncated) = self.prepare_text(alert)?;
-            if truncated {
+            // A render error is a permanent failure for this alert: count it,
+            // send nothing.
+            let prepared = match self.prepare_text(alert) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    record_permanent_failure(alert, &self.name, "telegram");
+                    return Err(e);
+                }
+            };
+            if prepared.truncated {
                 tracing::warn!(
                     rule_name = %alert.rule_name,
                     limit = TELEGRAM_TEXT_MAX_CODEPOINTS,
@@ -429,20 +746,13 @@ impl Notifier for TelegramNotifier {
                 .increment(1);
             }
 
+            // Counted once per alert, like email: sent if at least one chat
+            // succeeded, failed if every chat failed. Each failed chat is
+            // counted in `valerter_telegram_chat_errors_total`.
             let mut any_success = false;
             for chat_id in &self.chat_ids {
-                match self.send_to_chat(alert, chat_id, &text).await {
-                    Ok(()) => {
-                        any_success = true;
-                        metrics::counter!(
-                            "valerter_alerts_sent_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
-                        )
-                        .increment(1);
-                    }
+                match self.send_to_chat(alert, chat_id, &prepared).await {
+                    Ok(()) => any_success = true,
                     Err(e) => {
                         tracing::error!(
                             chat_id = %chat_id,
@@ -450,19 +760,10 @@ impl Notifier for TelegramNotifier {
                             "Telegram send permanently failed for chat"
                         );
                         metrics::counter!(
-                            "valerter_notify_errors_total",
+                            "valerter_telegram_chat_errors_total",
                             "rule_name" => alert.rule_name.clone(),
                             "vl_source" => alert.vl_source.clone(),
                             "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            "valerter_alerts_failed_total",
-                            "rule_name" => alert.rule_name.clone(),
-                            "vl_source" => alert.vl_source.clone(),
-                            "notifier_name" => self.name.clone(),
-                            "notifier_type" => "telegram",
                         )
                         .increment(1);
                     }
@@ -470,8 +771,17 @@ impl Notifier for TelegramNotifier {
             }
 
             if any_success {
+                metrics::counter!(
+                    "valerter_alerts_sent_total",
+                    "rule_name" => alert.rule_name.clone(),
+                    "vl_source" => alert.vl_source.clone(),
+                    "notifier_name" => self.name.clone(),
+                    "notifier_type" => "telegram",
+                )
+                .increment(1);
                 Ok(())
             } else {
+                record_permanent_failure(alert, &self.name, "telegram");
                 Err(NotifyError::SendFailed("all chat_ids failed".to_string()))
             }
         }
@@ -498,8 +808,17 @@ impl TelegramNotifier {
             parse_mode: DEFAULT_PARSE_MODE.to_string(),
             disable_notification: None,
             disable_web_page_preview: None,
-            body_template_source: None,
+            has_body_template: false,
+            body_template: compile_body_template(name, None).expect("default template compiles"),
+            format: OutputFormat::TelegramHtml,
         }
+    }
+
+    /// Test-only: replace the body template, bypassing validation.
+    pub(crate) fn set_body_template_for_tests(&mut self, source: Option<&str>) {
+        self.has_body_template = source.is_some();
+        self.body_template =
+            compile_body_template(&self.name, source).expect("test template compiles");
     }
 }
 
@@ -510,7 +829,7 @@ impl std::fmt::Debug for TelegramNotifier {
             .field("name", &self.name)
             .field("chat_count", &self.chat_ids.len())
             .field("parse_mode", &self.parse_mode)
-            .field("has_body_template", &self.body_template_source.is_some())
+            .field("has_body_template", &self.has_body_template)
             .finish()
     }
 }
@@ -520,19 +839,31 @@ mod tests {
     use super::*;
     use crate::template::RenderedMessage;
 
+    /// A prepared text without truncation nor distinct plain-text resend.
+    fn prepared(text: &str) -> Prepared {
+        Prepared {
+            text: text.to_string(),
+            truncated: false,
+            plain: None,
+        }
+    }
+
     fn sample_alert(title: &str, body: &str) -> AlertPayload {
         AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: title.to_string(),
                 body: body.to_string(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: "test_rule".to_string(),
             vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-04-14T10:00:00Z".to_string(),
             log_timestamp_formatted: "14/04/2026 10:00:00 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 
@@ -544,13 +875,136 @@ mod tests {
             disable_notification: None,
             disable_web_page_preview: None,
             body_template: None,
+            format: None,
+        }
+    }
+
+    /// Visible characters of a Telegram HTML text, counted independently of
+    /// [`truncate_text`]: tags removed, each entity one character.
+    fn visible_count(text: &str) -> usize {
+        let mut count = 0;
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // Output of `telegram_html` and of valerter's templates: a
+                // `<` always opens a tag, a `&` always an entity.
+                '<' => chars.by_ref().take_while(|c| *c != '>').for_each(drop),
+                '&' => {
+                    chars.by_ref().take_while(|c| *c != ';').for_each(drop);
+                    count += 1;
+                }
+                _ => count += 1,
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn html_truncation_closes_open_tags() {
+        let input = format!("<b>{}</b>", "x".repeat(5000));
+        let (out, truncated) = truncate_text(&input, true);
+        assert!(truncated);
+        assert_eq!(out, format!("<b>{}…</b>", "x".repeat(4095)));
+    }
+
+    #[test]
+    fn html_truncation_never_cuts_an_entity() {
+        let input = format!("{}&amp;&lt;{}", "a".repeat(4094), "b".repeat(100));
+        let (out, truncated) = truncate_text(&input, true);
+        assert!(truncated);
+        assert_eq!(out, format!("{}&amp;…", "a".repeat(4094)));
+    }
+
+    #[test]
+    fn html_truncation_does_not_count_tags_or_destinations() {
+        let input = format!(
+            "<a href=\"https://vl.example.com/{}\">logs</a>{}",
+            "q".repeat(3000),
+            "x".repeat(4000)
+        );
+        assert_eq!(truncate_text(&input, true), (input.clone(), false));
+        let exact = format!("<b>{}</b>", "&lt;".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS));
+        assert_eq!(truncate_text(&exact, true), (exact.clone(), false));
+    }
+
+    #[test]
+    fn html_truncation_of_code_blocks_and_malformed_text() {
+        let input = format!(
+            "<pre><code class=\"language-rust\">{}</code></pre>",
+            "x".repeat(5000)
+        );
+        let (out, _) = truncate_text(&input, true);
+        assert!(
+            out.ends_with("…</code></pre>"),
+            "{}",
+            &out[out.len() - 20..]
+        );
+        assert_eq!(visible_count(&out), TELEGRAM_TEXT_MAX_CODEPOINTS);
+
+        // A `<` without `>` is visible text (Telegram rejects it; the
+        // plain-text resend handles it).
+        let input = format!("a < b{}", "x".repeat(5000));
+        let (out, _) = truncate_text(&input, true);
+        assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(out.starts_with("a < bx"));
+
+        // An orphan closing tag is kept and closes nothing.
+        let input = format!("</i><b>{}", "x".repeat(5000));
+        let (out, _) = truncate_text(&input, true);
+        assert!(
+            out.starts_with("</i><b>x") && out.ends_with("x…</b>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn markdownv2_truncation_is_raw() {
+        let input = format!("*{}*", "x".repeat(5000));
+        let (out, truncated) = truncate_text(&input, false);
+        assert!(truncated);
+        assert_eq!(out, format!("*{}…", "x".repeat(4094)));
+    }
+
+    /// Long `telegram_html` renderings of random Markdown sources: the
+    /// truncated text is well formed, follows the nesting rules and counts
+    /// exactly the limit.
+    #[test]
+    fn html_truncation_of_rendered_bodies_is_well_formed() {
+        use crate::markdown::tests::{Rng, check_telegram, random_source};
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut checked = 0;
+        while checked < 2000 {
+            let source = random_source(&mut rng);
+            let once = crate::markdown::render(&source, &[], OutputFormat::TelegramHtml);
+            let per_copy = visible_count(&once);
+            if per_copy == 0 {
+                continue;
+            }
+            // Repeated as paragraphs: a well-formed rendering, cheaper than
+            // rendering the repeated source.
+            let copies = TELEGRAM_TEXT_MAX_CODEPOINTS / per_copy + 2;
+            let long = vec![once; copies].join("\n\n");
+            if visible_count(&long) <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+                continue;
+            }
+            let (out, truncated) = truncate_text(&long, true);
+            assert!(truncated);
+            if let Err(err) = check_telegram(&out) {
+                panic!("source {source:?}: {err}\n{out}");
+            }
+            assert_eq!(
+                visible_count(&out),
+                TELEGRAM_TEXT_MAX_CODEPOINTS,
+                "{source:?}"
+            );
+            checked += 1;
         }
     }
 
     #[test]
     fn truncate_text_leaves_short_text_alone() {
         let input = "hello";
-        let (out, was_truncated) = truncate_text(input);
+        let (out, was_truncated) = truncate_text(input, false);
         assert_eq!(out, "hello");
         assert!(!was_truncated);
     }
@@ -558,7 +1012,7 @@ mod tests {
     #[test]
     fn truncate_text_allows_exact_limit() {
         let input: String = "a".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS);
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
         assert!(!was_truncated);
     }
@@ -566,7 +1020,7 @@ mod tests {
     #[test]
     fn truncate_text_cuts_over_limit_to_exactly_4096_codepoints() {
         let input: String = "a".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 1);
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert!(was_truncated);
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
         assert!(out.ends_with('…'));
@@ -581,7 +1035,7 @@ mod tests {
             input.len() > TELEGRAM_TEXT_MAX_CODEPOINTS * 2,
             "input should be byte-heavy"
         );
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert!(was_truncated);
         // Limit is in codepoints, not bytes.
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
@@ -617,7 +1071,72 @@ mod tests {
         cfg.body_template = Some("{% broken %}".to_string());
         let err = TelegramNotifier::from_config("tg", &cfg, client).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidNotifier { .. }));
-        assert!(err.to_string().contains("body_template"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid notifier 'tg': body_template: "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_filter_in_body_template() {
+        let client = reqwest::Client::new();
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some("<b>{{ title | nosuchfilter }}</b>".to_string());
+        let msg = TelegramNotifier::from_config("tg", &cfg, client)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'tg': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn from_config_accepts_escaping_body_template() {
+        let client = reqwest::Client::new();
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template =
+            Some("<b>{{ title | e }}</b>\n{{ body | e }} {{ title | tojson }}".to_string());
+        assert!(TelegramNotifier::from_config("tg", &cfg, client).is_ok());
+    }
+
+    #[test]
+    fn normalize_parse_mode_returns_canonical_form() {
+        assert_eq!(normalize_parse_mode("html"), Some("HTML"));
+        assert_eq!(normalize_parse_mode("HTML"), Some("HTML"));
+        assert_eq!(normalize_parse_mode("markdownv2"), Some("MarkdownV2"));
+        assert_eq!(normalize_parse_mode("MARKDOWN"), Some("Markdown"));
+        assert_eq!(normalize_parse_mode("Markdown2"), None);
+        assert_eq!(normalize_parse_mode("markdown_v2"), None);
+        assert_eq!(normalize_parse_mode(""), None);
+    }
+
+    #[test]
+    fn from_config_stores_canonical_parse_mode() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.parse_mode = Some("markdownv2".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(notifier.parse_mode, "MarkdownV2");
+        cfg.parse_mode = Some("html".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(notifier.parse_mode, "HTML");
+    }
+
+    #[test]
+    fn from_config_rejects_unsupported_parse_mode() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.parse_mode = Some("Markdown2".to_string());
+        let msg = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(
+                "invalid notifier 'tg': parse_mode 'Markdown2' is not supported (expected HTML, MarkdownV2 or Markdown)"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -628,17 +1147,76 @@ mod tests {
         assert_eq!(notifier.name(), "tg");
         assert_eq!(notifier.notifier_type(), "telegram");
         assert_eq!(notifier.parse_mode, DEFAULT_PARSE_MODE);
-        assert!(notifier.body_template_source.is_none());
+        assert!(!notifier.has_body_template);
     }
 
     #[test]
     fn default_body_template_escapes_html() {
         let alert = sample_alert("<script>", "A & B");
-        let rendered = render_body_template(DEFAULT_BODY_TEMPLATE, &alert).unwrap();
+        let template = compile_body_template("tg", None).unwrap();
+        let rendered = render_body_template(&template, &alert, OutputFormat::TelegramHtml).unwrap();
         assert!(!rendered.contains("<script>"));
         assert!(rendered.contains("&lt;script&gt;"));
         assert!(rendered.contains("A &amp; B"));
         assert!(rendered.starts_with("<b>"));
+    }
+
+    #[test]
+    fn default_body_template_escapes_body() {
+        let template = compile_body_template("tg", None).unwrap();
+        let rendered = render_body_template(
+            &template,
+            &sample_alert("T", "a < b & c"),
+            OutputFormat::TelegramHtml,
+        )
+        .unwrap();
+        assert_eq!(rendered, "<b>T</b>\na &lt; b &amp; c");
+    }
+
+    #[test]
+    fn body_template_markup_with_escaped_log_fields() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some("<b>{{ title|e }}</b>\n<code>{{ log.host|e }}</code>".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("Disk", "body");
+        alert.log = AlertPayload::log_from_fields(&serde_json::json!({"host": "<web&01>"}));
+
+        let text = notifier.prepare_text(&alert).unwrap().text;
+
+        assert_eq!(text, "<b>Disk</b>\n<code>&lt;web&amp;01&gt;</code>");
+    }
+
+    #[test]
+    fn body_template_reads_log_fields_flat_and_unflattened() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template = Some(
+            "{{ log.host }}: {{ body }} {{ log[\"k8s.pod\"] }}|{{ log.k8s.pod }}|{{ log.missing }}|{{ log.rule_name }}"
+                .to_string(),
+        );
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("T", "disk full");
+        alert.log = AlertPayload::log_from_fields(
+            &serde_json::json!({"host": "web-01", "k8s.pod": "api-7f"}),
+        );
+
+        let text = notifier.prepare_text(&alert).unwrap().text;
+
+        assert_eq!(text, "web-01: disk full api-7f|api-7f||");
+    }
+
+    #[test]
+    fn from_config_accepts_valerter_filters_on_log_fields() {
+        let mut cfg = config_with(vec!["-100".to_string()]);
+        cfg.body_template =
+            Some("{{ log.host | mdv2_escape }} {{ log.msg | md_escape | upper }}".to_string());
+        let notifier = TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        let mut alert = sample_alert("T", "b");
+        alert.log =
+            AlertPayload::log_from_fields(&serde_json::json!({"host": "a.b", "msg": "x_y"}));
+
+        let text = notifier.prepare_text(&alert).unwrap().text;
+
+        assert_eq!(text, r"a\.b X\_Y");
     }
 
     #[test]
@@ -659,7 +1237,7 @@ mod tests {
         let payload = TelegramPayload {
             chat_id: "-100",
             text: "hello",
-            parse_mode: "HTML",
+            parse_mode: Some("HTML"),
             disable_notification: None,
             disable_web_page_preview: Some(true),
         };
@@ -781,6 +1359,36 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn configured_lowercase_parse_mode_is_sent_in_canonical_form() {
+        // `from_config` targets api.telegram.org: build the notifier from the
+        // configuration, then point it at wiremock (the Bot API endpoint is
+        // not configurable, so this cannot live in tests/integration_notify.rs).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/botTESTTOKEN/sendMessage"))
+            .and(body_partial_json(
+                serde_json::json!({ "parse_mode": "HTML" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_with(vec!["-100A".to_string()]);
+        cfg.parse_mode = Some("html".to_string());
+        let mut notifier =
+            TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        notifier.endpoint = SecretString::new(format!("{}/botTESTTOKEN/sendMessage", server.uri()));
+
+        notifier
+            .send(&sample_alert("hi", "body"))
+            .await
+            .expect("should succeed");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn send_all_chats_success_returns_ok() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -794,33 +1402,6 @@ mod tests {
         let alert = sample_alert("hi", "body");
         notifier.send(&alert).await.expect("should succeed");
 
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn send_partial_success_returns_ok_and_does_not_stop_after_failure() {
-        let server = MockServer::start().await;
-        // Every chat gets 200 — we verify the important property: 3 requests
-        // are issued in order even when the middle one hits a permanent error
-        // in a separate test. Here we first establish that the multi-chat
-        // fan-out reaches all chats.
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
-            .expect(3)
-            .mount(&server)
-            .await;
-
-        let notifier = test_notifier(
-            &server,
-            vec![
-                "-100A".to_string(),
-                "-100B".to_string(),
-                "-100C".to_string(),
-            ],
-        );
-        let alert = sample_alert("hi", "body");
-        notifier.send(&alert).await.expect("should succeed");
         server.verify().await;
     }
 
@@ -841,8 +1422,9 @@ mod tests {
                 if n == 0 {
                     ResponseTemplate::new(200).set_body_string("{\"ok\":true}")
                 } else {
-                    ResponseTemplate::new(400)
-                        .set_body_string("{\"ok\":false,\"description\":\"bad chat\"}")
+                    ResponseTemplate::new(400).set_body_string(
+                        "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}",
+                    )
                 }
             })
             .mount(&server)
@@ -862,8 +1444,8 @@ mod tests {
             .await
             .expect("partial success should be Ok");
 
-        // 1 success + 2 permanent failures = 3 requests. The failing chats are
-        // 4xx so there is no retry.
+        // 1 success + 2 permanent failures. `chat not found` is not a markup
+        // error: no plain-text resend, no retry: 1 + 2 = 3 requests.
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -873,9 +1455,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string("{\"ok\":false,\"description\":\"bad chat\"}"),
+                ResponseTemplate::new(400).set_body_string(
+                    "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}",
+                ),
             )
+            // One request per chat: `chat not found` is not resent.
             .expect(2)
             .mount(&server)
             .await;
@@ -993,6 +1577,248 @@ mod tests {
         server.verify().await;
     }
 
+    // ── Plain-text fallback on HTML rejection ────────────────────────────
+
+    /// Bot API body of a 400 caused by malformed HTML markup.
+    const ENTITY_ERROR_BODY: &str = "{\"ok\":false,\"error_code\":400,\"description\":\
+        \"Bad Request: can't parse entities: Unclosed start tag at byte offset 4090\"}";
+
+    /// Mount a responder answering the given `(status, body)` pairs in order
+    /// (the last one repeats) and return the notifier pointed at it.
+    async fn scripted_responses(
+        server: &MockServer,
+        responses: Vec<(u16, &'static str)>,
+        parse_mode: &str,
+    ) -> TelegramNotifier {
+        let calls = Arc::new(AtomicU32::new(0));
+        Mock::given(method("POST"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+                let (status, body) = responses[n.min(responses.len() - 1)];
+                ResponseTemplate::new(status).set_body_string(body)
+            })
+            .mount(server)
+            .await;
+        let mut notifier = test_notifier(server, vec!["-100A".to_string()]);
+        notifier.parse_mode = parse_mode.to_string();
+        notifier
+    }
+
+    /// Like [`scripted_responses`], with `{"ok":true}` for a 200 and a
+    /// realistic `can't parse entities` body for any other status.
+    async fn scripted_notifier(
+        server: &MockServer,
+        statuses: &'static [u16],
+        parse_mode: &str,
+    ) -> TelegramNotifier {
+        let responses: Vec<(u16, &'static str)> = statuses
+            .iter()
+            .map(|&status| {
+                (
+                    status,
+                    if status == 200 {
+                        "{\"ok\":true}"
+                    } else {
+                        ENTITY_ERROR_BODY
+                    },
+                )
+            })
+            .collect();
+        scripted_responses(server, responses, parse_mode).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_400_other_than_entity_parse_error_is_not_resent() {
+        for body in [
+            "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: chat not found\"}",
+            "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}",
+            "",
+            "not json",
+        ] {
+            let server = MockServer::start().await;
+            let responses = vec![(400, body), (200, "{\"ok\":true}")];
+            let notifier = scripted_responses(&server, responses, "HTML").await;
+
+            let err = notifier
+                .send_to_chat(&sample_alert("hi", "body"), "-100A", &prepared("text"))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(&err, NotifyError::SendFailed(msg) if msg == "client error: 400 Bad Request"),
+                "{body}: unexpected error: {err:?}"
+            );
+            assert_eq!(request_bodies(&server).await.len(), 1, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn entity_parse_error_is_matched_case_insensitively() {
+        let server = MockServer::start().await;
+        let notifier = scripted_responses(
+            &server,
+            vec![
+                (
+                    400,
+                    "{\"ok\":false,\"error_code\":400,\"description\":\
+                     \"Bad Request: Can't Parse Entities: unsupported start tag\"}",
+                ),
+                (200, "{\"ok\":true}"),
+            ],
+            "HTML",
+        )
+        .await;
+
+        notifier.send(&sample_alert("hi", "body")).await.unwrap();
+
+        assert_eq!(request_bodies(&server).await.len(), 2);
+    }
+
+    async fn request_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_400_is_resent_once_as_plain_text() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&sample_alert("hi", "a < b"))
+            .await
+            .expect("plain-text resend should succeed");
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[0]["text"], bodies[1]["text"]);
+        assert_eq!(bodies[0]["chat_id"], bodies[1]["chat_id"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_parse_mode_is_matched_case_insensitively() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "html").await;
+
+        notifier.send(&sample_alert("hi", "body")).await.unwrap();
+
+        assert_eq!(request_bodies(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plain_text_resend_rejected_fails_chat() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 400], "HTML").await;
+
+        let err = notifier
+            .send_to_chat(&sample_alert("hi", "body"), "-100A", &prepared("text"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, NotifyError::SendFailed(msg) if msg == "client error: 400 Bad Request"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(request_bodies(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn markdown_400_is_not_resent() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "MarkdownV2").await;
+
+        assert!(notifier.send(&sample_alert("hi", "body")).await.is_err());
+        assert_eq!(request_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn html_403_is_not_resent() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[403, 200], "HTML").await;
+
+        assert!(notifier.send(&sample_alert("hi", "body")).await.is_err());
+        assert_eq!(request_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plain_text_resend_follows_retry_policy() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 500, 200], "HTML").await;
+
+        notifier
+            .send(&sample_alert("hi", "body"))
+            .await
+            .expect("resend should be retried after 5xx");
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert!(bodies[2].get("parse_mode").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn truncated_html_rejected_is_delivered_as_plain_text() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let bodies = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let mut notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+                notifier.set_body_template_for_tests(Some("<pre>{{ body }}</pre>"));
+                let long_body = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 100);
+
+                notifier
+                    .send(&sample_alert("hi", &long_body))
+                    .await
+                    .expect("plain-text resend should deliver the alert");
+                request_bodies(&server).await
+            })
+        });
+
+        assert_eq!(bodies.len(), 2);
+        // The `<pre>` is closed after the cut; the text of a `text` template
+        // is resent as is.
+        let text = bodies[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("<pre>"));
+        assert!(text.ends_with("…</pre>"));
+        assert_eq!(visible_count(text), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], bodies[0]["text"]);
+
+        let rendered = handle.render();
+        let truncated: Vec<_> = rendered
+            .lines()
+            .filter(|l| l.starts_with("valerter_alerts_truncated_total{"))
+            .collect();
+        assert_eq!(
+            truncated,
+            vec![
+                "valerter_alerts_truncated_total{notifier_type=\"telegram\",notifier_name=\"tg-test\"} 1"
+            ]
+        );
+    }
+
     // ── Imports for the wiremock tests (kept near the tests to minimize
     //    churn in the rest of the module).
     use std::sync::Arc;
@@ -1102,7 +1928,7 @@ mod tests {
         cfg.body_template = Some("".to_string());
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let alert = sample_alert("Disk full", "");
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert!(!text.trim().is_empty(), "fallback text must not be empty");
         assert_eq!(text, "<b>Disk full</b>");
     }
@@ -1115,7 +1941,7 @@ mod tests {
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let mut alert = sample_alert("", "");
         alert.rule_name = "nginx-5xx".to_string();
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert_eq!(text, "Alert: nginx-5xx");
     }
 
@@ -1125,7 +1951,373 @@ mod tests {
         let cfg = config_with(vec!["-100".to_string()]);
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let alert = sample_alert("hello", "world");
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert_eq!(text, "<b>hello</b>\nworld");
+    }
+
+    // ── Per-alert counting ──────────────────────────────────────────────
+
+    /// Send one alert to `chat_ids` against a server answering `statuses`
+    /// per request (the last one repeats), under a local recorder. Returns
+    /// the result, the number of requests and the rendering.
+    fn send_counted(
+        chat_ids: &[&str],
+        statuses: &'static [u16],
+        body_template: Option<&str>,
+    ) -> (Result<(), NotifyError>, usize, String) {
+        use crate::notify::test_metrics::run_with_recorder;
+
+        let ((result, requests), rendered) = run_with_recorder(|| async {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicU32::new(0));
+            Mock::given(method("POST"))
+                .respond_with(move |_req: &wiremock::Request| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+                    let status = statuses[n.min(statuses.len() - 1)];
+                    ResponseTemplate::new(status).set_body_string(match status {
+                        200 => "{\"ok\":true}",
+                        400 => ENTITY_ERROR_BODY,
+                        _ => "{\"ok\":false,\"description\":\"Forbidden\"}",
+                    })
+                })
+                .mount(&server)
+                .await;
+            let mut notifier =
+                test_notifier(&server, chat_ids.iter().map(|c| c.to_string()).collect());
+            notifier.set_body_template_for_tests(body_template);
+            let result = notifier.send(&sample_alert("hi", "body")).await;
+            (result, server.received_requests().await.unwrap().len())
+        });
+        (result, requests, rendered)
+    }
+
+    #[test]
+    #[serial]
+    fn partial_success_counts_alert_once_and_failed_chat() {
+        use crate::notify::test_metrics::counter_total;
+
+        // Chat A succeeds, chat B gets a 403 (not resent as plain text).
+        let (result, _, rendered) = send_counted(&["-100A", "-100B"], &[200, 403], None);
+
+        assert!(result.is_ok());
+        for series in [
+            "valerter_alerts_sent_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+            "valerter_telegram_chat_errors_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "missing `{series}` in:\n{rendered}"
+            );
+        }
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 0);
+        assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn three_successful_chats_count_one_sent_alert() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, requests, rendered) = send_counted(&["-100A", "-100B", "-100C"], &[200], None);
+
+        assert!(result.is_ok());
+        assert_eq!(requests, 3);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 1);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn plain_text_resend_success_is_not_a_failure() {
+        use crate::notify::test_metrics::counter_total;
+
+        // HTML rejected with 400, then delivered as plain text.
+        let (result, requests, rendered) = send_counted(&["-100A"], &[400, 200], None);
+
+        assert!(result.is_ok());
+        assert_eq!(requests, 2);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 1);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn total_failure_counts_each_chat_and_one_failed_alert() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, _, rendered) = send_counted(&["-100A", "-100B"], &[403], None);
+
+        match result {
+            Err(NotifyError::SendFailed(m)) => assert_eq!(m, "all chat_ids failed"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            2
+        );
+        for series in [
+            "valerter_notify_errors_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+            "valerter_alerts_failed_total{rule_name=\"test_rule\",vl_source=\"vlprod\",notifier_name=\"tg-test\",notifier_type=\"telegram\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "missing `{series}` in:\n{rendered}"
+            );
+        }
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn render_failure_at_send_is_counted_and_sends_nothing() {
+        use crate::notify::test_metrics::counter_total;
+
+        let (result, requests, rendered) = send_counted(
+            &["-100A", "-100B"],
+            &[200],
+            Some("{{ body | no_such_filter }}"),
+        );
+
+        assert!(
+            matches!(result, Err(NotifyError::TemplateError(_))),
+            "unexpected result: {result:?}"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.starts_with("template error: "), "{message}");
+        assert_eq!(requests, 0, "no sendMessage request may be issued");
+        assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 1);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 1);
+        assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+        assert_eq!(
+            counter_total(&rendered, "valerter_telegram_chat_errors_total"),
+            0
+        );
+    }
+
+    // ── Markdown bodies (markdown-body-format) ───────────────────────────
+
+    fn markdown_alert(title: &str, body: &str, fields: serde_json::Value) -> AlertPayload {
+        AlertPayload {
+            message: crate::template::render_test_message(
+                title,
+                body,
+                crate::config::BodyFormat::Markdown,
+                &fields,
+            ),
+            ..sample_alert("", "")
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn markdown_body_with_default_template() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[200], "HTML").await;
+
+        notifier
+            .send(&markdown_alert(
+                "Disk",
+                "**{{ host }}** < 10%",
+                serde_json::json!({"host": "a_b"}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies[0]["text"], "<b>Disk</b>\n<b>a_b</b> &lt; 10%");
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn markdown_body_in_markdownv2_is_plain_text() {
+        let server = MockServer::start().await;
+        let mut cfg = config_with(vec!["-100A".to_string()]);
+        cfg.parse_mode = Some("MarkdownV2".to_string());
+        cfg.body_template = Some("{{ body | mdv2_escape }}".to_string());
+        let mut notifier =
+            TelegramNotifier::from_config("tg", &cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(notifier.output_format(), OutputFormat::Plain);
+        notifier.endpoint = SecretString::new(format!("{}/botTESTTOKEN/sendMessage", server.uri()));
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+            .mount(&server)
+            .await;
+
+        notifier
+            .send(&markdown_alert(
+                "t",
+                "**{{ v }}**",
+                serde_json::json!({"v": 1.5}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies[0]["text"], r"1\.5");
+        assert_eq!(bodies[0]["parse_mode"], "MarkdownV2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn text_body_with_default_template_is_unchanged() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[200], "HTML").await;
+
+        notifier
+            .send(&sample_alert("Disk", "**a_b** < 10%"))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies[0]["text"], "<b>Disk</b>\n**a_b** &lt; 10%");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn long_markdown_body_is_truncated_as_html() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[200], "HTML").await;
+        let long = format!(
+            "{}end",
+            "x <y> & z ".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS / 5)
+        );
+
+        notifier
+            .send(&markdown_alert(
+                "t",
+                "**{{ v }}** `c`\n\n> {{ v }}",
+                serde_json::json!({"v": long}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let text = bodies[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("<b>t</b>\n<b>x &lt;y&gt; &amp; z"),
+            "{text}"
+        );
+        assert!(text.ends_with("…</b>"), "{text}");
+        assert_eq!(visible_count(text), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        if let Err(err) = crate::markdown::tests::check_telegram(text) {
+            panic!("{err}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_is_resent_as_its_plain_rendering() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+        let long = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS);
+
+        notifier
+            .send(&markdown_alert(
+                "t",
+                "**{{ v }}**",
+                serde_json::json!({"v": long}),
+            ))
+            .await
+            .expect("plain-text resend should deliver the alert");
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        let plain = bodies[1]["text"].as_str().unwrap();
+        let expected: String = format!("t\n{long}")
+            .chars()
+            .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
+            .chain(['…'])
+            .collect();
+        assert_eq!(plain, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_resend_has_no_markup() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&markdown_alert(
+                "Disk",
+                "**{{ host }}** < 10%",
+                serde_json::json!({"host": "a_b"}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies[0]["text"], "<b>Disk</b>\n<b>a_b</b> &lt; 10%");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], "Disk\na_b < 10%");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_with_long_plain_rendering() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&markdown_alert(
+                "",
+                "{{ v }}",
+                serde_json::json!({"v": "é".repeat(5000)}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        let plain = bodies[1]["text"].as_str().unwrap();
+        assert_eq!(plain.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(plain.starts_with("éé"), "no title, no line break");
+        assert!(plain.ends_with('…'));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_text_alert_is_resent_unchanged() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier.send(&sample_alert("Disk", "a < b")).await.unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], bodies[0]["text"]);
+    }
+
+    #[test]
+    fn markdown_fallback_message_is_escaped_by_the_default_template() {
+        let mut alert = sample_alert("", "");
+        alert.message = crate::template::TemplateEngine::new(std::collections::HashMap::from([(
+            "t".to_string(),
+            crate::config::CompiledTemplate {
+                title: "T".to_string(),
+                body: "{{ x | nosuchfilter }}".to_string(),
+                email_body_html: None,
+                accent_color: None,
+                body_format: crate::config::BodyFormat::Markdown,
+            },
+        )]))
+        .render_with_fallback("t", &serde_json::json!({}), "r", "vl");
+        alert.message.body.push_str(" <x> **y**");
+
+        let template = compile_body_template("tg", None).unwrap();
+        let text = render_body_template(&template, &alert, OutputFormat::TelegramHtml).unwrap();
+        assert!(text.contains("Template render failed"), "{text}");
+        assert!(text.ends_with("&lt;x&gt; **y**"), "{text}");
     }
 }

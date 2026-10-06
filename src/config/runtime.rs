@@ -2,7 +2,8 @@
 
 use super::notifiers::NotifiersConfig;
 use super::types::{
-    Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig, VlSourceConfig,
+    BodyFormat, Config, DefaultsConfig, JsonParserConfig, MetricsConfig, NotifyConfig,
+    VlSourceConfig,
 };
 use crate::error::ConfigError;
 use regex::Regex;
@@ -63,6 +64,7 @@ pub struct CompiledTemplate {
     pub body: String,
     pub email_body_html: Option<String>,
     pub accent_color: Option<String>,
+    pub body_format: BodyFormat,
 }
 
 impl RuntimeConfig {
@@ -157,6 +159,7 @@ impl Config {
                         body: template.body,
                         email_body_html: template.email_body_html,
                         accent_color: template.accent_color,
+                        body_format: template.body_format,
                     },
                 )
             })

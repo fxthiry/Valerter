@@ -1,6 +1,6 @@
 [package]
 name = "valerter"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2024"
 description = "Real-time log alerting for VictoriaLogs"
 license = "Apache-2.0"
@@ -26,7 +26,9 @@ urlencoding = "2.1"
 
 # Parsing & Templating
 regex = "1.12"
-minijinja = { version = "2.12", features = ["builtins", "json"] }
+minijinja = { version = "2.12", features = ["builtins", "json", "urlencode"] }
+# Markdown bodies (`body_format: markdown`): parsed, then rendered per notifier.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 # Caching/Throttle
 moka = { version = "0.12", features = ["sync"] }
@@ -57,6 +59,7 @@ chrono-tz = "0.10"
 
 [dev-dependencies]
 wiremock = "0.6"
+tokio = { version = "1.48", features = ["test-util"] }
 tokio-test = "0.4"
 portpicker = "0.1"
 serial_test = "3.2"

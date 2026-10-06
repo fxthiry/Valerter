@@ -12,7 +12,7 @@ The [`config.yaml`](config.yaml) file defines 2 sources and 3 rules covering the
 | `staging_deploy_failures`  | `[staging]`          | `(rule, staging)`        | Pin a rule to another backend   |
 | `auth_failures_all_envs`   | (omitted)            | `(rule, prod)` + `(rule, staging)` | Fan out across every source |
 
-Each `(rule, source)` pair runs as an isolated task with its own throttle bucket (default key: `{rule}-{source}:global`) and per-source reconnect with `±10%` jitter. A flapping `staging` backend does not stop alerts on `prod`.
+Each `(rule, source)` pair runs as an isolated task with per-source reconnect with `±10%` jitter. A flapping `staging` backend does not stop alerts on `prod`. The throttle cache is shared by a rule's sources, but the default key `{rule}-{source}:global` contains the source name, so each source still gets its own bucket. A custom `throttle.key` without `{{ vl_source }}` (e.g. `{{ rule_name }}`) dedups the rule's alerts across sources instead.
 
 ## Source Name Constraints
 
@@ -29,9 +29,9 @@ Source names must match `^[a-zA-Z0-9_]+$` (alphanumeric or underscore only). No 
 export VL_PROD_USER="prod_user"
 export VL_PROD_PASS="prod_password"
 
-# Edit webhook_url in config.yaml to point at your real Mattermost hook
-# (--validate parses webhook_url as a URL, so it must be valid at validate time;
-#  ${WEBHOOK_URL} expansion is fine for runtime but not for `--validate`).
+# Edit webhook_url in config.yaml to point at your real Mattermost hook.
+# `webhook_url: "${WEBHOOK_URL}"` works too, but WEBHOOK_URL must then be
+# exported before `--validate`, which builds every notifier.
 
 # Validate the config
 valerter --validate -c examples/multi-source/config.yaml

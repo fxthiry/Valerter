@@ -3,7 +3,7 @@
 //! Spins up **two** wiremock `MockServer` instances to stand in for two
 //! VictoriaLogs sources (`vlprod`, `vldev`), serves distinct fixture events
 //! on each, runs `RuleEngine` against the pair, and inspects the alert
-//! payloads arriving on the notification queue to prove:
+//! payloads delivered through the notification queue to prove:
 //!
 //! 1. A rule with `vl_sources: [vlprod]` spawns exactly one task and its
 //!    payloads carry `vl_source == "vlprod"`.
@@ -14,6 +14,8 @@
 //! 4. Per-source default throttle buckets are isolated: two sources sending
 //!    identical events both pass through on first delivery rather than the
 //!    second being dropped as a duplicate.
+//! 5. The throttle cache is shared by a rule's sources: a custom key without
+//!    `vl_source` dedups across them, one with `vl_source` keeps them apart.
 //!
 //! The fixture corpus from `tests/fixtures/vl_events/` (chore/vl-fixtures-corpus)
 //! is consumed via `common::vl_events::load_fixture`.
@@ -25,17 +27,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use valerter::config::{
-    CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, JsonParserConfig,
-    MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    CompiledParser, CompiledRule, CompiledTemplate, CompiledThrottle, DefaultsConfig,
+    JsonParserConfig, MetricsConfig, NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
 };
-use valerter::notify::{AlertPayload, NotificationQueue};
+use valerter::notify::AlertPayload;
 use valerter::{RuleEngine, TemplateEngine};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use common::recording::RecordingDelivery;
 use common::vl_events::load_fixture;
 
 /// Re-serialize a JSON fixture (which in the corpus is a single object) into
@@ -103,6 +105,7 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
             body: "source={{ vl_source }} msg={{ _msg }}".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
 
@@ -125,28 +128,6 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
     }
 }
 
-/// Collect up to `max` alerts from a pre-created receiver within `deadline`,
-/// returning whatever arrived. Using a receiver created BEFORE the engine
-/// spawns avoids the broadcast channel's "messages before subscribe are lost"
-/// behaviour (see tokio::sync::broadcast docs).
-async fn drain_from(
-    rx: &mut broadcast::Receiver<AlertPayload>,
-    max: usize,
-    deadline: Duration,
-) -> Vec<AlertPayload> {
-    let mut out = Vec::new();
-    let _ = tokio::time::timeout(deadline, async {
-        while out.len() < max {
-            match rx.recv().await {
-                Ok(p) => out.push(p),
-                Err(_) => break,
-            }
-        }
-    })
-    .await;
-    out
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_source_rule_with_vl_sources_list_targets_single_source() {
     let vlprod = MockServer::start().await;
@@ -166,24 +147,23 @@ async fn multi_source_rule_with_vl_sources_list_targets_single_source() {
     // via this rule.
     let rules = vec![rule("prod_only", vec!["vlprod".to_string()])];
 
-    let queue = NotificationQueue::new(64);
-    // Subscribe BEFORE spawning the engine so no payloads are lost.
-    let mut rx = queue.subscribe();
+    let mut delivery = RecordingDelivery::start(&["dest"]);
 
     let cfg = runtime(sources, rules);
-    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
 
-    let alerts = drain_from(&mut rx, 1, Duration::from_secs(3)).await;
+    let alerts = delivery.drain(1, Duration::from_secs(3)).await;
     // Negative-evidence proof: vldev MUST NOT have served any tail request,
     // since the only rule is pinned to vlprod. Catches regressions where the
     // resolve_sources filter is bypassed and the rule fans out anyway.
     let vldev_hits = vldev.received_requests().await.unwrap_or_default();
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    delivery.shutdown().await;
 
     assert!(
         !alerts.is_empty(),
@@ -224,10 +204,9 @@ async fn multi_source_rule_without_vl_sources_fans_out_across_all() {
     // vl_sources empty = fan out across all sources.
     let rules = vec![rule("fan_out", Vec::new())];
 
-    let queue = NotificationQueue::new(64);
-    let mut rx = queue.subscribe();
+    let mut delivery = RecordingDelivery::start(&["dest"]);
     let cfg = runtime(sources, rules);
-    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -235,9 +214,10 @@ async fn multi_source_rule_without_vl_sources_fans_out_across_all() {
 
     // Drain a fixed time window with a high `max` so we don't exit before
     // the slower of the two parallel source tasks delivers its first alert.
-    let alerts = drain_from(&mut rx, 200, Duration::from_secs(2)).await;
+    let alerts = delivery.drain(200, Duration::from_secs(2)).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    delivery.shutdown().await;
 
     let mut sources_seen: std::collections::HashSet<String> = Default::default();
     for a in &alerts {
@@ -260,8 +240,9 @@ async fn multi_source_rule_without_vl_sources_fans_out_across_all() {
 async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
     // The same event delivered twice on two different sources must not be
     // deduped as a single bucket when the rule uses the default throttle
-    // (no custom key). The default key is `{rule}-{source}:global`, so
-    // each source has its own bucket and both alerts should land.
+    // (no custom key). The throttle cache is shared by the rule's sources,
+    // but the default key `{rule}-{source}:global` differs per source, so
+    // each source counts in its own bucket and both alerts should land.
     let vlprod = MockServer::start().await;
     let vldev = MockServer::start().await;
 
@@ -274,26 +255,26 @@ async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
     sources.insert("vlprod".to_string(), vl_source(&vlprod.uri()));
     sources.insert("vldev".to_string(), vl_source(&vldev.uri()));
 
-    // Tight throttle count=1: if buckets were shared the second source
-    // would be blocked.
+    // Tight throttle count=1: if both sources rendered the same key the
+    // second one would be blocked.
     let mut cfg = runtime(sources, vec![rule("isolate", Vec::new())]);
     cfg.defaults.throttle.count = 1;
 
-    let queue = NotificationQueue::new(64);
-    let mut rx = queue.subscribe();
-    let engine = RuleEngine::new(cfg, reqwest::Client::new(), queue.clone());
+    let mut delivery = RecordingDelivery::start(&["dest"]);
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
 
     // Drain for a fixed window long enough for both sources' first stream
-    // to land. With throttle count=1 each (rule, source) bucket allows only
-    // one alert through, but both buckets are independent so both deliver.
+    // to land. With throttle count=1 each per-source key allows only one
+    // alert through, but the two keys are distinct so both sources deliver.
     // Use a high `max` so we don't exit early before both sources land.
-    let alerts = drain_from(&mut rx, 100, Duration::from_secs(2)).await;
+    let alerts = delivery.drain(100, Duration::from_secs(2)).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    delivery.shutdown().await;
 
     let sources_seen: std::collections::HashSet<String> =
         alerts.iter().map(|a| a.vl_source.clone()).collect();
@@ -302,6 +283,76 @@ async fn multi_source_default_throttle_buckets_are_isolated_per_source() {
         sources_seen.contains("vlprod") && sources_seen.contains("vldev"),
         "per-source default throttle buckets must be isolated; saw: {:?} (alerts: {})",
         sources_seen,
+        alerts.len()
+    );
+}
+
+/// Run a fan-out rule with the given throttle key and `count: 1` against two
+/// sources serving the same event, and return the alerts drained.
+async fn run_shared_event_with_throttle_key(rule_name: &str, key: &str) -> Vec<AlertPayload> {
+    let vlprod = MockServer::start().await;
+    let vldev = MockServer::start().await;
+
+    let ev = load_fixture("nginx_http_500.json");
+    mount_ndjson(&vlprod, &[&ev]).await;
+    mount_ndjson(&vldev, &[&ev]).await;
+
+    let mut sources = BTreeMap::new();
+    sources.insert("vlprod".to_string(), vl_source(&vlprod.uri()));
+    sources.insert("vldev".to_string(), vl_source(&vldev.uri()));
+
+    // Long window: the mocks re-serve the event on every reconnection, all
+    // of which must land in the same window.
+    let mut r = rule(rule_name, Vec::new());
+    r.throttle = Some(CompiledThrottle {
+        key_template: Some(key.to_string()),
+        count: 1,
+        window: Duration::from_secs(3600),
+    });
+    let cfg = runtime(sources, vec![r]);
+
+    let mut delivery = RecordingDelivery::start(&["dest"]);
+    let engine = RuleEngine::new(cfg, reqwest::Client::new(), delivery.queue.clone());
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
+
+    // Fixed drain window with a high `max`: we must observe that no extra
+    // alert arrives, not just that the first one did.
+    let alerts = delivery.drain(100, Duration::from_secs(2)).await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    delivery.shutdown().await;
+    alerts
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_source_rule_name_key_dedups_across_sources() {
+    // `{{ rule_name }}` renders the same key on both sources, and the rule's
+    // throttle cache is shared: only the first event of either source passes.
+    let alerts = run_shared_event_with_throttle_key("dedup", "{{ rule_name }}").await;
+
+    let sources: Vec<&str> = alerts.iter().map(|a| a.vl_source.as_str()).collect();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "a key shared across sources must dedup to one alert; got sources {:?}",
+        sources
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_source_vl_source_key_isolates_sources() {
+    // Adding `{{ vl_source }}` to the key gives each source its own counter.
+    let alerts =
+        run_shared_event_with_throttle_key("isolate_key", "{{ vl_source }}-{{ _msg }}").await;
+
+    let count = |source: &str| alerts.iter().filter(|a| a.vl_source == source).count();
+    assert_eq!(
+        (count("vlprod"), count("vldev")),
+        (1, 1),
+        "a key with vl_source must let exactly one alert per source through (alerts: {})",
         alerts.len()
     );
 }
@@ -328,21 +379,21 @@ async fn multi_source_event_field_named_vl_source_is_masked_by_synthetic() {
 
     let rules = vec![rule("collision", Vec::new())];
 
-    let queue = NotificationQueue::new(64);
-    let mut rx = queue.subscribe();
+    let mut delivery = RecordingDelivery::start(&["dest"]);
     let engine = RuleEngine::new(
         runtime(sources, rules),
         reqwest::Client::new(),
-        queue.clone(),
+        delivery.queue.clone(),
     );
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { engine.run(cancel_clone).await });
 
-    let alerts = drain_from(&mut rx, 1, Duration::from_secs(3)).await;
+    let alerts = delivery.drain(1, Duration::from_secs(3)).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    delivery.shutdown().await;
 
     assert!(!alerts.is_empty(), "expected at least one alert");
     for a in &alerts {
@@ -378,6 +429,7 @@ async fn template_engine_renders_vl_source_directly_without_http() {
             body: "b".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
     let engine = Arc::new(TemplateEngine::new(templates));

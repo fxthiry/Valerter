@@ -45,8 +45,8 @@ notifiers:
   mattermost-ops:
     type: mattermost
     # Replace with your real webhook. Environment variables (e.g.
-    # `webhook_url: "${WEBHOOK_URL}"`) work too, but `--validate` parses the
-    # raw string as a URL so it must be valid at validate time.
+    # `webhook_url: "${WEBHOOK_URL}"`) work too, but the variable must be
+    # defined when running `--validate`, which builds every notifier.
     webhook_url: "https://mattermost.example.com/hooks/your-webhook-id"
     username: "Valerter"
 
@@ -92,8 +92,9 @@ rules:
 
   # ── Rule 3: fan-out across all sources (no vl_sources) ────────────────────
   # Spawns one task per source: (auth_failures_all_envs, prod) and
-  # (auth_failures_all_envs, staging). Each task carries its own throttle
-  # bucket via the default `{rule}-{source}:global` key.
+  # (auth_failures_all_envs, staging). The rule's throttle cache is shared by
+  # both tasks, but the default `{rule}-{source}:global` key gives each source
+  # its own bucket. Set `throttle.key: "{{ rule_name }}"` to dedup across them.
   - name: auth_failures_all_envs
     query: '_msg:"authentication failed"'
     parser:

@@ -2,11 +2,13 @@
 //!
 //! Uses wiremock to simulate VictoriaLogs tail endpoint behavior.
 
-use std::sync::Arc;
+mod common;
+
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use valerter::error::StreamError;
+use common::logs::capture_logs;
 use valerter::tail::{
     BACKOFF_BASE, BACKOFF_MAX, ReconnectCallback, TailClient, TailConfig, backoff_delay,
     log_reconnection_attempt, log_reconnection_success,
@@ -23,6 +25,54 @@ fn create_config(mock_server: &MockServer, query: &str) -> TailConfig {
         basic_auth: None,
         headers: None,
         tls: None,
+    }
+}
+
+/// What `stream_with_reconnect` produced during its first connection.
+struct FirstConnection {
+    lines: Vec<String>,
+    /// Logs (DEBUG and above) written meanwhile.
+    logs: String,
+}
+
+/// Runs `stream_with_reconnect` until its first connection ends, collecting
+/// the lines it delivered and the logs. The end is detected by the log written
+/// right before the reconnection delay (`Stream ended, reconnecting` after a
+/// clean EOF, `Connection failed, retrying` after a failure), so no second
+/// connection is ever made.
+async fn first_connection(client: &mut TailClient) -> FirstConnection {
+    let (logs, _guard) = capture_logs(tracing::Level::DEBUG);
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    let stream = client.stream_with_reconnect("test_rule", "default", None, move |line| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().unwrap().push(line);
+            Ok(())
+        }
+    });
+    let ended = async {
+        loop {
+            let text = logs.text();
+            if text.contains("Stream ended, reconnecting")
+                || text.contains("Connection failed, retrying")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        result = stream => panic!("stream_with_reconnect returned: {result:?}"),
+        () = ended => {}
+        () = tokio::time::sleep(Duration::from_secs(10)) => {
+            panic!("first connection did not end within 10s:\n{}", logs.text())
+        }
+    }
+    let lines = std::mem::take(&mut *lines.lock().unwrap());
+    FirstConnection {
+        lines,
+        logs: logs.text(),
     }
 }
 
@@ -53,10 +103,7 @@ async fn test_streaming_basic_single_line() {
     let config = create_config(&mock_server, "_stream:test");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("test log"));
@@ -83,10 +130,7 @@ async fn test_streaming_multiple_lines() {
     let config = create_config(&mock_server, "_stream:multi");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 3);
     assert!(lines[0].contains("log 1"));
@@ -107,10 +151,7 @@ async fn test_streaming_empty_response() {
     let config = create_config(&mock_server, "_stream:empty");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert!(lines.is_empty());
 }
@@ -132,15 +173,12 @@ async fn test_connection_error_http_500() {
     let config = create_config(&mock_server, "_stream:error");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule", "default").await;
+    let logs = first_connection(&mut client).await.logs;
 
-    assert!(result.is_err());
-    match result {
-        Err(StreamError::ConnectionFailed(msg)) => {
-            assert!(msg.contains("500"));
-        }
-        _ => panic!("Expected ConnectionFailed error"),
-    }
+    // The failure is logged and the client backs off to reconnect.
+    assert!(logs.contains("HTTP error from VictoriaLogs"), "{logs}");
+    assert!(logs.contains("status=500"), "{logs}");
+    assert!(logs.contains("Connection failed, retrying"), "{logs}");
 }
 
 #[tokio::test]
@@ -156,15 +194,12 @@ async fn test_connection_error_http_404() {
     let config = create_config(&mock_server, "_stream:notfound");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule", "default").await;
+    let logs = first_connection(&mut client).await.logs;
 
-    assert!(result.is_err());
-    match result {
-        Err(StreamError::ConnectionFailed(msg)) => {
-            assert!(msg.contains("404"));
-        }
-        _ => panic!("Expected ConnectionFailed error"),
-    }
+    // The failure is logged and the client backs off to reconnect.
+    assert!(logs.contains("HTTP error from VictoriaLogs"), "{logs}");
+    assert!(logs.contains("status=404"), "{logs}");
+    assert!(logs.contains("Connection failed, retrying"), "{logs}");
 }
 
 #[tokio::test]
@@ -180,15 +215,12 @@ async fn test_connection_error_http_503() {
     let config = create_config(&mock_server, "_stream:unavailable");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule", "default").await;
+    let logs = first_connection(&mut client).await.logs;
 
-    assert!(result.is_err());
-    match result {
-        Err(StreamError::ConnectionFailed(msg)) => {
-            assert!(msg.contains("503"));
-        }
-        _ => panic!("Expected ConnectionFailed error"),
-    }
+    // The failure is logged and the client backs off to reconnect.
+    assert!(logs.contains("HTTP error from VictoriaLogs"), "{logs}");
+    assert!(logs.contains("status=503"), "{logs}");
+    assert!(logs.contains("Connection failed, retrying"), "{logs}");
 }
 
 #[tokio::test]
@@ -205,47 +237,11 @@ async fn test_connection_error_server_down() {
 
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule", "default").await;
+    let logs = first_connection(&mut client).await.logs;
 
-    assert!(result.is_err());
-    match result {
-        Err(StreamError::ConnectionFailed(_)) => {}
-        _ => panic!("Expected ConnectionFailed error"),
-    }
-}
-
-// =============================================================================
-// Test 8.4: Timeout on zombie connection (read timeout)
-// =============================================================================
-
-#[tokio::test]
-async fn test_timeout_detection() {
-    let mock_server = MockServer::start().await;
-
-    // Configure a delayed response that exceeds read timeout
-    // Note: In real tests, we'd want to test actual timeout behavior,
-    // but wiremock doesn't easily support streaming delays.
-    // Instead, we test the timeout mapping in error handling.
-    Mock::given(method("GET"))
-        .and(path("/select/logsql/tail"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(b"incomplete", "application/x-ndjson")
-                .set_delay(Duration::from_millis(100)), // Short delay for test
-        )
-        .mount(&mock_server)
-        .await;
-
-    let config = create_config(&mock_server, "_stream:delay");
-    let mut client = TailClient::new(config).unwrap();
-
-    // This won't actually timeout since delay is short, but tests the path
-    let result = client.connect_and_receive("test_rule", "default").await;
-
-    // Should succeed (data received before timeout)
-    // The buffer will hold "incomplete" without newline
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_empty()); // No complete lines
+    // The failure is logged and the client backs off to reconnect.
+    assert!(logs.contains("Connection failed"), "{logs}");
+    assert!(logs.contains("Connection failed, retrying"), "{logs}");
 }
 
 // =============================================================================
@@ -296,7 +292,7 @@ async fn test_url_construction_is_correct() {
     };
 
     let mut client = TailClient::new(config).unwrap();
-    let _ = client.connect_and_receive("test_rule", "default").await;
+    first_connection(&mut client).await;
 
     // If we get here without panic, the URL matched
 }
@@ -324,7 +320,7 @@ async fn test_url_with_start_param() {
     };
 
     let mut client = TailClient::new(config).unwrap();
-    let _ = client.connect_and_receive("test_rule", "default").await;
+    first_connection(&mut client).await;
 }
 
 // =============================================================================
@@ -347,7 +343,7 @@ async fn test_headers_are_set_correctly() {
     let config = create_config(&mock_server, "_stream:headers");
     let mut client = TailClient::new(config).unwrap();
 
-    let _ = client.connect_and_receive("test_rule", "default").await;
+    first_connection(&mut client).await;
 }
 
 // =============================================================================
@@ -374,10 +370,7 @@ async fn test_streaming_with_utf8_content() {
     let config = create_config(&mock_server, "_stream:utf8");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("Café"));
@@ -610,10 +603,7 @@ async fn test_basic_auth_header_is_sent() {
     let config = create_config_with_basic_auth(&mock_server, "testuser", "testpass");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("authenticated"));
@@ -648,10 +638,7 @@ async fn test_custom_headers_are_sent() {
     let config = create_config_with_headers(&mock_server, headers);
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("headers received"));
@@ -681,10 +668,7 @@ async fn test_bearer_token_in_header() {
     let config = create_config_with_headers(&mock_server, headers);
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("bearer auth ok"));
@@ -727,10 +711,7 @@ async fn test_basic_auth_with_custom_headers_combined() {
 
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("combined auth ok"));
@@ -758,15 +739,14 @@ async fn test_basic_auth_401_on_wrong_credentials() {
     let config = create_config_with_basic_auth(&mock_server, "wrong_user", "wrong_pass");
     let mut client = TailClient::new(config).unwrap();
 
-    let result = client.connect_and_receive("test_rule", "default").await;
+    let logs = first_connection(&mut client).await.logs;
 
-    assert!(result.is_err());
-    match result {
-        Err(StreamError::ConnectionFailed(msg)) => {
-            assert!(msg.contains("401"), "Should mention 401 status: {}", msg);
-        }
-        _ => panic!("Expected ConnectionFailed error with 401"),
-    }
+    assert!(
+        logs.contains("status=401"),
+        "Should mention 401 status: {logs}"
+    );
+    assert!(logs.contains("response=Unauthorized"), "{logs}");
+    assert!(logs.contains("Connection failed, retrying"), "{logs}");
 }
 
 #[tokio::test]
@@ -787,10 +767,7 @@ async fn test_without_auth_no_authorization_header() {
     let config = create_config(&mock_server, "_stream:noauth");
     let mut client = TailClient::new(config).unwrap();
 
-    let lines = client
-        .connect_and_receive("test_rule", "default")
-        .await
-        .unwrap();
+    let lines = first_connection(&mut client).await.lines;
 
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("no auth"));
@@ -800,8 +777,8 @@ async fn test_without_auth_no_authorization_header() {
 // v2.0.3 hardening
 // =============================================================================
 
-/// Invalid UTF-8 in the stream must be dropped and streaming must continue,
-/// instead of surfacing a fatal `Utf8Error` that killed the rule task.
+/// Invalid UTF-8 in the stream must drop only the faulty line and streaming
+/// must continue, instead of killing the rule task.
 #[tokio::test]
 async fn test_invalid_utf8_line_is_dropped_not_fatal() {
     let mock_server = MockServer::start().await;
@@ -838,17 +815,49 @@ async fn test_invalid_utf8_line_is_dropped_not_fatal() {
     })
     .await;
 
-    // Must still be looping (timeout), not returned with Utf8Error.
+    // Must still be looping (timeout), not returned with an error.
     assert!(
         result.is_err(),
         "stream must not terminate on invalid UTF-8"
     );
     let lines = received_lines.lock().unwrap();
-    // The whole response arrives in one chunk: the invalid batch is discarded,
-    // but the loop reconnects and keeps going instead of dying.
-    assert!(
-        lines.iter().all(|l| !l.contains('\u{fffd}')),
-        "no replacement chars expected"
+    // Only the invalid line is dropped; its neighbours are delivered intact.
+    // The next connection only starts after ~1s, past the 800ms window.
+    assert_eq!(
+        *lines,
+        vec![r#"{"_msg":"before"}"#, r#"{"_msg":"after"}"#],
+        "valid lines around the invalid one must be kept"
+    );
+}
+
+/// A line over 1 MiB is dropped whole: its neighbours are delivered and no
+/// truncated fragment of it ever reaches the caller.
+#[tokio::test]
+async fn test_oversized_line_is_dropped_without_truncated_fragment() {
+    let mock_server = MockServer::start().await;
+
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(b"{\"_msg\":\"before\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"");
+    body.extend(std::iter::repeat_n(b'x', 1024 * 1024 + 10));
+    body.extend_from_slice(b"\"}\n");
+    body.extend_from_slice(b"{\"_msg\":\"after\"}\n");
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:oversized");
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = first_connection(&mut client).await.lines;
+
+    assert_eq!(
+        lines,
+        vec![r#"{"_msg":"before"}"#, r#"{"_msg":"after"}"#],
+        "only the two valid lines must be received"
     );
 }
 
@@ -911,10 +920,344 @@ async fn test_clean_eof_reconnects_with_delay_not_tight_loop() {
     .await;
 
     let n = mock_server.received_requests().await.unwrap().len();
-    // Empty EOFs back off (1s, 2s, ...): at most a handful of requests in 1.2s,
-    // where the old tight loop produced hundreds.
+    // Empty EOFs back off (1s, 2s, ...): the second request arrives after ~1s
+    // and at most 3 land in 1.2s, where the old tight loop produced hundreds.
     assert!(
-        (1..=5).contains(&n),
+        (2..=3).contains(&n),
         "expected backed-off reconnects, got {n}"
     );
+}
+
+/// Responder recording the arrival time of each request.
+struct TimedEmptyBody {
+    arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+impl wiremock::Respond for TimedEmptyBody {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(200).set_body_raw(b"", "application/x-ndjson")
+    }
+}
+
+/// The first empty EOF is followed by a ~1s delay (not 2s).
+#[tokio::test]
+async fn test_first_empty_eof_reconnects_after_about_one_second() {
+    let mock_server = MockServer::start().await;
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(TimedEmptyBody {
+            arrivals: Arc::clone(&arrivals),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let config = create_config(&mock_server, "_stream:eoffirst");
+    let mut client = TailClient::new(config).unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+        client
+            .stream_with_reconnect("test_rule", "default", None, |_| async { Ok(()) })
+            .await
+    })
+    .await;
+
+    let arrivals = arrivals.lock().unwrap();
+    assert!(
+        arrivals.len() >= 2,
+        "expected a second request, got {}",
+        arrivals.len()
+    );
+    let gap = arrivals[1] - arrivals[0];
+    assert!(
+        gap >= Duration::from_millis(850) && gap <= Duration::from_millis(1200),
+        "second request after {gap:?}, expected ~1s"
+    );
+}
+
+/// Run `stream_with_reconnect` against `mock_server` for `duration` under a
+/// local Prometheus recorder (current-thread runtime, so every metric lands
+/// in it). Returns the rendering.
+fn stream_counted(mock_server_setup: impl AsyncFnOnce(&MockServer), duration: Duration) -> String {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let mock_server = MockServer::start().await;
+            mock_server_setup(&mock_server).await;
+            let mut client = TailClient::new(create_config(&mock_server, "_stream:m")).unwrap();
+            let _ = tokio::time::timeout(duration, async {
+                client
+                    .stream_with_reconnect("r", "s", None, |_| async { Ok(()) })
+                    .await
+            })
+            .await;
+        })
+    });
+    handle.render()
+}
+
+/// Value of the `{rule_name="r",vl_source="s"}` series of `name`, if emitted.
+fn rs_counter(rendered: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name}{{rule_name=\"r\",vl_source=\"s\"}} ");
+    rendered
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix)?.parse().ok())
+}
+
+/// A clean EOF counts in `valerter_stream_ends_total`, never in
+/// `valerter_reconnections_total`.
+#[test]
+fn test_clean_eof_counts_stream_end_not_reconnection() {
+    let rendered = stream_counted(
+        async |server| {
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+                )
+                .mount(server)
+                .await;
+        },
+        Duration::from_millis(1500),
+    );
+
+    let ends = rs_counter(&rendered, "valerter_stream_ends_total").unwrap_or(0);
+    assert!(ends >= 1, "expected stream ends, got {ends}:\n{rendered}");
+    assert_eq!(
+        rs_counter(&rendered, "valerter_reconnections_total").unwrap_or(0),
+        0,
+        "a clean EOF is not a reconnection after failure:\n{rendered}"
+    );
+}
+
+/// One clean EOF, then an HTTP 500: one stream end, one reconnection.
+#[test]
+fn test_clean_eof_then_http_500_are_counted_separately() {
+    let rendered = stream_counted(
+        async |server| {
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+                )
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/select/logsql/tail"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(server)
+                .await;
+        },
+        // EOF at ~0s, ~1s delay, 500 at ~1s, then a >= 1s failure backoff.
+        Duration::from_millis(1700),
+    );
+
+    assert_eq!(
+        rs_counter(&rendered, "valerter_stream_ends_total"),
+        Some(1),
+        "{rendered}"
+    );
+    assert_eq!(
+        rs_counter(&rendered, "valerter_reconnections_total"),
+        Some(1),
+        "{rendered}"
+    );
+}
+
+// =============================================================================
+// URL normalization and header replacement
+// =============================================================================
+
+#[tokio::test]
+async fn test_base_url_with_trailing_slash() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"{\"_msg\":\"x\"}\n", "application/x-ndjson"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_config(&mock_server, "_stream:slash");
+    config.base_url = format!("{}/", mock_server.uri());
+    let mut client = TailClient::new(config).unwrap();
+
+    let lines = first_connection(&mut client).await.lines;
+    assert_eq!(lines.len(), 1);
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/select/logsql/tail");
+}
+
+/// Values of every header with the given name in the first received request.
+async fn received_header_values(mock_server: &MockServer, name: &str) -> Vec<String> {
+    let requests = mock_server.received_requests().await.unwrap();
+    requests[0]
+        .headers
+        .get_all(name)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_custom_accept_header_replaces_default() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"\n", "application/x-ndjson"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "accept".to_string(),
+        SecretString::new("application/json".to_string()),
+    );
+    let config = create_config_with_headers(&mock_server, headers);
+    let mut client = TailClient::new(config).unwrap();
+    first_connection(&mut client).await;
+
+    assert_eq!(
+        received_header_values(&mock_server, "accept").await,
+        vec!["application/json"]
+    );
+}
+
+#[tokio::test]
+async fn test_custom_authorization_replaces_basic_auth() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"\n", "application/x-ndjson"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_config_with_basic_auth(&mock_server, "admin", "secret");
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        SecretString::new("Bearer abc".to_string()),
+    );
+    config.headers = Some(headers);
+    assert!(config.custom_authorization_overrides_basic_auth());
+
+    let mut client = TailClient::new(config).unwrap();
+    first_connection(&mut client).await;
+
+    assert_eq!(
+        received_header_values(&mock_server, "authorization").await,
+        vec!["Bearer abc"]
+    );
+}
+
+// =============================================================================
+// Secrets and bounded error bodies
+// =============================================================================
+
+/// Credentials and query string of the source URL never reach the logs, not
+/// even at DEBUG level nor inside a transport error.
+#[tokio::test]
+async fn test_source_url_secrets_are_not_logged() {
+    let port = portpicker::pick_unused_port().expect("free port");
+    let config = TailConfig {
+        base_url: format!("http://user:S3CRETPASS@127.0.0.1:{port}/?token=S3CRETTOKEN"),
+        query: "_stream:secret".to_string(),
+        start: None,
+        basic_auth: None,
+        headers: None,
+        tls: None,
+    };
+    let mut client = TailClient::new(config).unwrap();
+
+    let logs = first_connection(&mut client).await.logs;
+
+    assert!(
+        logs.contains("Connecting to VictoriaLogs tail endpoint"),
+        "{logs}"
+    );
+    assert!(logs.contains("Connection failed"), "{logs}");
+    assert!(
+        logs.contains("***"),
+        "the URL should be logged redacted: {logs}"
+    );
+    assert!(!logs.contains("S3CRETPASS"), "{logs}");
+    assert!(!logs.contains("S3CRETTOKEN"), "{logs}");
+}
+
+/// A proxy answering 502 with a chunked body that never ends must not block
+/// the task: the warning is logged with what was received and the client
+/// reconnects.
+#[tokio::test]
+async fn test_endless_error_body_does_not_block_reconnection() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut second_tx = Some(second_tx);
+        let mut open = Vec::new();
+        for accepted in 0.. {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if accepted == 1
+                && let Some(tx) = second_tx.take()
+            {
+                let _ = tx.send(());
+            }
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      b\r\nproxy-error\r\n",
+                )
+                .await;
+            // Never send the final chunk: keep the socket open.
+            open.push(socket);
+        }
+    });
+
+    let (logs, _guard) = capture_logs(tracing::Level::WARN);
+    let config = TailConfig {
+        base_url: format!("http://{addr}"),
+        query: "_stream:endless".to_string(),
+        start: None,
+        basic_auth: None,
+        headers: None,
+        tls: None,
+    };
+    let mut client = TailClient::new(config).unwrap();
+    let stream = client.stream_with_reconnect("test_rule", "default", None, |_| async { Ok(()) });
+
+    tokio::select! {
+        result = stream => panic!("stream_with_reconnect returned: {result:?}"),
+        second = second_rx => second.expect("listener task alive"),
+        () = tokio::time::sleep(Duration::from_secs(10)) => {
+            panic!("no second connection within 10s:\n{}", logs.text())
+        }
+    }
+
+    let logs = logs.text();
+    assert!(logs.contains("HTTP error from VictoriaLogs"), "{logs}");
+    assert!(logs.contains("status=502"), "{logs}");
+    assert!(logs.contains("response=proxy-error"), "{logs}");
 }

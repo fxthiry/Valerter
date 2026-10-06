@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::{NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars};
+use crate::config::{
+    NotifierConfig, NotifiersConfig, OutputFormat, SecretString, resolve_env_vars,
+    validate_resolved_url,
+};
 use crate::error::ConfigError;
 
 use super::{EmailNotifier, MattermostNotifier, Notifier, TelegramNotifier, WebhookNotifier};
@@ -130,7 +133,10 @@ impl NotifierRegistry {
         let mut registry = NotifierRegistry::new();
         let mut errors = Vec::new();
 
-        for (name, config) in notifiers_config {
+        // By sorted name, for a stable error order.
+        let mut sorted: Vec<_> = notifiers_config.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, config) in sorted {
             match Self::create_notifier(name, config, &http_client, config_dir) {
                 Ok(notifier) => {
                     if let Err(e) = registry.register(notifier) {
@@ -158,20 +164,29 @@ impl NotifierRegistry {
         match config {
             NotifierConfig::Mattermost(mm_config) => {
                 // Resolve environment variables in webhook_url
+                // No metric here: notifiers are built before the metrics
+                // exporter is installed, and the error stops the daemon.
                 let resolved_url =
                     resolve_env_vars(mm_config.webhook_url.expose()).map_err(|e| {
-                        // Track env var resolution failures for monitoring (Fix M1)
-                        metrics::counter!(
-                            "valerter_notifier_config_errors_total",
-                            "notifier" => name.to_string(),
-                            "error_type" => "env_var_resolution"
-                        )
-                        .increment(1);
                         ConfigError::InvalidNotifier {
                             name: name.to_string(),
                             message: format!("webhook_url: {}", e),
                         }
                     })?;
+                // `Config::validate()` skips URLs holding a `${VAR}`: re-check
+                // the resolved value (never echoed, it carries the hook token).
+                validate_resolved_url(&resolved_url).map_err(|e| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message: format!("webhook_url: {}", e),
+                })?;
+
+                OutputFormat::resolve(
+                    mm_config.format,
+                    OutputFormat::Markdown,
+                    &[OutputFormat::Markdown],
+                    name,
+                    "mattermost",
+                )?;
 
                 let notifier = MattermostNotifier::with_options(
                     name.to_string(),

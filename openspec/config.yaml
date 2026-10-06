@@ -1,0 +1,45 @@
+schema: spec-driven
+
+context: |
+  Language: fr
+  All artifacts must be written in fr.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Projet : valerter, démon d'alerting temps réel pour VictoriaLogs (Apache-2.0, repo public
+  github.com/fxthiry/valerter). Pipeline : tail VictoriaLogs (/select/logsql/tail, streaming HTTP)
+  → parse (regex/JSON) → throttle → template → file de notifications → notifiers
+  (Mattermost, webhook, email SMTP, Telegram). Une tâche Tokio par couple (règle, source).
+
+  Stack : Rust stable, edition 2024, binaire statique musl ; tokio, reqwest (rustls), serde_yaml,
+  minijinja, moka, lettre, tracing, metrics + exporter Prometheus, clap, chrono-tz.
+  Distribution : .deb (cargo-deb) + unité systemd.
+
+  Qualité : cargo fmt --check, cargo clippy -- -D warnings, cargo test ; tests d'intégration
+  dans tests/ avec wiremock ; tests SMTP via Mailhog (--ignored).
+  Le code, les commentaires, la doc utilisateur (docs/, README, CHANGELOG) restent en anglais.
+
+  Git : Conventional Commits (fix:, feat!:, chore(deps):…), corps qui référence les issues
+  (Closes #NN) ; jamais de push direct sur main, tout passe par une PR.
+  Toute rupture de compatibilité de config se documente dans MIGRATION.md et CHANGELOG.md.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 
 use super::AlertPayload;
+use crate::config::OutputFormat;
 use crate::error::NotifyError;
 
 /// Abstract notifier trait for sending alerts to different channels.
@@ -21,6 +22,7 @@ use crate::error::NotifyError;
 /// impl Notifier for MyNotifier {
 ///     fn name(&self) -> &str { &self.name }
 ///     fn notifier_type(&self) -> &str { "my_type" }
+///     fn output_format(&self) -> OutputFormat { OutputFormat::Plain }
 ///     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
 ///         // Send implementation
 ///         Ok(())
@@ -34,6 +36,11 @@ pub trait Notifier: Send + Sync {
 
     /// Type of the notifier (e.g., "mattermost", "webhook", "email").
     fn notifier_type(&self) -> &str;
+
+    /// Format in which this notifier sends the body of a Markdown alert
+    /// (`format` key, or the default of its type). See
+    /// [`crate::template::RenderedMessage::body_for`].
+    fn output_format(&self) -> OutputFormat;
 
     /// Send an alert through this notifier.
     ///

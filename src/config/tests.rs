@@ -180,6 +180,126 @@ rules: []
         matches!(e, crate::error::ConfigError::ValidationError(msg) if msg.contains("no rules defined"))
     });
     assert!(has_no_rules_error);
+    // The "all rules are disabled" error is exclusive with "no rules defined".
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.to_string().contains("all rules are disabled")),
+        "Expected only 'no rules defined', got: {:?}",
+        errors
+    );
+}
+
+/// Build a config whose rules have the given `enabled` flags.
+fn config_with_rule_flags(flags: &[bool], notify_template: &str) -> Config {
+    let mut yaml = String::from(
+        r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+rules:
+"#,
+    );
+    for (i, enabled) in flags.iter().enumerate() {
+        yaml.push_str(&format!(
+            "  - name: rule{i}\n    enabled: {enabled}\n    query: 't'\n    parser:\n      json:\n        fields: [_msg]\n    notify:\n      template: {notify_template}\n      destinations: [test]\n"
+        ));
+    }
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn validate_all_rules_disabled_fails() {
+    let config = config_with_rule_flags(&[false, false], "test");
+    let errors = config.validate().unwrap_err();
+    let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains(
+            "all rules are disabled: enable at least one rule in config.yaml or rules.d/"
+        )),
+        "Expected 'all rules are disabled' error, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("no rules defined")),
+        "'no rules defined' must not be reported when rules exist, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn validate_all_rules_disabled_is_reported_with_other_errors() {
+    // Exhaustive validation: the disabled-rules error joins the other errors.
+    let config = config_with_rule_flags(&[false], "missing_template");
+    let errors = config.validate().unwrap_err();
+    let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("all rules are disabled")),
+        "Expected 'all rules are disabled' error, got: {:?}",
+        messages
+    );
+    assert!(
+        messages.len() >= 2,
+        "Expected the missing template error as well, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn validate_one_enabled_rule_among_disabled_passes() {
+    let config = config_with_rule_flags(&[false, true, false], "test");
+    config
+        .validate()
+        .expect("one enabled rule is enough to pass validation");
+}
+
+#[test]
+fn validate_rule_enabled_by_default_counts_as_enabled() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "Body"
+rules:
+  - name: off
+    enabled: false
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: test, destinations: [test] }
+  - name: on_by_default
+    query: 't'
+    parser: { json: { fields: [_msg] } }
+    notify: { template: test, destinations: [test] }
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    config
+        .validate()
+        .expect("a rule without `enabled` is enabled by default");
 }
 
 #[test]
@@ -369,6 +489,7 @@ fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeCo
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: crate::config::BodyFormat::Text,
                 },
             );
             t
@@ -484,6 +605,7 @@ fn validate_collects_all_errors() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -571,6 +693,7 @@ fn validate_throttle_key_template() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -643,6 +766,7 @@ fn validate_nonexistent_notify_template_fails() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -948,6 +1072,38 @@ rules:
 }
 
 #[test]
+fn validate_template_render_in_body_detects_unknown_filter_after_md_escape() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  test:
+    title: "Test"
+    body: "{{ host | md_escape }} {{ host | nosuch }}"
+rules: []
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let errors = config.validate().unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            crate::error::ConfigError::InvalidTemplate { message, .. }
+                if message.contains("body render") && message.contains("nosuch")
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn validate_template_render_in_body_detects_unknown_filter() {
     let yaml = r#"
 victorialogs:
@@ -1048,6 +1204,7 @@ fn validate_rule_destinations_collects_all_errors() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: crate::config::BodyFormat::Text,
                 },
             );
             t
@@ -1270,7 +1427,7 @@ fn load_with_intra_directory_collision_fails() {
             source1,
             source2,
         } => {
-            assert_eq!(resource_type, "rules");
+            assert_eq!(resource_type, "rule");
             assert_eq!(name, "collision_rule");
             // Due to sorting, a.yaml comes before b.yaml
             assert!(source1.contains("a.yaml"));
@@ -1278,6 +1435,67 @@ fn load_with_intra_directory_collision_fails() {
         }
         e => panic!("Expected DuplicateName error, got {:?}", e),
     }
+}
+
+#[test]
+fn load_orders_rules_from_directory_by_file_then_name() {
+    // b.yaml declares z_rule then a_rule, a.yaml declares m_rule.
+    for _ in 0..10 {
+        let config = Config::load(&fixture_path("multi-file-order/config.yaml")).unwrap();
+        let names: Vec<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["main_rule", "m_rule", "a_rule", "z_rule"]);
+        assert!(config.validate().is_ok());
+    }
+}
+
+/// Writes `config.yaml` (from the intra-collision fixture, with its rules.d
+/// collision removed) plus two files of `<dir>` defining the same `<key>`.
+fn intra_directory_collision(dir: &str, item: &str) -> crate::error::ConfigError {
+    let tmp = tempfile::tempdir().unwrap();
+    let main =
+        std::fs::read_to_string(fixture_path("multi-file-intra-collision/config.yaml")).unwrap();
+    std::fs::write(tmp.path().join("config.yaml"), main).unwrap();
+    let d = tmp.path().join(dir);
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("a.yaml"), item).unwrap();
+    std::fs::write(d.join("b.yaml"), item).unwrap();
+    Config::load(&tmp.path().join("config.yaml")).unwrap_err()
+}
+
+#[test]
+fn load_with_intra_directory_template_collision_uses_singular() {
+    let err = intra_directory_collision("templates.d", "t:\n  title: x\n  body: y\n");
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("duplicate template name 't': defined in '"),
+        "{msg}"
+    );
+    let a = msg.find("a.yaml").expect(&msg);
+    let b = msg.find("b.yaml").expect(&msg);
+    assert!(a < b, "{msg}");
+}
+
+#[test]
+fn load_with_intra_directory_notifier_collision_uses_singular() {
+    let err = intra_directory_collision(
+        "notifiers.d",
+        "n:\n  type: mattermost\n  webhook_url: \"https://example.com/hooks/n\"\n",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("duplicate notifier name 'n': defined in '"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn load_with_intra_directory_rule_collision_message_uses_singular() {
+    let err = Config::load(&fixture_path("multi-file-intra-collision/config.yaml")).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("duplicate rule name 'collision_rule': defined in '"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -2671,4 +2889,492 @@ fn load_fails_on_undefined_env_var_in_victorialogs_source() {
         err.contains("vlprod") && err.contains("V203_DEFINITELY_UNSET"),
         "{err}"
     );
+}
+
+// ============================================================
+// harden-config-validation: defaults.throttle and throttle.key render
+// ============================================================
+
+fn rule_r() -> &'static str {
+    r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+"#
+}
+
+fn with_defaults_throttle(throttle: &str) -> String {
+    v203_yaml(rule_r()).replace(
+        "throttle: { count: 5, window: 60s }",
+        &format!("throttle: {throttle}"),
+    )
+}
+
+#[test]
+fn validate_rejects_zero_defaults_throttle_count_and_window() {
+    let msg = v203_errors(&with_defaults_throttle("{ count: 0, window: 0s }"));
+    assert!(
+        msg.contains("defaults.throttle.count must be >= 1 (0 would suppress every alert)"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("defaults.throttle.window must be > 0 (0s disables throttling)"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn validate_rejects_defaults_throttle_key_syntax_error() {
+    let msg = v203_errors(&with_defaults_throttle(
+        r#"{ key: "{% if host %}{{ host", count: 5, window: 60s }"#,
+    ));
+    assert!(msg.contains("defaults.throttle.key: "), "{msg}");
+    assert!(!msg.contains("defaults.throttle.key render"), "{msg}");
+    assert!(!msg.contains("rule 'defaults'"), "{msg}");
+}
+
+#[test]
+fn validate_rejects_defaults_throttle_key_unknown_filter() {
+    let msg = v203_errors(&with_defaults_throttle(
+        r#"{ key: "{{ host | bad_filter }}", count: 5, window: 60s }"#,
+    ));
+    assert!(msg.contains("defaults.throttle.key render: "), "{msg}");
+    assert!(msg.contains("bad_filter"), "{msg}");
+}
+
+#[test]
+fn validate_rejects_duplicate_destinations() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains(
+            "rule 'r': notify.destinations contains duplicate entry 'mm' (each notifier may appear at most once)"
+        ),
+        "{msg}"
+    );
+    assert_eq!(msg.matches("duplicate entry").count(), 1, "{msg}");
+}
+
+#[test]
+fn validate_rejects_duplicate_destinations_in_disabled_rule() {
+    let yaml = v203_yaml(
+        r#"
+  - name: off
+    enabled: false
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains("rule 'off': notify.destinations contains duplicate entry 'mm'"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn validate_accepts_distinct_destinations() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm, mm2] }
+"#,
+    )
+    .replace(
+        "notifiers:\n",
+        "notifiers:\n  mm2:\n    type: mattermost\n    webhook_url: \"https://mattermost.example.com/hooks/other\"\n",
+    );
+    let msg = v203_errors(&yaml);
+    assert!(msg.is_empty(), "{msg}");
+}
+
+#[test]
+fn validate_rejects_defaults_throttle_key_unknown_filter_after_conversion() {
+    let msg = v203_errors(&with_defaults_throttle(
+        r#"{ key: "{{ status | int }}-{{ host | truncat(10) }}", count: 5, window: 60s }"#,
+    ));
+    assert!(msg.contains("defaults.throttle.key render: "), "{msg}");
+    assert!(msg.contains("truncat"), "{msg}");
+}
+
+#[test]
+fn validate_accepts_valid_defaults_throttle() {
+    let msg = v203_errors(&with_defaults_throttle(
+        r#"{ key: "{{ host }}", count: 5, window: 60s }"#,
+    ));
+    assert_eq!(msg, "");
+}
+
+#[test]
+fn validate_rejects_rule_throttle_key_unknown_filter() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    throttle: { key: "{{ host | bad_filter }}", count: 5, window: 60s }
+    notify: { template: default, destinations: [mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains("invalid template in rule 'r': throttle.key render: "),
+        "{msg}"
+    );
+    assert!(msg.contains("bad_filter"), "{msg}");
+}
+
+#[test]
+fn validate_rejects_throttle_key_unknown_filter_on_disabled_rule() {
+    let yaml = v203_yaml(
+        r#"
+  - name: on
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    notify: { template: default, destinations: [mm] }
+  - name: off
+    enabled: false
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    throttle: { key: "{{ host | bad_filter }}", count: 5, window: 60s }
+    notify: { template: default, destinations: [mm] }
+"#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains("invalid template in rule 'off': throttle.key render: "),
+        "{msg}"
+    );
+}
+
+#[test]
+fn validate_accepts_rule_throttle_key_with_type_conversion() {
+    let yaml = v203_yaml(
+        r#"
+  - name: r
+    query: "*"
+    parser: { regex: "(?P<m>.*)" }
+    throttle: { key: "{{ host }}-{{ status | int }}", count: 5, window: 60s }
+    notify: { template: default, destinations: [mm] }
+"#,
+    );
+    assert_eq!(v203_errors(&yaml), "");
+}
+
+#[test]
+fn validate_accepts_template_with_type_conversions() {
+    let yaml = v203_yaml(rule_r()).replace(
+        r#"title: "t""#,
+        r#"title: "{{ status | int }} {{ (latency | float) > 1.5 }} {{ count + 1 }}""#,
+    );
+    assert_eq!(v203_errors(&yaml), "");
+}
+
+#[test]
+fn validate_rejects_template_with_unknown_test() {
+    let yaml = v203_yaml(rule_r()).replace(
+        r#"body: "b""#,
+        r#"body: "{% if host is nosuchtest %}x{% endif %}""#,
+    );
+    let msg = v203_errors(&yaml);
+    assert!(msg.contains("body render"), "{msg}");
+    assert!(msg.contains("nosuchtest"), "{msg}");
+}
+
+// ============================================================
+// harden-config-validation: VictoriaLogs source URL and headers
+// ============================================================
+
+#[test]
+fn validate_rejects_source_url_with_unresolved_placeholder() {
+    // `load()` has already resolved placeholders: a `${` left in the value is
+    // checked like any other URL.
+    let yaml =
+        v203_yaml(rule_r()).replace(r#"url: "http://vl:9428""#, r#"url: "${VL_URL_SECRET}""#);
+    let msg = v203_errors(&yaml);
+    assert!(
+        msg.contains("victorialogs.vlprod.url: invalid URL: "),
+        "{msg}"
+    );
+    assert!(!msg.contains("VL_URL_SECRET"), "{msg}");
+}
+
+#[test]
+fn load_rejects_resolved_source_url_with_bad_scheme() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        v203_yaml(rule_r()).replace(r#"url: "http://vl:9428""#, r#"url: "${HCV_VL_URL_FTP}""#),
+    )
+    .unwrap();
+    // SAFETY: test-local variable with a unique name.
+    unsafe { std::env::set_var("HCV_VL_URL_FTP", "ftp://vl:9428/SECRET") };
+    let config = Config::load(&path).expect("load");
+    let msg = config
+        .validate()
+        .unwrap_err()
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains(
+            "victorialogs.vlprod.url: invalid URL: unsupported scheme 'ftp' (expected http or https)"
+        ),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+fn load_rejects_resolved_source_url_still_containing_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        v203_yaml(rule_r()).replace(r#"url: "http://vl:9428""#, r#"url: "${HCV_VL_URL_NESTED}""#),
+    )
+    .unwrap();
+    // SAFETY: test-local variable with a unique name.
+    unsafe { std::env::set_var("HCV_VL_URL_NESTED", "${SECRET_NOT_A_URL}") };
+    let config = Config::load(&path).expect("load");
+    let msg = config.validate().unwrap_err()[0].to_string();
+    assert!(
+        msg.contains("victorialogs.vlprod.url: invalid URL: "),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+fn with_source_headers(headers: &str) -> String {
+    v203_yaml(rule_r()).replace(
+        r#"url: "http://vl:9428""#,
+        &format!("url: \"http://vl:9428\"\n    headers: {headers}"),
+    )
+}
+
+#[test]
+fn validate_rejects_invalid_source_header_name() {
+    let msg = v203_errors(&with_source_headers(r#"{ "X Token": "abc" }"#));
+    assert!(
+        msg.contains("victorialogs.vlprod.headers: invalid header name 'X Token'"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn validate_rejects_invalid_source_header_value_without_echoing_it() {
+    let msg = v203_errors(&with_source_headers(
+        r#"{ Authorization: "Bearer SECRET\nInjected: 1" }"#,
+    ));
+    assert!(
+        msg.contains("victorialogs.vlprod.headers: invalid value for header 'Authorization'"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+fn validate_reports_source_header_errors_in_name_order() {
+    let msg = v203_errors(&with_source_headers(
+        r#"{ "Z Bad": "a", "A Bad": "b", "M Bad": "c" }"#,
+    ));
+    let a = msg.find("'A Bad'").expect(&msg);
+    let m = msg.find("'M Bad'").expect(&msg);
+    let z = msg.find("'Z Bad'").expect(&msg);
+    assert!(a < m && m < z, "{msg}");
+}
+
+#[test]
+fn validate_accepts_bearer_authorization_source_header() {
+    let msg = v203_errors(&with_source_headers(
+        r#"{ Authorization: "Bearer abc.def-123", X-Scope-OrgID: "tenant" }"#,
+    ));
+    assert_eq!(msg, "");
+}
+
+// ============================================================
+// harden-config-validation: deterministic error order
+// ============================================================
+
+#[test]
+fn validate_reports_template_errors_in_name_order() {
+    let yaml = v203_yaml(rule_r()).replace(
+        r#"  default:
+    title: "t"
+    body: "b""#,
+        r#"  default:
+    title: "t"
+    body: "b"
+  beta:
+    title: "t"
+    body: "{{ x | nosuchfilter }}"
+  alpha:
+    title: "t"
+    body: "{{ x | nosuchfilter }}""#,
+    );
+    for _ in 0..5 {
+        let msg = v203_errors(&yaml);
+        let alpha = msg.find("template:alpha").expect(&msg);
+        let beta = msg.find("template:beta").expect(&msg);
+        assert!(alpha < beta, "{msg}");
+    }
+}
+
+// ============================================================
+// body_format (markdown-body-format)
+// ============================================================
+
+fn template_yaml(extra: &str) -> String {
+    format!("title: \"T\"\nbody: \"B\"\n{extra}")
+}
+
+#[test]
+fn template_without_body_format_defaults_to_text() {
+    let template: TemplateConfig = serde_yaml::from_str(&template_yaml("")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Text);
+}
+
+#[test]
+fn template_accepts_body_format_markdown_and_text() {
+    let template: TemplateConfig =
+        serde_yaml::from_str(&template_yaml("body_format: markdown")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Markdown);
+    let template: TemplateConfig =
+        serde_yaml::from_str(&template_yaml("body_format: text")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Text);
+}
+
+#[test]
+fn template_rejects_unknown_body_format() {
+    let err = serde_yaml::from_str::<TemplateConfig>(&template_yaml("body_format: md"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`text`"), "{err}");
+    assert!(err.contains("`markdown`"), "{err}");
+}
+
+#[test]
+fn compile_carries_body_format() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  md:
+    title: "T"
+    body: "**{{ host }}**"
+    body_format: markdown
+  plain:
+    title: "T"
+    body: "B"
+rules: []
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let runtime = config
+        .compile(std::path::Path::new("/tmp/config.yaml"))
+        .unwrap();
+    assert_eq!(runtime.templates["md"].body_format, BodyFormat::Markdown);
+    assert_eq!(runtime.templates["plain"].body_format, BodyFormat::Text);
+}
+
+#[test]
+fn output_format_resolve_reports_expected_list() {
+    let err = OutputFormat::resolve(
+        Some(OutputFormat::Plain),
+        OutputFormat::Html,
+        &[OutputFormat::Html],
+        "mail",
+        "email",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid notifier 'mail': format 'plain' is not supported for email notifiers (expected html)"
+    );
+    assert_eq!(
+        OutputFormat::resolve(
+            None,
+            OutputFormat::Plain,
+            &[OutputFormat::Plain, OutputFormat::Markdown],
+            "w",
+            "webhook"
+        )
+        .unwrap(),
+        OutputFormat::Plain
+    );
+}
+
+fn markdown_template_config(body: &str) -> Config {
+    let yaml = format!(
+        r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  md:
+    title: "T"
+    body: {body:?}
+    body_format: markdown
+rules:
+  - name: r
+    query: "_msg:test"
+    parser:
+      regex: ".*"
+    notify:
+      template: md
+      destinations: [test]
+"#
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn validate_markdown_body_reports_unknown_filter_after_escaped_value() {
+    let errors = markdown_template_config("{{ host }} {{ host | nosuch }}")
+        .validate()
+        .unwrap_err();
+    assert!(
+        errors.iter().any(|e| {
+            let msg = e.to_string();
+            msg.contains("body render") && msg.contains("nosuch")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn validate_markdown_body_accepts_markdown_filters() {
+    let config = markdown_template_config(
+        "{{ _msg | codeblock('json') }} {{ host | code }} {{ md_link(host, url) }} {{ x | safe }}",
+    );
+    assert!(config.validate().is_ok());
 }

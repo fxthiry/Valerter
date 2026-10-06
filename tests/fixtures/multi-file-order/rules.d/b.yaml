@@ -1,0 +1,16 @@
+# Declared z_rule then a_rule: loaded as a_rule, z_rule (sorted by name)
+z_rule:
+  query: "_msg:z"
+  parser:
+    regex: "(?P<m>.*)"
+  notify:
+    template: default_alert
+    destinations: [test]
+
+a_rule:
+  query: "_msg:a"
+  parser:
+    regex: "(?P<m>.*)"
+  notify:
+    template: default_alert
+    destinations: [test]

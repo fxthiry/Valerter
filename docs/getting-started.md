@@ -93,9 +93,9 @@ defaults:
 
 templates:
   default_alert:
-    title: "{{ title | default('Alert') }}"
-    body: "{{ body }}"
-    email_body_html: "<p>{{ body }}</p>"
+    title: "{{ rule_name }}"
+    body: "{{ _msg }}"
+    email_body_html: "<p>{{ _msg }}</p>"
 
 rules:
   - name: "error_alert"
@@ -111,6 +111,13 @@ rules:
 ### 2. Validate Configuration
 
 ```bash
+valerter --validate
+```
+
+`--validate` builds every notifier: if your notifiers reference environment variables (for example `webhook_url: "${MATTERMOST_WEBHOOK}"`), export them in the shell first, with the same values the service gets (for example from a systemd drop-in with `Environment=`):
+
+```bash
+export MATTERMOST_WEBHOOK="https://mattermost.example.com/hooks/your-webhook-id"
 valerter --validate
 ```
 
@@ -138,8 +145,13 @@ journalctl -u valerter -f
 ```bash
 curl -LO https://github.com/fxthiry/valerter/releases/latest/download/valerter_latest_amd64.deb
 sudo dpkg -i valerter_latest_amd64.deb
-sudo systemctl restart valerter
 ```
+
+The package restarts the service itself when it is running or enabled (`systemctl enable valerter`): no manual `systemctl restart` is needed. A service that is both stopped and disabled stays stopped. Note that an enabled service you stopped on purpose is started again by the upgrade.
+
+About two seconds after the restart, the package checks that the service is active. If it is not (typically an invalid configuration), a warning is printed and the upgrade still completes: check the logs with `journalctl -u valerter`, fix the configuration, then `sudo systemctl restart valerter`.
+
+**Upgrading from 2.0.3 or earlier:** the old package stops the service before the new one is installed. An enabled service is restarted as described above, but a service that was started by hand without being enabled stays stopped: run `sudo systemctl start valerter` after the upgrade.
 
 **Note:** Configuration is preserved during upgrades - dpkg will prompt if you've modified `/etc/valerter/config.yaml`.
 

@@ -1,0 +1,33 @@
+# Fixture: a webhook body_template uses an unknown filter in an else branch.
+# Passes Config::validate(); rejected by the preflight (Notifier configuration error).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "Message: {{ _msg }}"
+
+notifiers:
+  wh:
+    type: webhook
+    url: "https://hooks.example.com/alerts"
+    body_template: '{"alert": "{% if title %}{{ title }}{% else %}{{ title | nosuchfilter }}{% endif %}"}'
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "wh"

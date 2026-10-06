@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use valerter::AlertPayload;
 use valerter::config::CompiledTemplate;
 use valerter::template::TemplateEngine;
 
@@ -29,6 +30,7 @@ fn engine_with(title_tpl: &str, body_tpl: &str) -> TemplateEngine {
             body: body_tpl.to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
     TemplateEngine::new(templates)
@@ -91,8 +93,11 @@ fn regression_gh25_dotted_keys_render_their_value() {
         let Some(expected) = expected else {
             continue;
         };
+        // The engine unflattens dotted keys once per alert, in the payload's
+        // `log` value, before rendering the rule template.
+        let log = AlertPayload::log_from_fields(&value);
         let rendered = engine
-            .render("t", &value, "gh25", "vlprod")
+            .render("t", &log, "gh25", "vlprod")
             .unwrap_or_else(|e| panic!("fixture {} failed to render for #25: {}", name, e));
         assert_eq!(
             rendered.body, expected,

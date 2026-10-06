@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use tokio::sync::mpsc;
 
 use crate::config::{
     EmailNotifierConfig, MattermostNotifierConfig, NotifierConfig, SecretString, SmtpConfig,
@@ -20,33 +21,39 @@ fn test_config_dir() -> std::path::PathBuf {
 
 fn make_payload(rule_name: &str) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
         destinations: vec![], // Uses default notifier
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
 fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: format!("Alert from {}", rule_name),
             body: "Test body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
         destinations,
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -64,6 +71,10 @@ impl Notifier for TestNotifier {
 
     fn notifier_type(&self) -> &str {
         &self.notifier_type
+    }
+
+    fn output_format(&self) -> crate::config::OutputFormat {
+        crate::config::OutputFormat::Plain
     }
 
     async fn send(&self, _alert: &AlertPayload) -> Result<(), NotifyError> {
@@ -238,6 +249,7 @@ fn registry_from_config_creates_mattermost_notifiers() {
                     channel: Some("infra-alerts".to_string()),
                     username: Some("valerter".to_string()),
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -249,6 +261,7 @@ fn registry_from_config_creates_mattermost_notifiers() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -288,6 +301,7 @@ fn registry_from_config_fails_on_undefined_env_var() {
                 channel: None,
                 username: None,
                 icon_url: None,
+                format: None,
             }),
         );
 
@@ -330,6 +344,7 @@ fn registry_from_config_collects_all_errors() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -339,6 +354,7 @@ fn registry_from_config_collects_all_errors() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -355,6 +371,44 @@ fn registry_from_config_collects_all_errors() {
             );
         },
     );
+}
+
+#[test]
+#[serial]
+fn registry_from_config_reports_errors_in_notifier_name_order() {
+    temp_env::with_var("UNDEFINED_ORDER_VAR", None::<&str>, || {
+        // Several HashMaps built in the same run iterate in different orders.
+        for _ in 0..8 {
+            let mut notifiers_config = HashMap::new();
+            for name in ["zeta", "alpha"] {
+                notifiers_config.insert(
+                    name.to_string(),
+                    NotifierConfig::Mattermost(MattermostNotifierConfig {
+                        webhook_url: SecretString::new("${UNDEFINED_ORDER_VAR}".to_string()),
+                        channel: None,
+                        username: None,
+                        icon_url: None,
+                        format: None,
+                    }),
+                );
+            }
+
+            let client = reqwest::Client::new();
+            let Err(errors) =
+                NotifierRegistry::from_config(&notifiers_config, client, &test_config_dir())
+            else {
+                panic!("both notifiers are invalid");
+            };
+            let names: Vec<_> = errors
+                .iter()
+                .map(|e| match e {
+                    crate::error::ConfigError::InvalidNotifier { name, .. } => name.as_str(),
+                    other => panic!("Expected InvalidNotifier, got {:?}", other),
+                })
+                .collect();
+            assert_eq!(names, ["alpha", "zeta"]);
+        }
+    });
 }
 
 #[test]
@@ -391,6 +445,7 @@ fn registry_from_config_creates_webhook_notifiers() {
                     h
                 },
                 body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
+                format: None,
             }),
         );
 
@@ -423,6 +478,7 @@ fn registry_from_config_webhook_with_defaults() {
             method: "POST".to_string(),
             headers: std::collections::HashMap::new(),
             body_template: None,
+            format: None,
         }),
     );
 
@@ -457,6 +513,7 @@ fn registry_from_config_webhook_fails_on_undefined_env_var() {
                     h
                 },
                 body_template: None,
+                format: None,
             }),
         );
 
@@ -498,6 +555,7 @@ fn registry_from_config_mixed_notifiers() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -514,6 +572,7 @@ fn registry_from_config_mixed_notifiers() {
                         h
                     },
                     body_template: None,
+                    format: None,
                 }),
             );
 
@@ -540,77 +599,553 @@ fn registry_from_config_mixed_notifiers() {
     );
 }
 
+// ============================================================================
+// Notification queue: one queue and one delivery task per destination
+// ============================================================================
+
+/// Registry of `TestNotifier`s that always succeed.
+fn make_ok_registry(names: &[&str]) -> NotifierRegistry {
+    let mut registry = NotifierRegistry::new();
+    for name in names {
+        registry
+            .register(Arc::new(TestNotifier {
+                name: name.to_string(),
+                notifier_type: "test".to_string(),
+                should_fail: false,
+            }))
+            .unwrap();
+    }
+    registry
+}
+
+fn to(rule_name: &str, destinations: &[&str]) -> AlertPayload {
+    make_payload_with_destinations(
+        rule_name,
+        destinations.iter().map(|d| d.to_string()).collect(),
+    )
+}
+
+/// Notifier recording the rule name of every alert it delivers.
+///
+/// Optionally panics on its first alert, or waits on `gate` after recording
+/// each alert (to keep a send in flight).
+struct RecordingTestNotifier {
+    name: String,
+    tx: mpsc::UnboundedSender<String>,
+    panic_on_first: AtomicBool,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl RecordingTestNotifier {
+    fn new(name: &str, tx: mpsc::UnboundedSender<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            tx,
+            panic_on_first: AtomicBool::new(false),
+            gate: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Notifier for RecordingTestNotifier {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn notifier_type(&self) -> &str {
+        "test"
+    }
+
+    fn output_format(&self) -> crate::config::OutputFormat {
+        crate::config::OutputFormat::Plain
+    }
+
+    async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
+        if self.panic_on_first.swap(false, AtomicOrdering::SeqCst) {
+            panic!("scripted notifier panic");
+        }
+        let _ = self.tx.send(alert.rule_name.clone());
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        Ok(())
+    }
+}
+
+fn registry_of(notifiers: Vec<RecordingTestNotifier>) -> Arc<NotifierRegistry> {
+    let mut registry = NotifierRegistry::new();
+    for n in notifiers {
+        registry.register(Arc::new(n)).unwrap();
+    }
+    Arc::new(registry)
+}
+
+async fn recv_n(rx: &mut mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(name)) => out.push(name),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Run `f` with a local Prometheus recorder on a current-thread runtime, so
+/// every task it spawns records into that recorder. Returns the rendering.
+fn with_recorder<F: std::future::Future<Output = ()>>(f: impl FnOnce() -> F) -> String {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || rt.block_on(f()));
+    handle.render()
+}
+
+fn assert_series(rendered: &str, series: &str) {
+    assert!(
+        rendered.lines().any(|l| l == series),
+        "missing `{series}` in:\n{rendered}"
+    );
+}
+
 #[test]
 fn send_to_queue_is_non_blocking() {
-    let queue = NotificationQueue::new(10);
-    let _rx = queue.subscribe();
+    let queue = NotificationQueue::new(10, &make_ok_registry(&["test-1"]));
 
-    let payload = make_payload("test_rule");
-    let result = queue.send(payload);
+    let result = queue.send(to("test_rule", &["test-1"]));
 
     assert!(result.is_ok());
     assert_eq!(queue.len(), 1);
 }
 
 #[test]
-fn send_without_receiver_returns_error() {
-    let queue = NotificationQueue::new(10);
+fn send_routes_to_each_destination() {
+    let queue = NotificationQueue::new(10, &make_ok_registry(&["mm-ops", "mm-infra", "other"]));
 
-    let payload = make_payload("test_rule");
-    let result = queue.send(payload);
+    queue.send(to("cpu", &["mm-ops", "mm-infra"])).unwrap();
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        crate::error::QueueError::Closed => {}
-    }
-}
-
-#[tokio::test]
-async fn drop_oldest_when_queue_full() {
-    let queue = NotificationQueue::new(5);
-    let mut rx = queue.subscribe();
-
-    for i in 0..10 {
-        let payload = make_payload(&format!("rule_{}", i));
-        let _ = queue.send(payload);
-    }
-
-    match rx.recv().await {
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-            assert!(n >= 1, "Expected at least 1 lagged message, got {}", n);
-            assert!(n <= 10, "Cannot drop more messages than sent");
-        }
-        Ok(_) => panic!("Expected Lagged error when queue overflows"),
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    }
-}
-
-#[test]
-fn queue_size_updates_on_send() {
-    let queue = NotificationQueue::new(10);
-    let _rx = queue.subscribe();
-
-    assert_eq!(queue.len(), 0);
-    assert!(queue.is_empty());
-
-    queue.send(make_payload("rule_1")).unwrap();
-    assert_eq!(queue.len(), 1);
-
-    queue.send(make_payload("rule_2")).unwrap();
+    assert_eq!(queue.destination_len("mm-ops"), Some(1));
+    assert_eq!(queue.destination_len("mm-infra"), Some(1));
+    assert_eq!(queue.destination_len("other"), Some(0));
+    assert_eq!(queue.destination_len("missing"), None);
     assert_eq!(queue.len(), 2);
 }
 
 #[test]
-fn queue_capacity_is_respected() {
-    let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY);
-    let _rx = queue.subscribe();
+fn send_skips_and_counts_unknown_destination() {
+    let queue = NotificationQueue::new(10, &make_ok_registry(&["mm-ops"]));
 
-    for i in 0..DEFAULT_QUEUE_CAPACITY {
-        let payload = make_payload(&format!("rule_{}", i));
-        queue.send(payload).unwrap();
+    let rendered = with_recorder(|| async {
+        assert!(queue.send(to("cpu", &["ghost", "mm-ops"])).is_ok());
+    });
+
+    assert_eq!(queue.destination_len("mm-ops"), Some(1));
+    assert_eq!(queue.len(), 1);
+    // Counted like any permanent failure: same labels, same order.
+    for name in [
+        "valerter_notify_errors_total",
+        "valerter_alerts_failed_total",
+    ] {
+        assert_series(
+            &rendered,
+            &format!(
+                "{name}{{rule_name=\"cpu\",vl_source=\"vlprod\",notifier_name=\"ghost\",notifier_type=\"unknown\"}} 1"
+            ),
+        );
+    }
+}
+
+#[test]
+fn send_without_known_destination_is_not_an_error() {
+    let queue = NotificationQueue::new(10, &make_ok_registry(&["mm-ops"]));
+    assert!(queue.send(to("cpu", &["ghost"])).is_ok());
+    assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn send_after_worker_stopped_returns_closed() {
+    let registry = Arc::new(make_ok_registry(&["test-1"]));
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    // Pending alerts are accepted before the worker starts.
+    assert!(queue.send(to("before", &["test-1"])).is_ok());
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    worker.run(cancel).await;
+
+    let result = queue.send(to("after", &["test-1"]));
+    assert_eq!(result, Err(crate::error::QueueError::Closed));
+    assert_eq!(result.unwrap_err().to_string(), "notification queue closed");
+}
+
+#[test]
+fn drop_oldest_is_per_destination() {
+    let queue = NotificationQueue::new(5, &make_ok_registry(&["slow", "fast"]));
+
+    for i in 0..10 {
+        queue.send(to(&format!("rule_{i}"), &["slow"])).unwrap();
+    }
+    queue.send(to("fast_rule", &["fast"])).unwrap();
+
+    assert_eq!(queue.destination_len("slow"), Some(5));
+    assert_eq!(queue.destination_len("fast"), Some(1));
+    assert_eq!(queue.len(), 6);
+}
+
+#[test]
+fn queue_capacity_is_exact_per_destination() {
+    let queue = NotificationQueue::new(DEFAULT_QUEUE_CAPACITY, &make_ok_registry(&["a", "b"]));
+
+    for i in 0..200 {
+        queue.send(to(&format!("rule_{i}"), &["a", "b"])).unwrap();
     }
 
-    assert_eq!(queue.len(), DEFAULT_QUEUE_CAPACITY);
+    assert_eq!(queue.destination_len("a"), Some(DEFAULT_QUEUE_CAPACITY));
+    assert_eq!(queue.destination_len("b"), Some(DEFAULT_QUEUE_CAPACITY));
+    assert_eq!(queue.len(), 2 * DEFAULT_QUEUE_CAPACITY);
+}
+
+#[test]
+fn queue_size_updates_on_send() {
+    let queue = NotificationQueue::new(10, &make_ok_registry(&["test-1"]));
+
+    assert_eq!(queue.len(), 0);
+    assert!(queue.is_empty());
+
+    queue.send(to("rule_1", &["test-1"])).unwrap();
+    assert_eq!(queue.len(), 1);
+
+    queue.send(to("rule_2", &["test-1"])).unwrap();
+    assert_eq!(queue.len(), 2);
+}
+
+#[test]
+fn queue_metrics_sum_destinations_and_count_drops_per_destination() {
+    let queue = NotificationQueue::new(3, &make_ok_registry(&["mm-ops", "mm-infra"]));
+
+    let rendered = with_recorder(|| async {
+        // Two alerts to two destinations: 2 + 2 pending deliveries.
+        queue.send(to("cpu", &["mm-ops", "mm-infra"])).unwrap();
+        queue.send(to("cpu", &["mm-ops", "mm-infra"])).unwrap();
+        // Overflow mm-ops only: 2 more alerts, capacity 3 -> 1 dropped.
+        queue.send(to("disk", &["mm-ops"])).unwrap();
+        queue.send(to("disk", &["mm-ops"])).unwrap();
+    });
+
+    assert_series(
+        &rendered,
+        "valerter_destination_queue_size{notifier_name=\"mm-ops\",notifier_type=\"test\"} 3",
+    );
+    assert_series(
+        &rendered,
+        "valerter_destination_queue_size{notifier_name=\"mm-infra\",notifier_type=\"test\"} 2",
+    );
+    assert_series(&rendered, "valerter_queue_size 5");
+    assert_series(&rendered, "valerter_alerts_dropped_total 1");
+    assert_series(
+        &rendered,
+        "valerter_destination_alerts_dropped_total{notifier_name=\"mm-ops\",notifier_type=\"test\"} 1",
+    );
+    assert!(
+        !rendered.contains("valerter_destination_alerts_dropped_total{notifier_name=\"mm-infra\""),
+        "mm-infra dropped nothing:\n{rendered}"
+    );
+}
+
+#[test]
+fn queue_gauges_follow_worker_consumption() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![
+        RecordingTestNotifier::new("mm-ops", tx.clone()),
+        RecordingTestNotifier::new("mm-infra", tx),
+    ]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let rendered = with_recorder(|| async {
+        queue.send(to("cpu", &["mm-ops", "mm-infra"])).unwrap();
+        queue.send(to("cpu", &["mm-ops", "mm-infra"])).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run = tokio::spawn(async move { worker.run(run_cancel).await });
+        assert_eq!(recv_n(&mut rx, 4).await.len(), 4);
+        cancel.cancel();
+        run.await.unwrap();
+    });
+
+    assert_series(&rendered, "valerter_queue_size 0");
+    assert_series(
+        &rendered,
+        "valerter_destination_queue_size{notifier_name=\"mm-ops\",notifier_type=\"test\"} 0",
+    );
+    assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn worker_delivers_each_destination_in_fifo_order() {
+    let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+    let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![
+        RecordingTestNotifier::new("a", tx_a),
+        RecordingTestNotifier::new("b", tx_b),
+    ]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..5 {
+        queue.send(to(&format!("rule_{i}"), &["a", "b"])).unwrap();
+    }
+    queue.send(to("only_b", &["b"])).unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let run = tokio::spawn(async move { worker.run(run_cancel).await });
+
+    // Alerts queued while the worker runs are delivered too.
+    let a = recv_n(&mut rx_a, 5).await;
+    queue.send(to("late", &["a"])).unwrap();
+    let a_late = recv_n(&mut rx_a, 1).await;
+    let b = recv_n(&mut rx_b, 6).await;
+    cancel.cancel();
+    run.await.unwrap();
+
+    assert_eq!(a, vec!["rule_0", "rule_1", "rule_2", "rule_3", "rule_4"]);
+    assert_eq!(a_late, vec!["late"]);
+    assert_eq!(
+        b,
+        vec!["rule_0", "rule_1", "rule_2", "rule_3", "rule_4", "only_b"]
+    );
+}
+
+/// `RecordingTestNotifier` that waits on the returned gate after recording
+/// each alert, keeping that send in flight until a permit is added.
+fn gated_notifier(
+    name: &str,
+    tx: mpsc::UnboundedSender<String>,
+) -> (RecordingTestNotifier, Arc<tokio::sync::Semaphore>) {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut notifier = RecordingTestNotifier::new(name, tx);
+    notifier.gate = Some(Arc::clone(&gate));
+    (notifier, gate)
+}
+
+fn drain_rx(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+#[tokio::test]
+async fn drain_sends_pending_alerts_in_fifo_order() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![RecordingTestNotifier::new("mm-ops", tx)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    // Shutdown requested while the three alerts are still queued.
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker.run(drain))
+        .await
+        .expect("worker should stop once its queue is drained");
+
+    assert_eq!(drain_rx(&mut rx), vec!["rule_0", "rule_1", "rule_2"]);
+    assert!(queue.is_empty());
+    assert_eq!(
+        queue.send(to("after", &["mm-ops"])),
+        Err(crate::error::QueueError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn drain_of_a_destination_is_not_held_by_a_blocked_one() {
+    let (tx_blocked, mut rx_blocked) = mpsc::unbounded_channel();
+    let (tx_ok, mut rx_ok) = mpsc::unbounded_channel();
+    let (blocked, gate) = gated_notifier("blocked", tx_blocked);
+    let registry = registry_of(vec![blocked, RecordingTestNotifier::new("ok", tx_ok)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..3 {
+        queue
+            .send(to(&format!("rule_{i}"), &["blocked", "ok"]))
+            .unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    let run = tokio::spawn(async move { worker.run(drain).await });
+
+    assert_eq!(
+        recv_n(&mut rx_ok, 3).await,
+        vec!["rule_0", "rule_1", "rule_2"]
+    );
+    assert_eq!(recv_n(&mut rx_blocked, 1).await, vec!["rule_0"]);
+    assert_eq!(queue.destination_len("ok"), Some(0));
+    assert_eq!(queue.destination_len("blocked"), Some(2));
+    assert!(!run.is_finished(), "blocked destination is still draining");
+
+    gate.add_permits(10);
+    tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .expect("worker should stop once every queue is drained")
+        .unwrap();
+    assert_eq!(drain_rx(&mut rx_blocked), vec!["rule_1", "rule_2"]);
+    assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn drain_of_empty_queues_returns_immediately() {
+    let registry = Arc::new(make_ok_registry(&["a", "b"]));
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let run = tokio::spawn(async move { worker.run(run_drain).await });
+    tokio::task::yield_now().await;
+    drain.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), run)
+        .await
+        .expect("an empty queue must not delay the shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drain_requested_during_send_finishes_it_then_sends_the_rest() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (notifier, gate) = gated_notifier("mm-ops", tx);
+    let registry = registry_of(vec![notifier]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let run = tokio::spawn(async move { worker.run(run_drain).await });
+
+    // First alert in flight, then shutdown is requested.
+    assert_eq!(recv_n(&mut rx, 1).await, vec!["rule_0"]);
+    drain.cancel();
+    gate.add_permits(10);
+    tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .expect("worker should stop once its queue is drained")
+        .unwrap();
+
+    assert_eq!(drain_rx(&mut rx), vec!["rule_1", "rule_2"]);
+    assert!(queue.is_empty());
+    assert_eq!(
+        queue.send(to("after", &["mm-ops"])),
+        Err(crate::error::QueueError::Closed)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn await_worker_drain_reports_drained_worker() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registry = registry_of(vec![RecordingTestNotifier::new("mm-ops", tx)]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    drain.cancel();
+    let handle = tokio::spawn(async move { worker.run(drain).await });
+    let start = tokio::time::Instant::now();
+
+    let outcome = await_worker_drain(handle, &queue, SHUTDOWN_DRAIN_TIMEOUT).await;
+
+    assert_eq!(outcome, DrainOutcome::Drained);
+    assert!(start.elapsed() < SHUTDOWN_DRAIN_TIMEOUT);
+    assert_eq!(drain_rx(&mut rx).len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn await_worker_drain_aborts_worker_after_timeout() {
+    assert_eq!(SHUTDOWN_DRAIN_TIMEOUT, std::time::Duration::from_secs(20));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    // The gate never gets a permit: the first send blocks forever.
+    let (notifier, _gate) = gated_notifier("mm-ops", tx);
+    let registry = registry_of(vec![notifier]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+    for i in 0..3 {
+        queue.send(to(&format!("rule_{i}"), &["mm-ops"])).unwrap();
+    }
+
+    let drain = tokio_util::sync::CancellationToken::new();
+    let run_drain = drain.clone();
+    let handle = tokio::spawn(async move { worker.run(run_drain).await });
+    let abort_handle = handle.abort_handle();
+    assert_eq!(recv_n(&mut rx, 1).await, vec!["rule_0"]);
+    drain.cancel();
+    let start = tokio::time::Instant::now();
+
+    let outcome = await_worker_drain(handle, &queue, SHUTDOWN_DRAIN_TIMEOUT).await;
+
+    assert_eq!(outcome, DrainOutcome::TimedOut { undelivered: 2 });
+    assert_eq!(start.elapsed(), SHUTDOWN_DRAIN_TIMEOUT);
+    assert!(abort_handle.is_finished(), "worker task must be aborted");
+}
+
+#[test]
+fn notifier_panic_is_isolated_and_counted() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx_other, mut rx_other) = mpsc::unbounded_channel();
+    let panicky = RecordingTestNotifier::new("webhook-x", tx);
+    panicky.panic_on_first.store(true, AtomicOrdering::SeqCst);
+    let registry = registry_of(vec![
+        panicky,
+        RecordingTestNotifier::new("mm-ops", tx_other),
+    ]);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let rendered = with_recorder(|| async {
+        queue.send(to("cpu", &["webhook-x", "mm-ops"])).unwrap();
+        queue.send(to("disk", &["webhook-x", "mm-ops"])).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run = tokio::spawn(async move { worker.run(run_cancel).await });
+
+        // The alert after the panic is delivered normally.
+        assert_eq!(recv_n(&mut rx, 1).await, vec!["disk"]);
+        assert_eq!(recv_n(&mut rx_other, 2).await, vec!["cpu", "disk"]);
+
+        // The destination still accepts and delivers alerts.
+        queue.send(to("mem", &["webhook-x"])).unwrap();
+        assert_eq!(recv_n(&mut rx, 1).await, vec!["mem"]);
+        cancel.cancel();
+        run.await.unwrap();
+    });
+
+    for name in [
+        "valerter_notify_errors_total",
+        "valerter_alerts_failed_total",
+    ] {
+        assert_series(
+            &rendered,
+            &format!(
+                "{name}{{rule_name=\"cpu\",vl_source=\"vlprod\",notifier_name=\"webhook-x\",notifier_type=\"test\"}} 1"
+            ),
+        );
+    }
 }
 
 #[test]
@@ -640,17 +1175,20 @@ fn backoff_delay_handles_overflow() {
 #[test]
 fn alert_payload_clone_works() {
     let payload = AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: "Test".to_string(),
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: "my_rule".to_string(),
         vl_source: "vlprod".to_string(),
         destinations: vec!["mattermost-infra".to_string()],
         log_timestamp: "2026-01-15T10:00:00Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     };
 
     let cloned = payload.clone();
@@ -667,39 +1205,18 @@ fn alert_payload_clone_works() {
 
 #[test]
 fn queue_is_clone() {
-    let queue1 = NotificationQueue::new(10);
+    let queue1 = NotificationQueue::new(10, &make_ok_registry(&["test-1"]));
     let queue2 = queue1.clone();
 
-    let _rx = queue1.subscribe();
-
-    queue1.send(make_payload("rule_1")).unwrap();
+    queue1.send(to("rule_1", &["test-1"])).unwrap();
     assert_eq!(queue2.len(), 1);
 }
 
 #[test]
 fn queue_debug_format() {
-    let queue = NotificationQueue::new(10);
+    let queue = NotificationQueue::new(10, &make_ok_registry(&[]));
     let debug = format!("{:?}", queue);
     assert!(debug.contains("NotificationQueue"));
-}
-
-#[tokio::test]
-async fn multiple_messages_consumed_in_order() {
-    let queue = NotificationQueue::new(10);
-    let mut rx = queue.subscribe();
-
-    for i in 0..3 {
-        queue.send(make_payload(&format!("rule_{}", i))).unwrap();
-    }
-
-    let msg0 = rx.recv().await.unwrap();
-    assert_eq!(msg0.rule_name, "rule_0");
-
-    let msg1 = rx.recv().await.unwrap();
-    assert_eq!(msg1.rule_name, "rule_1");
-
-    let msg2 = rx.recv().await.unwrap();
-    assert_eq!(msg2.rule_name, "rule_2");
 }
 
 #[test]
@@ -738,6 +1255,7 @@ fn registry_from_config_creates_email_notifiers() {
             subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }),
     );
 
@@ -781,6 +1299,7 @@ fn registry_from_config_email_with_auth() {
                     subject_template: "{{ title }}".to_string(),
                     body_template: None,
                     body_template_file: None,
+                    format: None,
                 }),
             );
 
@@ -820,6 +1339,7 @@ fn registry_from_config_email_fails_on_undefined_env_var() {
                 subject_template: "{{ title }}".to_string(),
                 body_template: None,
                 body_template_file: None,
+                format: None,
             }),
         );
 
@@ -859,6 +1379,7 @@ fn registry_from_config_email_fails_on_invalid_from_address() {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }),
     );
 
@@ -895,6 +1416,7 @@ fn registry_from_config_all_three_notifier_types() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -906,6 +1428,7 @@ fn registry_from_config_all_three_notifier_types() {
                     method: "POST".to_string(),
                     headers: std::collections::HashMap::new(),
                     body_template: None,
+                    format: None,
                 }),
             );
 
@@ -926,6 +1449,7 @@ fn registry_from_config_all_three_notifier_types() {
                     subject_template: "{{ title }}".to_string(),
                     body_template: None,
                     body_template_file: None,
+                    format: None,
                 }),
             );
 
@@ -964,6 +1488,7 @@ fn registry_from_config_creates_telegram_notifier() {
             disable_notification: None,
             disable_web_page_preview: Some(true),
             body_template: None,
+            format: None,
         }),
     );
 
@@ -998,6 +1523,7 @@ fn registry_from_config_propagates_telegram_validation_errors() {
             disable_notification: None,
             disable_web_page_preview: None,
             body_template: None,
+            format: None,
         }),
     );
 
@@ -1006,4 +1532,339 @@ fn registry_from_config_propagates_telegram_validation_errors() {
 
     let errs = result.unwrap_err();
     assert!(errs.iter().any(|e| e.to_string().contains("chat_ids")));
+}
+
+fn mattermost_registry_errors(env_value: &str) -> String {
+    temp_env::with_var("HCV_MM_WEBHOOK", Some(env_value), || {
+        let mut notifiers_config = HashMap::new();
+        notifiers_config.insert(
+            "mm".to_string(),
+            NotifierConfig::Mattermost(MattermostNotifierConfig {
+                webhook_url: SecretString::new("${HCV_MM_WEBHOOK}".to_string()),
+                channel: None,
+                username: None,
+                icon_url: None,
+                format: None,
+            }),
+        );
+        match NotifierRegistry::from_config(
+            &notifiers_config,
+            reqwest::Client::new(),
+            &test_config_dir(),
+        ) {
+            Ok(_) => String::new(),
+            Err(errors) => errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    })
+}
+
+#[test]
+#[serial]
+fn registry_rejects_resolved_mattermost_url_with_bad_scheme() {
+    let msg = mattermost_registry_errors("htps://mm.example.com/hooks/SECRET");
+    assert!(
+        msg.contains("invalid notifier 'mm': webhook_url: invalid URL:"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+#[serial]
+fn registry_rejects_resolved_mattermost_url_that_does_not_parse() {
+    let msg = mattermost_registry_errors("not a url SECRET");
+    assert!(
+        msg.contains("invalid notifier 'mm': webhook_url: invalid URL:"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+#[test]
+#[serial]
+fn registry_accepts_resolved_mattermost_url() {
+    assert_eq!(
+        mattermost_registry_errors("https://mm.example.com/hooks/abc"),
+        ""
+    );
+}
+
+// ============================================================
+// Output format of notifiers (markdown-body-format)
+// ============================================================
+
+/// Builds the notifiers of `yaml` (a `notifiers:` map).
+fn registry_from_yaml(yaml: &str) -> Result<NotifierRegistry, Vec<String>> {
+    let config: crate::config::NotifiersConfig = serde_yaml::from_str(yaml).unwrap();
+    NotifierRegistry::from_config(&config, reqwest::Client::new(), &test_config_dir())
+        .map_err(|errors| errors.iter().map(ToString::to_string).collect())
+}
+
+const MATTERMOST: &str = "type: mattermost\n  webhook_url: https://mm.example.com/hooks/x";
+const TELEGRAM: &str = "type: telegram\n  bot_token: \"123:abc\"\n  chat_ids: [\"-100\"]";
+const EMAIL: &str = "type: email\n  smtp: {host: smtp.example.com, port: 587}\n  from: a@example.com\n  to: [b@example.com]\n  subject_template: \"{{ title }}\"";
+const WEBHOOK: &str = "type: webhook\n  url: https://hook.example.com/x";
+
+fn format_of(definition: &str, extra: &str) -> Result<crate::config::OutputFormat, Vec<String>> {
+    let yaml = format!("n:\n  {definition}\n  {extra}\n");
+    registry_from_yaml(&yaml).map(|registry| registry.get("n").unwrap().output_format())
+}
+
+#[test]
+fn notifier_output_format_defaults() {
+    use crate::config::OutputFormat::*;
+    assert_eq!(format_of(MATTERMOST, ""), Ok(Markdown));
+    assert_eq!(format_of(TELEGRAM, ""), Ok(TelegramHtml));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: HTML"), Ok(TelegramHtml));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: MarkdownV2"), Ok(Plain));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: Markdown"), Ok(Plain));
+    assert_eq!(format_of(EMAIL, ""), Ok(Html));
+    assert_eq!(format_of(WEBHOOK, ""), Ok(Plain));
+}
+
+#[test]
+fn notifier_output_format_accepted_values() {
+    use crate::config::OutputFormat::*;
+    assert_eq!(format_of(MATTERMOST, "format: markdown"), Ok(Markdown));
+    assert_eq!(
+        format_of(TELEGRAM, "format: telegram_html"),
+        Ok(TelegramHtml)
+    );
+    assert_eq!(format_of(TELEGRAM, "format: plain"), Ok(Plain));
+    assert_eq!(
+        format_of(TELEGRAM, "format: plain\n  parse_mode: MarkdownV2"),
+        Ok(Plain)
+    );
+    assert_eq!(format_of(EMAIL, "format: html"), Ok(Html));
+    assert_eq!(format_of(WEBHOOK, "format: plain"), Ok(Plain));
+    assert_eq!(format_of(WEBHOOK, "format: markdown"), Ok(Markdown));
+    assert_eq!(format_of(WEBHOOK, "format: html"), Ok(Html));
+}
+
+#[test]
+fn notifier_output_format_refused_values() {
+    let refused = |definition: &str, format: &str| {
+        format_of(definition, &format!("format: {format}")).unwrap_err()
+    };
+    assert_eq!(
+        refused(EMAIL, "plain"),
+        [
+            "invalid notifier 'n': format 'plain' is not supported for email notifiers (expected html)"
+        ]
+    );
+    assert_eq!(
+        refused(MATTERMOST, "plain"),
+        [
+            "invalid notifier 'n': format 'plain' is not supported for mattermost notifiers (expected markdown)"
+        ]
+    );
+    assert_eq!(
+        refused(TELEGRAM, "markdown"),
+        [
+            "invalid notifier 'n': format 'markdown' is not supported for telegram notifiers (expected telegram_html, plain)"
+        ]
+    );
+    assert_eq!(
+        refused(WEBHOOK, "telegram_html"),
+        [
+            "invalid notifier 'n': format 'telegram_html' is not supported for webhook notifiers (expected plain, markdown, html)"
+        ]
+    );
+}
+
+#[test]
+fn telegram_html_format_requires_html_parse_mode() {
+    assert_eq!(
+        format_of(TELEGRAM, "format: telegram_html\n  parse_mode: MarkdownV2").unwrap_err(),
+        ["invalid notifier 'n': format 'telegram_html' requires parse_mode HTML"]
+    );
+}
+
+#[test]
+fn unknown_format_value_is_rejected_at_load() {
+    let yaml = format!("n:\n  {WEBHOOK}\n  format: md\n");
+    let err = serde_yaml::from_str::<crate::config::NotifiersConfig>(&yaml)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("format") || err.contains("md"), "{err}");
+}
+
+// ============================================================
+// Markdown body end to end (markdown-body-format): engine → queue →
+// Mattermost, Telegram and webhook notifiers (wiremock). Here rather than in
+// tests/: the Telegram Bot API endpoint is only redirectable from the crate.
+// ============================================================
+
+/// Bodies received for one alert of a rule whose template body is
+/// `**{{ host }}**` (`host=a_b`) in `body_format`, routed to a Mattermost, a
+/// Telegram and a default webhook notifier: (Mattermost attachment text,
+/// Telegram text, webhook JSON `body`).
+async fn markdown_end_to_end(body_format: crate::config::BodyFormat) -> (String, String, String) {
+    use crate::config::{
+        CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, MetricsConfig,
+        NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let sink = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+        .mount(&sink)
+        .await;
+
+    let vl = MockServer::start().await;
+    let line = b"{\"_time\":\"2026-01-15T10:49:35Z\",\"_stream\":\"{}\",\"_msg\":\"x\",\"host\":\"a_b\"}\n";
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(line.to_vec(), "application/x-ndjson"),
+        )
+        .up_to_n_times(1)
+        .mount(&vl)
+        .await;
+
+    let client = reqwest::Client::new();
+    let mut registry = NotifierRegistry::new();
+    registry
+        .register(Arc::new(MattermostNotifier::new(
+            "mm".to_string(),
+            SecretString::new(format!("{}/mm", sink.uri())),
+            client.clone(),
+        )))
+        .unwrap();
+    registry
+        .register(Arc::new(TelegramNotifier::new_for_tests(
+            "tg",
+            format!("{}/botTOKEN/sendMessage", sink.uri()),
+            vec!["-100".to_string()],
+            client.clone(),
+        )))
+        .unwrap();
+    let webhook_config = WebhookNotifierConfig {
+        url: SecretString::new(format!("{}/hook", sink.uri())),
+        method: "POST".to_string(),
+        headers: HashMap::new(),
+        body_template: None,
+        format: None,
+    };
+    registry
+        .register(Arc::new(
+            WebhookNotifier::from_config("hook", &webhook_config, client.clone()).unwrap(),
+        ))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let config = RuntimeConfig {
+        victorialogs: BTreeMap::from([(
+            "vlprod".to_string(),
+            VlSourceConfig {
+                url: vl.uri(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+        )]),
+        defaults: DefaultsConfig {
+            throttle: ThrottleConfig {
+                key: None,
+                count: 5,
+                window: Duration::from_secs(60),
+            },
+            timestamp_timezone: "UTC".to_string(),
+            max_streams: crate::config::DEFAULT_MAX_STREAMS,
+        },
+        templates: HashMap::from([(
+            "tpl".to_string(),
+            CompiledTemplate {
+                title: "Alert".to_string(),
+                body: "**{{ host }}**".to_string(),
+                email_body_html: None,
+                accent_color: None,
+                body_format,
+            },
+        )]),
+        rules: vec![CompiledRule {
+            name: "md_rule".to_string(),
+            enabled: true,
+            query: "_stream:test".to_string(),
+            parser: CompiledParser {
+                regex: None,
+                json: None,
+            },
+            throttle: None,
+            notify: NotifyConfig {
+                template: "tpl".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["mm".to_string(), "tg".to_string(), "hook".to_string()],
+            },
+            vl_sources: vec![],
+        }],
+        metrics: MetricsConfig::default(),
+        notifiers: None,
+        config_dir: std::path::PathBuf::from("."),
+    };
+    let engine = crate::RuleEngine::new(config, client, queue);
+
+    let cancel = CancellationToken::new();
+    let engine_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { engine.run(cancel).await }
+    });
+    let worker_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+    let start = tokio::time::Instant::now();
+    while sink.received_requests().await.unwrap_or_default().len() < 3
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), engine_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+
+    let requests = sink.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "one request per notifier");
+    let body_of = |prefix: &str| -> serde_json::Value {
+        let request = requests
+            .iter()
+            .find(|r| r.url.path().starts_with(prefix))
+            .unwrap_or_else(|| panic!("no request to {prefix}"));
+        serde_json::from_slice(&request.body).unwrap()
+    };
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    (
+        text(&body_of("/mm")["attachments"][0]["text"]),
+        text(&body_of("/botTOKEN")["text"]),
+        text(&body_of("/hook")["body"]),
+    )
+}
+
+#[tokio::test]
+async fn markdown_rule_reaches_each_notifier_in_its_format() {
+    let (mattermost, telegram, webhook) =
+        markdown_end_to_end(crate::config::BodyFormat::Markdown).await;
+    assert_eq!(mattermost, r"**a\_b**");
+    assert_eq!(telegram, "<b>Alert</b>\n<b>a_b</b>");
+    assert_eq!(webhook, "a_b");
+}
+
+#[tokio::test]
+async fn text_rule_reaches_each_notifier_unchanged() {
+    let (mattermost, telegram, webhook) =
+        markdown_end_to_end(crate::config::BodyFormat::Text).await;
+    assert_eq!(mattermost, "**a_b**");
+    assert_eq!(telegram, "<b>Alert</b>\n**a_b**");
+    assert_eq!(webhook, "**a_b**");
 }

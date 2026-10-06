@@ -9,16 +9,21 @@
 //! - Production: Uses `AsyncSmtpTransport<Tokio1Executor>`
 //! - Testing: Uses `MockEmailTransport` for unit tests without SMTP server
 
-use crate::config::{EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars};
+use crate::config::{
+    EmailNotifierConfig, OutputFormat, TlsMode, resolve_body_template, resolve_env_vars,
+    validate_notifier_template,
+};
 use crate::error::{ConfigError, NotifyError};
-use crate::notify::{AlertPayload, Notifier, backoff_delay};
+use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
+use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::transport::smtp::response::{Code, Severity};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use minijinja::{Environment, context};
+use minijinja::context;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,8 +64,63 @@ pub trait EmailTransport: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(())` - Email sent successfully
-    /// * `Err(String)` - Error message describing the failure
-    async fn send_email(&self, message: Message) -> Result<(), String>;
+    /// * `Err(EmailSendError)` - Failure, classified as permanent or transient
+    async fn send_email(&self, message: Message) -> Result<(), EmailSendError>;
+}
+
+/// Failure reported by an [`EmailTransport`].
+///
+/// `permanent` drives the retry decision: a permanent error is not retried
+/// for the recipient, a transient one is retried with backoff. `message` is
+/// only used for logs and the returned error, never for the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailSendError {
+    /// True for a 5xx SMTP reply, false for anything else.
+    pub permanent: bool,
+    /// Human-readable description of the failure.
+    pub message: String,
+}
+
+impl EmailSendError {
+    /// A permanent (non-retryable) failure.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            permanent: true,
+            message: message.into(),
+        }
+    }
+
+    /// A transient (retryable) failure.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            permanent: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EmailSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Classify an SMTP failure from its reply code.
+///
+/// A 5xx reply (RFC 5321 permanent negative completion, including `535`
+/// authentication failures) is permanent. A 4xx reply, or no reply at all
+/// (network, TLS, timeout, client-side errors), is transient. The message
+/// text never takes part in the decision.
+fn classify_smtp_status(status: Option<Code>, message: String) -> EmailSendError {
+    let permanent =
+        status.is_some_and(|code| code.severity == Severity::PermanentNegativeCompletion);
+    EmailSendError { permanent, message }
+}
+
+/// Classify a lettre SMTP error. `status()` is only set for 4xx/5xx replies,
+/// which is exactly what `is_permanent()`/`is_transient()` match on.
+fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> EmailSendError {
+    classify_smtp_status(error.status(), error.to_string())
 }
 
 /// Real SMTP transport wrapper implementing `EmailTransport`.
@@ -79,12 +139,12 @@ impl SmtpTransport {
 
 #[async_trait]
 impl EmailTransport for SmtpTransport {
-    async fn send_email(&self, message: Message) -> Result<(), String> {
+    async fn send_email(&self, message: Message) -> Result<(), EmailSendError> {
         self.inner
             .send(message)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| classify_smtp_error(&e))
     }
 }
 
@@ -99,10 +159,10 @@ impl EmailTransport for SmtpTransport {
 ///
 /// # Retry Policy
 ///
-/// - **Connection errors**: Retry (timeout, connection refused)
-/// - **Authentication errors**: Do NOT retry (invalid credentials)
-/// - **Transient SMTP errors**: Retry (4xx responses)
-/// - **Permanent SMTP errors**: Do NOT retry (5xx responses)
+/// - **Connection, TLS and timeout errors**: Retry (no SMTP reply)
+/// - **Transient SMTP errors**: Retry (4xx replies)
+/// - **Permanent SMTP errors**: Do NOT retry (5xx replies, including `535`
+///   authentication failures)
 ///
 /// # Testability (Story 7.2)
 ///
@@ -120,10 +180,25 @@ pub struct EmailNotifier {
     from: Mailbox,
     /// Recipient email addresses.
     to: Vec<Mailbox>,
-    /// Subject line template source.
-    subject_template_source: String,
-    /// Body template source (always has a value - defaults to embedded template).
-    body_template_source: String,
+    /// Subject line template, compiled once.
+    subject_template: NotifierTemplate,
+    /// Body template (file, inline or embedded default), compiled once with
+    /// HTML auto-escaping.
+    body_template: NotifierTemplate,
+}
+
+/// Variables of the email templates: the common layer 2 context plus
+/// `accent_color`.
+fn email_context_variables() -> Vec<&'static str> {
+    let mut known = CONTEXT_VARIABLES.to_vec();
+    known.push("accent_color");
+    known
+}
+
+/// Compile a validated subject (`html == false`) or body (`html == true`)
+/// template; `field` prefixes the (unexpected) error.
+fn compile_template(field: &str, source: String, html: bool) -> Result<NotifierTemplate, String> {
+    NotifierTemplate::compile(source, html).map_err(|e| format!("{field}: {e}"))
 }
 
 impl EmailNotifier {
@@ -198,21 +273,26 @@ impl EmailNotifier {
             });
         }
 
-        // 5. Validate the subject template (syntax)
-        Self::validate_template(&config.subject_template).map_err(|e| {
-            ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("subject_template: {}", e),
-            }
-        })?;
+        // The message is a single `text/html` part: `html` is the only format.
+        OutputFormat::resolve(
+            config.format,
+            OutputFormat::Html,
+            &[OutputFormat::Html],
+            name,
+            "email",
+        )?;
 
-        // 5b. Validate the subject template (render test for unknown filters)
-        crate::config::validate_template_render(&config.subject_template).map_err(|e| {
-            ConfigError::InvalidNotifier {
-                name: name.to_string(),
-                message: format!("subject_template render: {}", e),
-            }
-        })?;
+        // 5. Validate the subject template (syntax, then render test), then
+        // compile it once
+        let subject_template =
+            validate_notifier_template("subject_template", &config.subject_template)
+                .and_then(|()| {
+                    compile_template("subject_template", config.subject_template.clone(), false)
+                })
+                .map_err(|message| ConfigError::InvalidNotifier {
+                    name: name.to_string(),
+                    message,
+                })?;
 
         // 6. Resolve body template (file > inline > embedded default)
         let body_template_source = match resolve_body_template(config, config_dir)? {
@@ -220,21 +300,26 @@ impl EmailNotifier {
             None => DEFAULT_BODY_TEMPLATE.to_string(),
         };
 
-        // 7. Validate the body template
-        Self::validate_template(&body_template_source).map_err(|e| {
-            ConfigError::InvalidNotifier {
+        // 7. Validate the retained body template (file, inline or embedded):
+        // syntax, then render test, then compile it once (HTML auto-escape)
+        let body_template = validate_notifier_template("body_template", &body_template_source)
+            .and_then(|()| compile_template("body_template", body_template_source, true))
+            .map_err(|message| ConfigError::InvalidNotifier {
                 name: name.to_string(),
-                message: format!("body_template: {}", e),
-            }
-        })?;
+                message,
+            })?;
+
+        let known = email_context_variables();
+        subject_template.warn_unknown_variables(name, "subject_template", &known);
+        body_template.warn_unknown_variables(name, "body_template", &known);
 
         Ok(Self {
             name: name.to_string(),
             transport: Arc::new(SmtpTransport::new(transport)),
             from,
             to,
-            subject_template_source: config.subject_template.clone(),
-            body_template_source,
+            subject_template,
+            body_template,
         })
     }
 
@@ -280,10 +365,20 @@ impl EmailNotifier {
             transport,
             from,
             to,
-            subject_template_source: subject_template_source.to_string(),
-            body_template_source: body_template_source
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_BODY_TEMPLATE.to_string()),
+            subject_template: compile_template(
+                "subject_template",
+                subject_template_source.to_string(),
+                false,
+            )
+            .expect("test subject template compiles"),
+            body_template: compile_template(
+                "body_template",
+                body_template_source
+                    .unwrap_or(DEFAULT_BODY_TEMPLATE)
+                    .to_string(),
+                true,
+            )
+            .expect("test body template compiles"),
         }
     }
 
@@ -360,73 +455,50 @@ impl EmailNotifier {
         Ok(builder.build())
     }
 
-    /// Validate a minijinja template syntax.
-    fn validate_template(source: &str) -> Result<(), String> {
-        let mut env = Environment::new();
-        env.add_template("_validate", source)
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Render the subject template with alert context.
+    /// Render the subject template with alert context. A subject is text:
+    /// `body` is the `plain` rendering of a Markdown body.
     fn render_subject(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        let mut env = Environment::new();
-        env.add_template("subject", &self.subject_template_source)
-            .map_err(|e| NotifyError::TemplateError(format!("template error: {}", e)))?;
-
-        let tmpl = env
-            .get_template("subject")
-            .map_err(|e| NotifyError::TemplateError(format!("template error: {}", e)))?;
-
-        tmpl.render(context! {
-            title => &alert.message.title,
-            body => &alert.message.body,
-            rule_name => &alert.rule_name,
-            vl_source => &alert.vl_source,
-            accent_color => &alert.message.accent_color,
-            log_timestamp => &alert.log_timestamp,
-            log_timestamp_formatted => &alert.log_timestamp_formatted,
-        })
-        .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
+        self.subject_template
+            .render(context! {
+                title => &alert.message.title,
+                body => alert.message.body_for(OutputFormat::Plain).text,
+                rule_name => &alert.rule_name,
+                vl_source => &alert.vl_source,
+                accent_color => &alert.message.accent_color,
+                log_timestamp => &alert.log_timestamp,
+                log_timestamp_formatted => &alert.log_timestamp_formatted,
+                log => &alert.log,
+            })
+            .map_err(|e| NotifyError::TemplateError(format!("template render error: {}", e)))
     }
 
     /// Render the body template with alert context.
     ///
-    /// Uses `email_body_html` from the template engine (already HTML-escaped) if available,
-    /// otherwise falls back to `body`. The body is marked as "safe" (pre-escaped) so
-    /// the template doesn't need `| safe` filter - this prevents user errors if they
-    /// edit the email template and accidentally remove the filter.
+    /// `body` is, by priority: `email_body_html` from the template engine
+    /// (already HTML-escaped), the `html` rendering of a Markdown body
+    /// (already escaped), or the text `body` (fallback message), escaped by
+    /// the template. The first two are marked "safe" so the template doesn't
+    /// need `| safe` filter - this prevents user errors if they edit the
+    /// email template and accidentally remove the filter. Every other value,
+    /// `log` fields included, is HTML-escaped automatically.
     fn render_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        let mut env = Environment::new();
-        // HTML auto-escape for title/rule_name/etc
-        env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
-        env.add_template("body", &self.body_template_source)
-            .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
+        let body = match &alert.message.email_body_html {
+            Some(html) => minijinja::Value::from_safe_string(html.clone()),
+            None => alert.message.body_for(OutputFormat::Html).to_value(),
+        };
 
-        let tmpl = env
-            .get_template("body")
-            .map_err(|e| NotifyError::TemplateError(format!("body template error: {}", e)))?;
-
-        // Use email_body_html if available (already HTML-escaped), otherwise fall back to body
-        let body_content = alert
-            .message
-            .email_body_html
-            .as_ref()
-            .unwrap_or(&alert.message.body);
-
-        // Mark body as pre-escaped (safe) so template doesn't need | safe filter
-        let body_safe = minijinja::Value::from_safe_string(body_content.clone());
-
-        tmpl.render(context! {
-            title => &alert.message.title,
-            body => body_safe,
-            rule_name => &alert.rule_name,
-            vl_source => &alert.vl_source,
-            accent_color => &alert.message.accent_color,
-            log_timestamp => &alert.log_timestamp,
-            log_timestamp_formatted => &alert.log_timestamp_formatted,
-        })
-        .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
+        self.body_template
+            .render(context! {
+                title => &alert.message.title,
+                body => body,
+                rule_name => &alert.rule_name,
+                vl_source => &alert.vl_source,
+                accent_color => &alert.message.accent_color,
+                log_timestamp => &alert.log_timestamp,
+                log_timestamp_formatted => &alert.log_timestamp_formatted,
+                log => &alert.log,
+            })
+            .map_err(|e| NotifyError::TemplateError(format!("body template render error: {}", e)))
     }
 
     /// Build the email message for a specific recipient.
@@ -470,24 +542,23 @@ impl EmailNotifier {
                     );
                     return Ok(());
                 }
-                Err(error_str) => {
-                    // Check for permanent errors (don't retry)
-                    if Self::is_permanent_error(&error_str) {
+                Err(error) => {
+                    if error.permanent {
                         tracing::warn!(
                             recipient = %recipient,
-                            error = %error_str,
+                            error = %error,
                             "Permanent SMTP error, not retrying for this recipient"
                         );
                         return Err(NotifyError::SendFailed(format!(
                             "permanent error for {}: {}",
-                            recipient, error_str
+                            recipient, error
                         )));
                     }
 
                     tracing::debug!(
                         attempt = attempt,
                         recipient = %recipient,
-                        error = %error_str,
+                        error = %error,
                         "Failed to send email, retrying"
                     );
 
@@ -501,30 +572,6 @@ impl EmailNotifier {
 
         Err(NotifyError::MaxRetriesExceeded)
     }
-
-    /// Check if an SMTP error is permanent and should not be retried.
-    ///
-    /// Uses word boundary matching to avoid false positives when SMTP codes
-    /// appear in email addresses or other contexts.
-    fn is_permanent_error(error_str: &str) -> bool {
-        // Helper to check if a code appears as a word boundary (not part of email/text)
-        let contains_smtp_code = |code: &str| {
-            error_str
-                .split(|c: char| !c.is_ascii_digit())
-                .any(|segment| segment == code)
-        };
-
-        // Authentication failures
-        error_str.to_lowercase().contains("authentication")
-            || contains_smtp_code("535")
-            || error_str.to_lowercase().contains("invalid credentials")
-            // Mailbox/recipient permanent errors (5xx)
-            || contains_smtp_code("550") // Mailbox unavailable
-            || contains_smtp_code("551") // User not local
-            || contains_smtp_code("552") // Message size exceeded
-            || contains_smtp_code("553") // Mailbox name invalid
-            || contains_smtp_code("554") // Transaction failed
-    }
 }
 
 #[async_trait]
@@ -535,6 +582,10 @@ impl Notifier for EmailNotifier {
 
     fn notifier_type(&self) -> &str {
         "email"
+    }
+
+    fn output_format(&self) -> OutputFormat {
+        OutputFormat::Html
     }
 
     /// Send alert to all configured recipients.
@@ -553,9 +604,18 @@ impl Notifier for EmailNotifier {
         );
 
         async {
-            // Render templates once for all recipients
-            let subject = self.render_subject(alert)?;
-            let body = self.render_body(alert)?;
+            // Render templates once for all recipients. A render error is a
+            // permanent failure for this alert: count it, send nothing.
+            let rendered = self
+                .render_subject(alert)
+                .and_then(|subject| self.render_body(alert).map(|body| (subject, body)));
+            let (subject, body) = match rendered {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    record_permanent_failure(alert, &self.name, "email");
+                    return Err(e);
+                }
+            };
             tracing::trace!(
                 subject_len = subject.len(),
                 body_len = body.len(),
@@ -619,23 +679,7 @@ impl Notifier for EmailNotifier {
                     recipient_count = failure_count,
                     "Email delivery failed to all recipients"
                 );
-                metrics::counter!(
-                    "valerter_notify_errors_total",
-                    "rule_name" => alert.rule_name.clone(),
-                    "vl_source" => alert.vl_source.clone(),
-                    "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email",
-                )
-                .increment(1);
-                // Permanent failure - all recipients failed
-                metrics::counter!(
-                    "valerter_alerts_failed_total",
-                    "rule_name" => alert.rule_name.clone(),
-                    "vl_source" => alert.vl_source.clone(),
-                    "notifier_name" => self.name.clone(),
-                    "notifier_type" => "email",
-                )
-                .increment(1);
+                record_permanent_failure(alert, &self.name, "email");
                 Err(NotifyError::SendFailed(format!(
                     "all {} recipients failed",
                     failure_count
@@ -681,8 +725,8 @@ mod tests {
         send_count: AtomicU32,
         /// If Some, returns this error on next send.
         fail_next_n: AtomicU32,
-        /// Error message to return when failing.
-        error_message: Mutex<String>,
+        /// Error to return when failing.
+        error: Mutex<EmailSendError>,
     }
 
     /// Captured email for verification.
@@ -701,14 +745,14 @@ mod tests {
                 sent_messages: Mutex::new(Vec::new()),
                 send_count: AtomicU32::new(0),
                 fail_next_n: AtomicU32::new(0),
-                error_message: Mutex::new("mock failure".to_string()),
+                error: Mutex::new(EmailSendError::transient("mock failure")),
             }
         }
 
         /// Configure the mock to fail the next n sends.
-        pub fn fail_next(&self, count: u32, error: &str) {
+        pub fn fail_next(&self, count: u32, error: EmailSendError) {
             self.fail_next_n.store(count, Ordering::SeqCst);
-            *self.error_message.lock().unwrap() = error.to_string();
+            *self.error.lock().unwrap() = error;
         }
 
         /// Get the number of times send was called.
@@ -731,14 +775,14 @@ mod tests {
 
     #[async_trait]
     impl EmailTransport for MockEmailTransport {
-        async fn send_email(&self, message: Message) -> Result<(), String> {
+        async fn send_email(&self, message: Message) -> Result<(), EmailSendError> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
 
             // Check if we should fail
             let fail_count = self.fail_next_n.load(Ordering::SeqCst);
             if fail_count > 0 {
                 self.fail_next_n.fetch_sub(1, Ordering::SeqCst);
-                return Err(self.error_message.lock().unwrap().clone());
+                return Err(self.error.lock().unwrap().clone());
             }
 
             // Extract email details from the message
@@ -789,6 +833,7 @@ mod tests {
             subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }
     }
 
@@ -798,17 +843,20 @@ mod tests {
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
         AlertPayload {
+            mattermost_channel: None,
             message: RenderedMessage {
                 title: "Test Alert".to_string(),
                 body: "Something happened".to_string(),
                 email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
+                ..Default::default()
             },
             rule_name: rule_name.to_string(),
             vl_source: "vlprod".to_string(),
             destinations: vec![],
             log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
             log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+            log: AlertPayload::log_from_fields(&serde_json::json!({})),
         }
     }
 
@@ -1364,7 +1412,10 @@ mod tests {
         // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
         let mock = Arc::new(MockEmailTransport::new());
         // Fail first 2 attempts with transient error, succeed on 3rd
-        mock.fail_next(2, "connection timeout");
+        mock.fail_next(
+            2,
+            EmailSendError::transient("network error: connection timeout"),
+        );
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("retry_test");
@@ -1381,7 +1432,10 @@ mod tests {
         // This allows testing retry logic without waiting for real backoff delays (AC#2: <1s)
         let mock = Arc::new(MockEmailTransport::new());
         // Fail all 3 attempts
-        mock.fail_next(3, "connection timeout");
+        mock.fail_next(
+            3,
+            EmailSendError::transient("network error: connection timeout"),
+        );
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("fail_test");
@@ -1400,7 +1454,7 @@ mod tests {
     async fn mock_transport_no_retry_on_permanent_error() {
         let mock = Arc::new(MockEmailTransport::new());
         // Fail with authentication error (permanent)
-        mock.fail_next(1, "535 authentication failed");
+        mock.fail_next(1, smtp_reply_error("535 5.7.8 authentication failed"));
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("auth_fail_test");
@@ -1414,7 +1468,7 @@ mod tests {
     #[tokio::test]
     async fn mock_transport_no_retry_on_550_mailbox_unavailable() {
         let mock = Arc::new(MockEmailTransport::new());
-        mock.fail_next(1, "550 mailbox unavailable");
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
 
         let notifier = make_notifier_with_mock(mock.clone());
         let alert = make_alert_payload("mailbox_fail");
@@ -1430,7 +1484,7 @@ mod tests {
         // Test that if one recipient fails permanently, others still succeed
         let mock = Arc::new(MockEmailTransport::new());
         // First send fails permanently, others succeed
-        mock.fail_next(1, "550 mailbox unavailable");
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
 
         let notifier = EmailNotifier::with_transport(
             "partial-success",
@@ -1461,7 +1515,7 @@ mod tests {
     async fn mock_transport_all_recipients_fail_returns_error() {
         let mock = Arc::new(MockEmailTransport::new());
         // All sends fail permanently
-        mock.fail_next(3, "550 all mailboxes unavailable");
+        mock.fail_next(3, smtp_reply_error("550 all mailboxes unavailable"));
 
         let notifier = EmailNotifier::with_transport(
             "all-fail",
@@ -1480,6 +1534,137 @@ mod tests {
         let result = notifier.send(&alert).await;
 
         assert!(result.is_err(), "Should fail when all recipients fail");
+    }
+
+    // ===================================================================
+    // SMTP error classification (by reply code, never by message text)
+    // ===================================================================
+
+    /// Classify a raw SMTP reply line the way `SmtpTransport` does for a
+    /// lettre error carrying that reply.
+    fn smtp_reply_error(reply: &str) -> EmailSendError {
+        use lettre::transport::smtp::response::Response;
+        use std::str::FromStr;
+
+        let response = Response::from_str(&format!("{reply}\r\n")).expect("valid SMTP reply");
+        classify_smtp_status(Some(response.code()), reply.to_string())
+    }
+
+    #[test]
+    fn classify_5xx_replies_as_permanent() {
+        for reply in [
+            "535 5.7.8 authentication failed",
+            "550 mailbox unavailable",
+            "503 bad sequence of commands",
+        ] {
+            assert!(
+                smtp_reply_error(reply).permanent,
+                "{reply} should be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_4xx_replies_as_transient() {
+        for reply in [
+            "454 4.7.0 temporary authentication failure",
+            "451 4.3.0 local error in processing",
+            "421 4.4.2 queue id 15501 timed out, closing connection",
+        ] {
+            assert!(
+                !smtp_reply_error(reply).permanent,
+                "{reply} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_errors_without_reply_as_transient() {
+        for message in [
+            "network error: connection refused (mx550.example.com:550)",
+            "tls error: invalid peer certificate: 550",
+            "Connection error: timed out after 550 ms",
+        ] {
+            let error = classify_smtp_status(None, message.to_string());
+            assert!(!error.permanent, "{message} should be transient");
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn classify_lettre_error_without_reply_as_transient() {
+        use lettre::transport::smtp::response::Response;
+        use std::str::FromStr;
+
+        // A reply lettre cannot parse yields a lettre error with no status.
+        let error = Response::from_str("550").unwrap_err();
+        assert!(error.status().is_none());
+        assert!(!classify_smtp_error(&error).permanent);
+    }
+
+    #[tokio::test]
+    async fn mock_transport_permanent_error_single_attempt() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(3, smtp_reply_error("503 bad sequence of commands"));
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("permanent_503")).await;
+
+        assert!(result.is_err());
+        assert_eq!(mock.send_count(), 1, "Should NOT retry on a 5xx reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_retries_transient_error_mentioning_authentication() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(
+            3,
+            smtp_reply_error("454 4.7.0 temporary authentication failure"),
+        );
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("transient_454")).await;
+
+        assert!(result.is_err());
+        assert_eq!(mock.send_count(), 3, "4xx reply should be retried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_transport_retries_network_error_mentioning_550() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(
+            3,
+            classify_smtp_status(None, "network error: mx550.example.com:550".to_string()),
+        );
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let result = notifier.send(&make_alert_payload("network_550")).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            mock.send_count(),
+            3,
+            "error without reply should be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_error_message_names_recipient() {
+        let mock = Arc::new(MockEmailTransport::new());
+        mock.fail_next(1, smtp_reply_error("550 mailbox unavailable"));
+
+        let notifier = make_notifier_with_mock(mock.clone());
+        let recipient: Mailbox = "recipient@test.com".parse().unwrap();
+        let err = notifier
+            .send_to_recipient("subject", "body", &recipient)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, NotifyError::SendFailed(msg)
+                if msg == "permanent error for recipient@test.com: 550 mailbox unavailable"),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ===================================================================
@@ -1543,6 +1728,53 @@ Accent Color: {{ accent_color }}"#;
         );
     }
 
+    /// Notifier with `subject` and `body` templates and a mock transport.
+    fn notifier_with_templates(subject: &str, body: Option<&str>) -> EmailNotifier {
+        EmailNotifier::with_transport(
+            "log-test",
+            Arc::new(MockEmailTransport::new()),
+            "sender@test.com".parse().unwrap(),
+            vec!["dest@test.com".parse().unwrap()],
+            subject,
+            body,
+        )
+    }
+
+    /// Alert titled `title` whose event carries `fields`.
+    fn alert_with_log(title: &str, fields: serde_json::Value) -> AlertPayload {
+        let mut alert = make_alert_payload("log_rule");
+        alert.message.title = title.to_string();
+        alert.log = AlertPayload::log_from_fields(&fields);
+        alert
+    }
+
+    #[test]
+    fn render_body_escapes_log_fields() {
+        let notifier = notifier_with_templates("s", Some("<td>{{ log.host }}</td>{{ body }}"));
+        let mut alert = alert_with_log("T", serde_json::json!({"host": "<b>x</b>"}));
+        alert.message.email_body_html = Some("<p>ok</p>".to_string());
+
+        let body = notifier.render_body(&alert).unwrap();
+
+        assert_eq!(body, "<td>&lt;b&gt;x&lt;&#x2f;b&gt;</td><p>ok</p>");
+    }
+
+    #[test]
+    fn render_subject_reads_log_fields() {
+        let notifier = notifier_with_templates("[{{ log.severity | upper }}] {{ title }}", None);
+        let alert = alert_with_log("Disk", serde_json::json!({"severity": "crit"}));
+
+        assert_eq!(notifier.render_subject(&alert).unwrap(), "[CRIT] Disk");
+    }
+
+    #[test]
+    fn render_subject_missing_log_field_is_empty() {
+        let notifier = notifier_with_templates("[{{ log.missing }}] {{ title }}", None);
+        let alert = alert_with_log("T", serde_json::json!({"host": "web-01"}));
+
+        assert_eq!(notifier.render_subject(&alert).unwrap(), "[] T");
+    }
+
     #[test]
     fn body_template_validation_fails_on_invalid() {
         // Task 13: Test that invalid body template fails at notifier creation
@@ -1560,6 +1792,7 @@ Accent Color: {{ accent_color }}"#;
             subject_template: "{{ title }}".to_string(),
             body_template: Some("{% if unclosed".to_string()), // Invalid template
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("invalid-body", &config, &test_config_dir());
@@ -1577,6 +1810,67 @@ Accent Color: {{ accent_color }}"#;
             }
             _ => panic!("Expected InvalidNotifier, got {:?}", err),
         }
+    }
+
+    fn email_config_with_body(
+        body_template: Option<&str>,
+        body_template_file: Option<&str>,
+    ) -> EmailNotifierConfig {
+        EmailNotifierConfig {
+            smtp: SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                tls: TlsMode::Starttls,
+                tls_verify: true,
+            },
+            from: "test@example.com".to_string(),
+            to: vec!["dest@example.com".to_string()],
+            subject_template: "{{ title }}".to_string(),
+            body_template: body_template.map(str::to_string),
+            body_template_file: body_template_file.map(str::to_string),
+            format: None,
+        }
+    }
+
+    #[test]
+    fn body_template_file_with_unknown_filter_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("body.html"),
+            "<p>{{ body | nosuchfilter }}</p>",
+        )
+        .unwrap();
+        let config = email_config_with_body(None, Some("body.html"));
+        let msg = EmailNotifier::from_config("mail", &config, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'mail': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn inline_body_template_with_unknown_filter_is_rejected() {
+        let config = email_config_with_body(Some("<p>{{ title | nosuchfilter }}</p>"), None);
+        let msg = EmailNotifier::from_config("mail", &config, &test_config_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("invalid notifier 'mail': body_template render: "),
+            "{msg}"
+        );
+        assert!(msg.contains("nosuchfilter"), "{msg}");
+    }
+
+    #[test]
+    fn embedded_body_template_passes_render_test() {
+        crate::config::validate_template_render(DEFAULT_BODY_TEMPLATE).unwrap();
+        let config = email_config_with_body(None, None);
+        assert!(EmailNotifier::from_config("mail", &config, &test_config_dir()).is_ok());
     }
 
     #[tokio::test]
@@ -1666,6 +1960,7 @@ Accent Color: {{ accent_color }}"#;
             subject_template: "[TEST] {{ _msg | truncate(50) }}".to_string(), // Unknown filter
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("bad-subject", &config, &test_config_dir());
@@ -1708,6 +2003,7 @@ Accent Color: {{ accent_color }}"#;
                 .to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("good-subject", &config, &test_config_dir());
@@ -1716,6 +2012,130 @@ Accent Color: {{ accent_color }}"#;
             result.is_ok(),
             "Built-in filters should pass: {:?}",
             result.err()
+        );
+    }
+
+    // ===================================================================
+    // Render failure at send time
+    // ===================================================================
+
+    #[test]
+    fn render_failure_at_send_is_counted_and_sends_nothing() {
+        use crate::notify::test_metrics::{counter_total, run_with_recorder};
+
+        // Subject, then body: each fails only at render time.
+        for (subject, body) in [
+            ("{{ title | no_such_filter }}", None),
+            ("{{ title }}", Some("{{ body | no_such_filter }}")),
+        ] {
+            let mock = Arc::new(MockEmailTransport::new());
+            let notifier = EmailNotifier::with_transport(
+                "mail",
+                mock.clone(),
+                "sender@test.com".parse().unwrap(),
+                vec!["dest@test.com".parse().unwrap()],
+                subject,
+                body,
+            );
+
+            let (result, rendered) =
+                run_with_recorder(|| async { notifier.send(&make_alert_payload("r")).await });
+
+            assert!(
+                matches!(result, Err(NotifyError::TemplateError(_))),
+                "unexpected result: {result:?}"
+            );
+            assert_eq!(mock.send_count(), 0, "no SMTP send may be attempted");
+            assert_eq!(counter_total(&rendered, "valerter_notify_errors_total"), 1);
+            assert_eq!(counter_total(&rendered, "valerter_alerts_failed_total"), 1);
+            assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+            assert!(
+                rendered.contains(
+                    "valerter_alerts_failed_total{rule_name=\"r\",vl_source=\"vlprod\",notifier_name=\"mail\",notifier_type=\"email\"} 1"
+                ),
+                "unexpected labels in:\n{rendered}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // Markdown bodies (markdown-body-format)
+    // ===================================================================
+
+    fn markdown_alert(body: &str, email_body_html: Option<&str>, host: &str) -> AlertPayload {
+        let mut message = crate::template::render_test_message(
+            "Disk {{ host }}",
+            body,
+            crate::config::BodyFormat::Markdown,
+            &serde_json::json!({"host": host}),
+        );
+        message.email_body_html = email_body_html.map(str::to_string);
+        AlertPayload {
+            message,
+            ..make_alert_payload("r")
+        }
+    }
+
+    #[test]
+    fn markdown_body_without_email_body_html_is_rendered_as_html() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let body = notifier
+            .render_body(&markdown_alert("**{{ host }}**", None, "<x>"))
+            .unwrap();
+        assert_eq!(body, "<div><p><strong>&lt;x&gt;</strong></p></div>");
+    }
+
+    #[test]
+    fn email_body_html_takes_priority_over_the_markdown_rendering() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let body = notifier
+            .render_body(&markdown_alert(
+                "**{{ host }}**",
+                Some("<p>custom</p>"),
+                "x",
+            ))
+            .unwrap();
+        assert_eq!(body, "<div><p>custom</p></div>");
+    }
+
+    #[test]
+    fn text_body_without_email_body_html_is_escaped() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let mut alert = make_alert_payload("r");
+        alert.message.body = "Template render failed: <x>".to_string();
+        let body = notifier.render_body(&alert).unwrap();
+        assert_eq!(body, "<div>Template render failed: &lt;x&gt;</div>");
+    }
+
+    #[test]
+    fn subject_gets_the_plain_rendering_of_a_markdown_body() {
+        let notifier = notifier_with_templates("{{ title }}: {{ body }}", Some("{{ body }}"));
+        let subject = notifier
+            .render_subject(&markdown_alert(
+                "**{{ host }}** [logs](https://vl.example.com)",
+                None,
+                "a_b",
+            ))
+            .unwrap();
+        assert_eq!(subject, "Disk a_b: a_b logs (https://vl.example.com)");
+    }
+
+    #[tokio::test]
+    async fn markdown_alert_is_sent_with_the_default_body_template() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        notifier
+            .send(&markdown_alert("**{{ host }}**", None, "<x>"))
+            .await
+            .unwrap();
+
+        let sent = mock.sent_emails();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].body.contains("<p><strong>&lt;x&gt;</strong></p>"),
+            "{}",
+            sent[0].body
         );
     }
 }

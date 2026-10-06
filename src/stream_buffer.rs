@@ -1,81 +1,106 @@
 //! Safe UTF-8 streaming line buffer.
 //!
-//! This module handles fragmented UTF-8 characters across TCP chunk boundaries.
+//! This module splits the raw tail byte stream into lines across TCP chunk
+//! boundaries. Each complete line is decoded on its own: splitting on `\n`
+//! (0x0A) is always safe in UTF-8 because that byte never appears inside a
+//! multi-byte sequence, so a character cut by a chunk boundary simply stays in
+//! the pending fragment until the rest of its line arrives.
+//!
 //! AD-01: 100% test coverage required for this module.
 
-use crate::error::StreamError;
-
-/// Maximum size for a single log line (1MB).
+/// Maximum size for a single log line (1MB), counted in bytes before the
+/// terminating `\n` (a trailing `\r` included).
 /// Lines exceeding this are discarded to prevent OOM.
 pub const MAX_LINE_SIZE: usize = 1024 * 1024;
 
+/// Result of feeding one network chunk to a [`StreamBuffer`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ChunkOutcome {
+    /// Valid, non-empty lines completed by this chunk, in stream order.
+    pub lines: Vec<String>,
+    /// Number of complete lines dropped because they are not valid UTF-8.
+    pub invalid_utf8: usize,
+    /// One entry per oversized line detected in this chunk (observed size in bytes).
+    pub oversized: Vec<usize>,
+}
+
 /// Buffer for safe UTF-8 streaming line reconstruction.
 ///
-/// Handles fragmented UTF-8 characters across TCP chunk boundaries.
-/// Accumulates bytes until complete lines are available, ensuring
-/// multi-byte characters are never split during decoding.
+/// Holds the pending (not yet terminated) line, never more than
+/// [`MAX_LINE_SIZE`] bytes. Once a line exceeds the limit, its bytes are
+/// dropped and everything up to the next `\n` is skipped (`discarding`), so
+/// no truncated fragment of it is ever emitted.
 #[derive(Debug, Default)]
 pub struct StreamBuffer {
     buffer: Vec<u8>,
+    discarding: bool,
 }
 
 impl StreamBuffer {
     /// Create a new empty buffer.
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self::default()
     }
 
-    /// Push raw bytes into the buffer.
+    /// Feed one network chunk and return the lines it completes.
     ///
-    /// # Errors
-    /// Returns `StreamError::LineTooLarge` if buffer would exceed MAX_LINE_SIZE.
-    pub fn push(&mut self, chunk: &[u8]) -> Result<(), StreamError> {
-        if self.buffer.len() + chunk.len() > MAX_LINE_SIZE {
-            let total = self.buffer.len() + chunk.len();
-            self.buffer.clear(); // Discard accumulated data
-            return Err(StreamError::LineTooLarge(total, MAX_LINE_SIZE));
-        }
-        self.buffer.extend_from_slice(chunk);
-        Ok(())
-    }
+    /// Empty lines are skipped and a trailing `\r` is stripped. A line that is
+    /// not valid UTF-8 is dropped alone (counted in `invalid_utf8`); the other
+    /// lines of the chunk and the pending fragment are kept.
+    pub fn process_chunk(&mut self, chunk: &[u8]) -> ChunkOutcome {
+        let mut outcome = ChunkOutcome::default();
+        let mut rest = chunk;
 
-    /// Drain all complete lines from the buffer.
-    ///
-    /// Returns complete lines (without trailing newlines) that have been
-    /// fully received and are valid UTF-8. Incomplete lines or partial
-    /// UTF-8 characters remain in the buffer.
-    ///
-    /// # Errors
-    /// Returns `StreamError::Utf8Error` if the buffer contains invalid UTF-8.
-    pub fn drain_complete_lines(&mut self) -> Result<Vec<String>, StreamError> {
-        let mut lines = Vec::new();
-
-        // Find the last newline position
-        if let Some(last_newline) = self.buffer.iter().rposition(|&b| b == b'\n') {
-            // Find safe UTF-8 boundary up to and including the last newline
-            // Note: safe_end is guaranteed > 0 when there's a newline,
-            // because newline (0x0A) is ASCII and always a safe boundary
-            let safe_end = find_safe_utf8_boundary(&self.buffer[..=last_newline]);
-
-            // Extract complete portion
-            let complete: Vec<u8> = self.buffer.drain(..safe_end).collect();
-
-            // Decode and split into lines
-            let text =
-                String::from_utf8(complete).map_err(|e| StreamError::Utf8Error(e.to_string()))?;
-
-            for line in text.lines() {
-                lines.push(line.to_string());
+        if self.discarding {
+            match rest.iter().position(|&b| b == b'\n') {
+                None => return outcome,
+                Some(pos) => {
+                    rest = &rest[pos + 1..];
+                    self.discarding = false;
+                }
             }
         }
 
-        Ok(lines)
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            let segment = &rest[..pos];
+            rest = &rest[pos + 1..];
+
+            let line_len = self.buffer.len() + segment.len();
+            if line_len > MAX_LINE_SIZE {
+                self.buffer.clear();
+                outcome.oversized.push(line_len);
+                continue;
+            }
+
+            if self.buffer.is_empty() {
+                decode_line(segment, &mut outcome);
+            } else {
+                self.buffer.extend_from_slice(segment);
+                decode_line(&self.buffer, &mut outcome);
+                self.buffer.clear();
+            }
+        }
+
+        if !rest.is_empty() {
+            let pending = self.buffer.len() + rest.len();
+            if pending > MAX_LINE_SIZE {
+                self.buffer.clear();
+                outcome.oversized.push(pending);
+                self.discarding = true;
+            } else {
+                self.buffer.extend_from_slice(rest);
+            }
+        }
+
+        outcome
     }
 
-    /// Discard any buffered partial line (used when a connection is replaced,
-    /// so a fragment from the old stream is never glued to the new one).
+    /// Discard any buffered partial line and leave the discarding state (used
+    /// when a connection is replaced, so a fragment from the old stream is
+    /// never glued to the new one).
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.discarding = false;
     }
 
     /// Get current buffer size in bytes.
@@ -89,70 +114,33 @@ impl StreamBuffer {
     }
 }
 
-/// Find the last position in the buffer that ends on a valid UTF-8 boundary.
-///
-/// This prevents splitting multi-byte characters when draining the buffer.
-/// Returns the number of bytes that can be safely decoded as UTF-8.
-fn find_safe_utf8_boundary(buffer: &[u8]) -> usize {
-    if buffer.is_empty() {
-        return 0;
+/// Decode one complete line (without its `\n`) into `outcome`.
+fn decode_line(raw: &[u8], outcome: &mut ChunkOutcome) {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    if raw.is_empty() {
+        return;
     }
-
-    let len = buffer.len();
-    let mut pos = len;
-
-    // Walk backwards to find start of last (potentially incomplete) character
-    while pos > 0 {
-        let byte = buffer[pos - 1];
-
-        // ASCII byte (0x00-0x7F) - always a complete character, safe boundary
-        if byte & 0x80 == 0 {
-            return pos;
-        }
-
-        // Check if this is a start byte (not a continuation byte)
-        // Continuation bytes are 0x80-0xBF (binary: 10xxxxxx)
-        if byte & 0xC0 != 0x80 {
-            // This is a start byte, determine expected character length
-            let char_start = pos - 1;
-            let expected_len = if byte & 0xF8 == 0xF0 {
-                4 // 11110xxx - 4-byte character
-            } else if byte & 0xF0 == 0xE0 {
-                3 // 1110xxxx - 3-byte character
-            } else if byte & 0xE0 == 0xC0 {
-                2 // 110xxxxx - 2-byte character
-            } else {
-                // Invalid leading byte (0x80-0xBF or 0xF8+), treat as 1 byte
-                1
-            };
-
-            if char_start + expected_len <= len {
-                // Character is complete, include it
-                return char_start + expected_len;
-            } else {
-                // Character is incomplete - boundary is before it
-                return char_start;
-            }
-        }
-
-        pos -= 1;
+    match std::str::from_utf8(raw) {
+        Ok(line) => outcome.lines.push(line.to_owned()),
+        Err(_) => outcome.invalid_utf8 += 1,
     }
-
-    // Buffer contains only continuation bytes - invalid UTF-8
-    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn lines_of(outcome: ChunkOutcome) -> Vec<String> {
+        assert_eq!(outcome.invalid_utf8, 0);
+        assert!(outcome.oversized.is_empty());
+        outcome.lines
+    }
+
     // Test 4.1: Ligne complete simple ASCII
     #[test]
     fn test_complete_ascii_line() {
         let mut buffer = StreamBuffer::new();
-        buffer.push(b"Hello World\n").unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b"Hello World\n"));
         assert_eq!(lines, vec!["Hello World"]);
         assert!(buffer.is_empty());
     }
@@ -161,10 +149,7 @@ mod tests {
     #[test]
     fn test_complete_line_with_french_accents() {
         let mut buffer = StreamBuffer::new();
-        // "été" contains é (C3 A9) twice
-        buffer.push("Café crème été\n".as_bytes()).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk("Café crème été\n".as_bytes()));
         assert_eq!(lines, vec!["Café crème été"]);
         assert!(buffer.is_empty());
     }
@@ -176,18 +161,11 @@ mod tests {
 
         // 🚨 = F0 9F 9A A8
         // Chunk 1: "Hello " + first 2 bytes of emoji
-        buffer
-            .push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xF0, 0x9F])
-            .unwrap();
-
-        // Should return no complete lines yet (no newline)
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert!(lines.is_empty());
+        let outcome = buffer.process_chunk(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xF0, 0x9F]);
+        assert!(lines_of(outcome).is_empty());
 
         // Chunk 2: last 2 bytes of emoji + newline
-        buffer.push(&[0x9A, 0xA8, 0x0A]).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(&[0x9A, 0xA8, 0x0A]));
         assert_eq!(lines, vec!["Hello 🚨"]);
         assert!(buffer.is_empty());
     }
@@ -198,18 +176,11 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // 🚨 = F0 9F 9A A8, sent byte by byte
-        buffer.push(&[0xF0]).unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
+        assert!(lines_of(buffer.process_chunk(&[0xF0])).is_empty());
+        assert!(lines_of(buffer.process_chunk(&[0x9F])).is_empty());
+        assert!(lines_of(buffer.process_chunk(&[0x9A])).is_empty());
 
-        buffer.push(&[0x9F]).unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
-
-        buffer.push(&[0x9A]).unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
-
-        buffer.push(&[0xA8, 0x0A]).unwrap(); // Last byte + newline
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(&[0xA8, 0x0A])); // Last byte + newline
         assert_eq!(lines, vec!["🚨"]);
         assert!(buffer.is_empty());
     }
@@ -221,15 +192,10 @@ mod tests {
 
         // é = C3 A9
         // Chunk 1: "Caf" + first byte of é
-        buffer.push(&[0x43, 0x61, 0x66, 0xC3]).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert!(lines.is_empty()); // No newline yet
+        assert!(lines_of(buffer.process_chunk(&[0x43, 0x61, 0x66, 0xC3])).is_empty());
 
         // Chunk 2: second byte of é + newline
-        buffer.push(&[0xA9, 0x0A]).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(&[0xA9, 0x0A]));
         assert_eq!(lines, vec!["Café"]);
         assert!(buffer.is_empty());
     }
@@ -240,18 +206,10 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // 0xFF is never valid in UTF-8
-        buffer
-            .push(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0xFF, 0x0A])
-            .unwrap();
-
-        let result = buffer.drain_complete_lines();
-        assert!(result.is_err());
-        match result {
-            Err(StreamError::Utf8Error(msg)) => {
-                assert!(msg.contains("invalid"));
-            }
-            _ => panic!("Expected Utf8Error"),
-        }
+        let outcome = buffer.process_chunk(&[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0xFF, 0x0A]);
+        assert!(outcome.lines.is_empty());
+        assert_eq!(outcome.invalid_utf8, 1);
+        assert!(buffer.is_empty());
     }
 
     // Test 4.7: Buffer vide
@@ -262,17 +220,14 @@ mod tests {
         assert!(buffer.is_empty());
         assert_eq!(buffer.len(), 0);
 
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert!(lines.is_empty());
+        assert_eq!(buffer.process_chunk(b""), ChunkOutcome::default());
     }
 
     // Test 4.8: Multiple lignes dans un seul chunk
     #[test]
     fn test_multiple_lines_single_chunk() {
         let mut buffer = StreamBuffer::new();
-        buffer.push(b"Line 1\nLine 2\nLine 3\n").unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b"Line 1\nLine 2\nLine 3\n"));
         assert_eq!(lines, vec!["Line 1", "Line 2", "Line 3"]);
         assert!(buffer.is_empty());
     }
@@ -281,15 +236,11 @@ mod tests {
     #[test]
     fn test_incomplete_line_stays_in_buffer() {
         let mut buffer = StreamBuffer::new();
-        buffer.push(b"Incomplete line").unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert!(lines.is_empty());
+        assert!(lines_of(buffer.process_chunk(b"Incomplete line")).is_empty());
         assert_eq!(buffer.len(), 15); // "Incomplete line" = 15 bytes
 
         // Now add newline
-        buffer.push(b"\n").unwrap();
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b"\n"));
         assert_eq!(lines, vec!["Incomplete line"]);
         assert!(buffer.is_empty());
     }
@@ -300,18 +251,11 @@ mod tests {
         let mut buffer = StreamBuffer::new();
 
         // 中 (zhōng) = E4 B8 AD
-        // Chunk 1: first byte
-        buffer.push(&[0xE4]).unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
-
-        // Chunk 2: second byte
-        buffer.push(&[0xB8]).unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
+        assert!(lines_of(buffer.process_chunk(&[0xE4])).is_empty());
+        assert!(lines_of(buffer.process_chunk(&[0xB8])).is_empty());
 
         // Chunk 3: third byte + newline
-        buffer.push(&[0xAD, 0x0A]).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(&[0xAD, 0x0A]));
         assert_eq!(lines, vec!["中"]);
         assert!(buffer.is_empty());
     }
@@ -320,224 +264,260 @@ mod tests {
     #[test]
     fn test_mixed_ascii_and_multibyte() {
         let mut buffer = StreamBuffer::new();
-
-        // "Hello 中 🚨 été\n"
-        buffer.push("Hello 中 🚨 été\n".as_bytes()).unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk("Hello 中 🚨 été\n".as_bytes()));
         assert_eq!(lines, vec!["Hello 中 🚨 été"]);
         assert!(buffer.is_empty());
     }
 
-    // Additional test: StreamBuffer::new() creates empty buffer
     #[test]
     fn test_new_buffer_is_empty() {
         let buffer = StreamBuffer::new();
         assert!(buffer.is_empty());
         assert_eq!(buffer.len(), 0);
+        assert!(!buffer.discarding);
     }
 
-    // Additional test: Default trait implementation
     #[test]
     fn test_default_trait() {
         let buffer = StreamBuffer::default();
         assert!(buffer.is_empty());
     }
 
-    // Test find_safe_utf8_boundary with empty buffer
     #[test]
-    fn test_safe_boundary_empty() {
-        assert_eq!(find_safe_utf8_boundary(&[]), 0);
-    }
-
-    // Test find_safe_utf8_boundary with pure ASCII
-    #[test]
-    fn test_safe_boundary_ascii() {
-        assert_eq!(find_safe_utf8_boundary(b"Hello\n"), 6);
-    }
-
-    // Test find_safe_utf8_boundary with incomplete 2-byte char
-    #[test]
-    fn test_safe_boundary_incomplete_2byte() {
-        // C3 is start of 2-byte sequence, but missing second byte
-        let data = [0x48, 0x65, 0x6C, 0x6C, 0x6F, 0xC3]; // "Hello" + start of é
-        assert_eq!(find_safe_utf8_boundary(&data), 5); // Stop before C3
-    }
-
-    // Test find_safe_utf8_boundary with incomplete 3-byte char
-    #[test]
-    fn test_safe_boundary_incomplete_3byte() {
-        // E4 B8 is start of 3-byte sequence (中), missing third byte
-        let data = [0x48, 0x69, 0xE4, 0xB8]; // "Hi" + incomplete 中
-        assert_eq!(find_safe_utf8_boundary(&data), 2); // Stop before E4
-    }
-
-    // Test find_safe_utf8_boundary with incomplete 4-byte char
-    #[test]
-    fn test_safe_boundary_incomplete_4byte() {
-        // F0 9F 9A is start of 4-byte emoji, missing last byte
-        let data = [0x48, 0x69, 0xF0, 0x9F, 0x9A]; // "Hi" + incomplete 🚨
-        assert_eq!(find_safe_utf8_boundary(&data), 2); // Stop before F0
-    }
-
-    // Test find_safe_utf8_boundary with complete multi-byte followed by newline
-    #[test]
-    fn test_safe_boundary_complete_multibyte() {
-        // 中 (E4 B8 AD) followed by newline
-        let data = [0xE4, 0xB8, 0xAD, 0x0A];
-        assert_eq!(find_safe_utf8_boundary(&data), 4); // All bytes safe
-    }
-
-    // Test with only continuation bytes (invalid UTF-8)
-    #[test]
-    fn test_safe_boundary_only_continuation_bytes() {
-        // All continuation bytes - should return 0
-        let data = [0x80, 0x81, 0x82];
-        assert_eq!(find_safe_utf8_boundary(&data), 0);
-    }
-
-    // Test consecutive drains
-    #[test]
-    fn test_consecutive_drains() {
+    fn test_consecutive_chunks() {
         let mut buffer = StreamBuffer::new();
 
-        buffer.push(b"First\n").unwrap();
-        assert_eq!(buffer.drain_complete_lines().unwrap(), vec!["First"]);
-
-        buffer.push(b"Second\n").unwrap();
-        assert_eq!(buffer.drain_complete_lines().unwrap(), vec!["Second"]);
-
-        buffer.push(b"Third\nFourth\n").unwrap();
+        assert_eq!(lines_of(buffer.process_chunk(b"First\n")), vec!["First"]);
+        assert_eq!(lines_of(buffer.process_chunk(b"Second\n")), vec!["Second"]);
         assert_eq!(
-            buffer.drain_complete_lines().unwrap(),
+            lines_of(buffer.process_chunk(b"Third\nFourth\n")),
             vec!["Third", "Fourth"]
         );
     }
 
-    // Test partial line followed by complete lines
     #[test]
     fn test_partial_then_complete() {
         let mut buffer = StreamBuffer::new();
 
-        buffer.push(b"Partial").unwrap();
-        assert!(buffer.drain_complete_lines().unwrap().is_empty());
+        assert!(lines_of(buffer.process_chunk(b"Partial")).is_empty());
 
-        buffer.push(b" line\nComplete\n").unwrap();
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b" line\nComplete\n"));
         assert_eq!(lines, vec!["Partial line", "Complete"]);
     }
 
-    // Test: multiple complete lines followed by incomplete line
     #[test]
     fn test_complete_lines_with_trailing_incomplete() {
         let mut buffer = StreamBuffer::new();
 
-        buffer.push(b"Line1\nLine2\nIncomplete").unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b"Line1\nLine2\nIncomplete"));
         assert_eq!(lines, vec!["Line1", "Line2"]);
         assert_eq!(buffer.len(), 10); // "Incomplete" = 10 bytes remains
 
-        // Now complete the line
-        buffer.push(b" data\n").unwrap();
-        let lines = buffer.drain_complete_lines().unwrap();
+        let lines = lines_of(buffer.process_chunk(b" data\n"));
         assert_eq!(lines, vec!["Incomplete data"]);
         assert!(buffer.is_empty());
     }
 
-    // Test: newline after only continuation bytes returns UTF-8 error
-    // because when we try to decode, the continuation bytes are invalid
     #[test]
-    fn test_newline_after_continuation_bytes_returns_error() {
+    fn test_crlf_and_empty_lines() {
         let mut buffer = StreamBuffer::new();
 
-        // Continuation bytes followed by newline
-        // The newline is ASCII so safe_end includes it, but decoding fails
-        buffer.push(&[0x80, 0x81, 0x0A]).unwrap();
+        let lines = lines_of(buffer.process_chunk(b"a\r\n\n\r\nb\n"));
+        assert_eq!(lines, vec!["a", "b"]);
 
-        let result = buffer.drain_complete_lines();
-        assert!(result.is_err());
-        match result {
-            Err(StreamError::Utf8Error(_)) => {}
-            _ => panic!("Expected Utf8Error"),
-        }
-    }
-
-    // Test: invalid leading byte (0xF8+) which is treated as 1 byte
-    #[test]
-    fn test_invalid_leading_byte_f8_plus() {
-        // 0xF8 is an invalid leading byte (would indicate 5+ byte sequence, not valid in UTF-8)
-        let data = [0x48, 0x69, 0xF8]; // "Hi" + invalid leading byte
-        // Should treat 0xF8 as 1 byte and return full length
-        assert_eq!(find_safe_utf8_boundary(&data), 3);
-    }
-
-    // Test: incomplete char followed by newline returns error
-    // because incomplete UTF-8 sequences followed by newline are still invalid
-    #[test]
-    fn test_incomplete_char_before_newline_returns_error() {
-        let mut buffer = StreamBuffer::new();
-
-        // Incomplete 3-byte char (E4 B8) followed by newline
-        // The newline is ASCII so safe_end includes up to it
-        // But decoding E4 B8 0A fails as invalid UTF-8
-        buffer.push(&[0xE4, 0xB8, 0x0A]).unwrap();
-
-        let result = buffer.drain_complete_lines();
-        assert!(result.is_err());
-        match result {
-            Err(StreamError::Utf8Error(_)) => {}
-            _ => panic!("Expected Utf8Error"),
-        }
-    }
-
-    // Test: verify that newline is always a safe boundary
-    // This confirms that safe_end is never 0 when there's a newline
-    #[test]
-    fn test_newline_always_safe_boundary() {
-        // Newline (0x0A) is ASCII, so it's always a safe UTF-8 boundary
-        // This means safe_end is guaranteed > 0 when there's a newline
-        let data = [0x80, 0x81, 0x0A];
-        // 0x0A is ASCII (0x0A & 0x80 == 0), so boundary includes it
-        assert_eq!(find_safe_utf8_boundary(&data), 3);
-
-        // Even with just a newline
-        let data = [0x0A];
-        assert_eq!(find_safe_utf8_boundary(&data), 1);
+        // `\r` split from its `\n` by a chunk boundary is still stripped.
+        assert!(lines_of(buffer.process_chunk(b"c\r")).is_empty());
+        assert_eq!(lines_of(buffer.process_chunk(b"\n")), vec!["c"]);
     }
 
     // ==========================================================================
-    // Tests for MAX_LINE_SIZE limit
+    // Invalid UTF-8: only the faulty line is dropped
     // ==========================================================================
 
     #[test]
-    fn test_push_exceeds_max_line_size() {
+    fn test_invalid_line_between_valid_lines() {
         let mut buffer = StreamBuffer::new();
-        let large_chunk = vec![b'x'; MAX_LINE_SIZE + 1];
 
-        let result = buffer.push(&large_chunk);
-        assert!(matches!(result, Err(StreamError::LineTooLarge(_, _))));
-        assert!(buffer.is_empty());
+        let outcome = buffer.process_chunk(
+            b"{\"_msg\":\"before\"}\n{\"_msg\":\"bad \xff\xfe\"}\n{\"_msg\":\"after\"}\n",
+        );
+        assert_eq!(
+            outcome.lines,
+            vec![r#"{"_msg":"before"}"#, r#"{"_msg":"after"}"#]
+        );
+        assert_eq!(outcome.invalid_utf8, 1);
+        assert!(outcome.oversized.is_empty());
     }
 
     #[test]
-    fn test_push_accumulation_exceeds_max() {
+    fn test_two_invalid_lines_in_one_chunk() {
+        let mut buffer = StreamBuffer::new();
+
+        let outcome = buffer.process_chunk(b"\x80\x81\nok\n\xE4\xB8\n");
+        assert_eq!(outcome.lines, vec!["ok"]);
+        assert_eq!(outcome.invalid_utf8, 2);
+    }
+
+    #[test]
+    fn test_pending_fragment_kept_after_invalid_line() {
+        let mut buffer = StreamBuffer::new();
+
+        // Invalid complete line, then "Caf" + first byte of é.
+        let outcome = buffer.process_chunk(b"bad \xff\nCaf\xC3");
+        assert!(outcome.lines.is_empty());
+        assert_eq!(outcome.invalid_utf8, 1);
+        assert_eq!(buffer.len(), 4);
+
+        let lines = lines_of(buffer.process_chunk(&[0xA9, 0x0A]));
+        assert_eq!(lines, vec!["Café"]);
+    }
+
+    #[test]
+    fn test_invalid_line_spanning_chunks() {
+        let mut buffer = StreamBuffer::new();
+
+        assert!(lines_of(buffer.process_chunk(b"start \xff")).is_empty());
+        let outcome = buffer.process_chunk(b" end\nnext\n");
+        assert_eq!(outcome.lines, vec!["next"]);
+        assert_eq!(outcome.invalid_utf8, 1);
+    }
+
+    // ==========================================================================
+    // MAX_LINE_SIZE limit
+    // ==========================================================================
+
+    #[test]
+    fn test_line_at_exact_limit_is_kept() {
+        let mut buffer = StreamBuffer::new();
+        let mut chunk = vec![b'x'; MAX_LINE_SIZE];
+        chunk.push(b'\n');
+
+        let lines = lines_of(buffer.process_chunk(&chunk));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_LINE_SIZE);
+    }
+
+    #[test]
+    fn test_pending_fragment_at_exact_limit_is_kept() {
+        let mut buffer = StreamBuffer::new();
+
+        assert!(lines_of(buffer.process_chunk(&vec![b'x'; MAX_LINE_SIZE])).is_empty());
+        assert_eq!(buffer.len(), MAX_LINE_SIZE);
+
+        let lines = lines_of(buffer.process_chunk(b"\n"));
+        assert_eq!(lines[0].len(), MAX_LINE_SIZE);
+    }
+
+    #[test]
+    fn test_complete_line_over_limit_is_dropped() {
+        let mut buffer = StreamBuffer::new();
+        let mut chunk = vec![b'x'; MAX_LINE_SIZE + 1];
+        chunk.extend_from_slice(b"\nnext\n");
+
+        let outcome = buffer.process_chunk(&chunk);
+        assert_eq!(outcome.lines, vec!["next"]);
+        assert_eq!(outcome.oversized, vec![MAX_LINE_SIZE + 1]);
+        assert!(!buffer.discarding);
+    }
+
+    #[test]
+    fn test_buffered_line_completed_over_limit_is_dropped() {
         let mut buffer = StreamBuffer::new();
         let half = vec![b'x'; MAX_LINE_SIZE / 2 + 1];
 
-        buffer.push(&half).unwrap();
-        let result = buffer.push(&half);
+        assert!(lines_of(buffer.process_chunk(&half)).is_empty());
 
-        assert!(matches!(result, Err(StreamError::LineTooLarge(_, _))));
+        let mut chunk = half.clone();
+        chunk.extend_from_slice(b"\nnext\n");
+        let outcome = buffer.process_chunk(&chunk);
+        assert_eq!(outcome.lines, vec!["next"]);
+        assert_eq!(outcome.oversized, vec![2 * half.len()]);
         assert!(buffer.is_empty());
     }
 
     #[test]
-    fn test_push_at_exact_limit_succeeds() {
+    fn test_pending_fragment_over_limit_starts_discarding() {
         let mut buffer = StreamBuffer::new();
-        let exact = vec![b'x'; MAX_LINE_SIZE];
 
-        assert!(buffer.push(&exact).is_ok());
-        assert_eq!(buffer.len(), MAX_LINE_SIZE);
+        let outcome = buffer.process_chunk(&vec![b'x'; MAX_LINE_SIZE + 1]);
+        assert!(outcome.lines.is_empty());
+        assert_eq!(outcome.oversized, vec![MAX_LINE_SIZE + 1]);
+        assert!(buffer.is_empty());
+        assert!(buffer.discarding);
+    }
+
+    #[test]
+    fn test_oversized_tail_skipped_over_several_chunks() {
+        let mut buffer = StreamBuffer::new();
+        let half = vec![b'x'; MAX_LINE_SIZE / 2 + 1];
+
+        assert!(lines_of(buffer.process_chunk(&half)).is_empty());
+        // Accumulation crosses the limit: one record, buffer dropped.
+        let outcome = buffer.process_chunk(&half);
+        assert_eq!(outcome.oversized, vec![2 * half.len()]);
+        assert!(buffer.is_empty());
+
+        // The rest of the line, without `\n`, is ignored and not recorded again.
+        assert_eq!(buffer.process_chunk(&half), ChunkOutcome::default());
+        assert_eq!(buffer.process_chunk(b"more\xff"), ChunkOutcome::default());
+        assert!(buffer.is_empty());
+
+        // The end of the oversized line is never emitted; the next line is.
+        let outcome = buffer.process_chunk(b"end of the line\"}\n{\"_msg\":\"next\"}\n");
+        assert_eq!(
+            outcome,
+            ChunkOutcome {
+                lines: vec![r#"{"_msg":"next"}"#.to_string()],
+                ..ChunkOutcome::default()
+            }
+        );
+        assert!(!buffer.discarding);
+    }
+
+    #[test]
+    fn test_oversized_tail_ending_in_same_chunk_as_next_fragment() {
+        let mut buffer = StreamBuffer::new();
+
+        buffer.process_chunk(&vec![b'x'; MAX_LINE_SIZE + 1]);
+        let outcome = buffer.process_chunk(b"tail\npartial");
+        assert_eq!(outcome, ChunkOutcome::default());
+        assert_eq!(buffer.len(), 7);
+        assert_eq!(lines_of(buffer.process_chunk(b"\n")), vec!["partial"]);
+    }
+
+    #[test]
+    fn test_valid_lines_before_overflow_in_same_chunk_are_emitted() {
+        let mut buffer = StreamBuffer::new();
+        let mut chunk = b"{\"_msg\":\"a\"}\n".to_vec();
+        chunk.extend(vec![b'x'; MAX_LINE_SIZE + 1]);
+
+        let outcome = buffer.process_chunk(&chunk);
+        assert_eq!(outcome.lines, vec![r#"{"_msg":"a"}"#]);
+        assert_eq!(outcome.oversized, vec![MAX_LINE_SIZE + 1]);
+        assert!(buffer.discarding);
+    }
+
+    #[test]
+    fn test_clear_resets_discarding() {
+        let mut buffer = StreamBuffer::new();
+
+        buffer.process_chunk(&vec![b'x'; MAX_LINE_SIZE + 1]);
+        assert!(buffer.discarding);
+
+        buffer.clear();
+        assert!(!buffer.discarding);
+        assert!(buffer.is_empty());
+
+        // First bytes of the new connection are processed normally.
+        assert_eq!(lines_of(buffer.process_chunk(b"fresh\n")), vec!["fresh"]);
+    }
+
+    #[test]
+    fn test_clear_drops_pending_fragment() {
+        let mut buffer = StreamBuffer::new();
+
+        buffer.process_chunk(b"old partial");
+        buffer.clear();
+        assert_eq!(lines_of(buffer.process_chunk(b"new\n")), vec!["new"]);
     }
 }

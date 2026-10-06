@@ -4,32 +4,29 @@ use super::notifiers::EmailNotifierConfig;
 use crate::error::ConfigError;
 use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Maximum size for body_template_file (1MB).
 const MAX_BODY_TEMPLATE_SIZE: u64 = 1024 * 1024;
 
-/// Resolves `${VAR_NAME}` patterns in a string.
-pub fn resolve_env_vars(value: &str) -> Result<String, ConfigError> {
-    let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("Invalid regex");
+static ENV_VAR_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex"));
 
-    let mut result = value.to_string();
+/// Resolves `${VAR_NAME}` patterns in a string.
+///
+/// Substitution is a single pass over the original value: text inserted from
+/// a variable is never itself substituted, even if it contains `${...}`.
+pub fn resolve_env_vars(value: &str) -> Result<String, ConfigError> {
     let mut errors = Vec::new();
 
-    let matches: Vec<_> = re.captures_iter(value).collect();
-
-    for cap in matches {
-        let full_match = cap.get(0).unwrap().as_str();
-        let var_name = &cap[1];
-
-        match std::env::var(var_name) {
-            Ok(var_value) => {
-                result = result.replace(full_match, &var_value);
-            }
-            Err(_) => {
-                errors.push(var_name.to_string());
-            }
-        }
-    }
+    let result = ENV_VAR_REGEX
+        .replace_all(value, |caps: &regex::Captures<'_>| {
+            std::env::var(&caps[1]).unwrap_or_else(|_| {
+                errors.push(caps[1].to_string());
+                String::new()
+            })
+        })
+        .into_owned();
 
     if errors.is_empty() {
         Ok(result)
@@ -186,6 +183,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: Some("<p>Inline: {{ body }}</p>".to_string()),
             body_template_file: None,
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -212,6 +210,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -254,6 +253,21 @@ mod tests {
 
     #[test]
     #[serial]
+    fn resolve_env_vars_does_not_resubstitute_inserted_values() {
+        temp_env::with_vars(
+            [
+                ("TEST_CHAIN_A", Some("${TEST_CHAIN_B}")),
+                ("TEST_CHAIN_B", Some("x")),
+            ],
+            || {
+                let result = resolve_env_vars("${TEST_CHAIN_A}-${TEST_CHAIN_B}");
+                assert_eq!(result.unwrap(), "${TEST_CHAIN_B}-x");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn resolve_env_vars_supports_lowercase_variables() {
         temp_env::with_var("test_lowercase_var", Some("lowercase_value"), || {
             let result = resolve_env_vars("${test_lowercase_var}");
@@ -277,6 +291,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some("templates/default-email.html.j2".to_string()),
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -304,6 +319,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some("nonexistent/template.html".to_string()),
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -341,6 +357,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some(large_file_path.to_string_lossy().to_string()),
+            format: None,
         };
 
         let result = resolve_body_template(&config, temp_dir.path());
@@ -380,6 +397,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some(invalid_utf8_path.to_string_lossy().to_string()),
+            format: None,
         };
 
         let result = resolve_body_template(&config, temp_dir.path());

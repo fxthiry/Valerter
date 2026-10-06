@@ -9,4 +9,6 @@
 
 #![allow(dead_code)]
 
+pub mod logs;
+pub mod recording;
 pub mod vl_events;

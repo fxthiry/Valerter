@@ -31,14 +31,15 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONNECTION, HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, info, trace, warn};
 
-use crate::config::{BasicAuthConfig, SecretString, TlsConfig, VlSourceConfig};
+use crate::config::{BasicAuthConfig, SecretString, TlsConfig, VlSourceConfig, redact_url};
 use crate::error::StreamError;
-use crate::stream_buffer::StreamBuffer;
+use crate::http_body::read_body_prefix;
+use crate::stream_buffer::{MAX_LINE_SIZE, StreamBuffer};
 
 // Note: No read_timeout - VictoriaLogs tail endpoint doesn't send keepalives,
 // so we rely on CancellationToken for shutdown. Connection health is implicit
@@ -94,37 +95,94 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of characters of an error response body kept in logs.
 const ERROR_BODY_MAX_CHARS: usize = 512;
 
-/// Drain complete lines from the buffer. Invalid UTF-8 is logged, counted and
-/// dropped instead of propagated: it used to bubble up as a fatal
-/// `StreamError::Utf8Error` that killed the (rule, source) task for good.
-fn drain_lines_lenient(buffer: &mut StreamBuffer, rule_name: &str, vl_source: &str) -> Vec<String> {
-    match buffer.drain_complete_lines() {
-        Ok(lines) => lines,
-        Err(e) => {
-            warn!(
-                rule_name = %rule_name,
-                vl_source = %vl_source,
-                error = %e,
-                "Discarding log data with invalid UTF-8"
-            );
-            metrics::counter!(
-                "valerter_lines_discarded_total",
-                "rule_name" => rule_name.to_string(),
-                "vl_source" => vl_source.to_string(),
-                "reason" => "invalid_utf8",
-            )
-            .increment(1);
-            buffer.clear();
-            Vec::new()
-        }
+/// Bytes of a non-2xx response body read at most (512 characters are at most
+/// 2 KiB of UTF-8, with margin).
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+
+/// Time spent reading a non-2xx response body at most.
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of characters of an invalid header name kept in errors.
+const HEADER_NAME_MAX_CHARS: usize = 64;
+
+/// Feed one network chunk to the buffer and return the lines it completes.
+///
+/// Dropped lines are logged and counted in `valerter_lines_discarded_total`:
+/// one `oversized` warning and increment per oversized line, and a single
+/// invalid UTF-8 warning per chunk (so a binary stream cannot flood the logs)
+/// with the counter incremented once per dropped line.
+fn process_chunk_logged(
+    buffer: &mut StreamBuffer,
+    chunk: &[u8],
+    rule_name: &str,
+    vl_source: &str,
+) -> Vec<String> {
+    let outcome = buffer.process_chunk(chunk);
+
+    for size in outcome.oversized {
+        warn!(
+            rule_name = %rule_name,
+            vl_source = %vl_source,
+            size_bytes = size,
+            max_bytes = MAX_LINE_SIZE,
+            "Discarding oversized log line, buffer cleared"
+        );
+        metrics::counter!(
+            "valerter_lines_discarded_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+            "reason" => "oversized",
+        )
+        .increment(1);
     }
+
+    if outcome.invalid_utf8 > 0 {
+        warn!(
+            rule_name = %rule_name,
+            vl_source = %vl_source,
+            discarded_lines = outcome.invalid_utf8,
+            "Discarding log data with invalid UTF-8"
+        );
+        metrics::counter!(
+            "valerter_lines_discarded_total",
+            "rule_name" => rule_name.to_string(),
+            "vl_source" => vl_source.to_string(),
+            "reason" => "invalid_utf8",
+        )
+        .increment(outcome.invalid_utf8 as u64);
+    }
+
+    for line in &outcome.lines {
+        trace!(
+            rule_name = %rule_name,
+            vl_source = %vl_source,
+            line_len = line.len(),
+            "Received log line"
+        );
+    }
+
+    outcome.lines
+}
+
+/// Error for a custom header that is not a valid HTTP header. Names the header
+/// (truncated) but never includes its value, which may hold a secret.
+fn invalid_header_error(name: &str) -> StreamError {
+    let name: String = name.chars().take(HEADER_NAME_MAX_CHARS).collect();
+    StreamError::ConnectionFailed(format!(
+        "invalid header '{name}' in VictoriaLogs source configuration"
+    ))
 }
 
 /// Reads the body of a non-2xx VictoriaLogs response so the actual error
 /// (e.g. `unsupported pipe "stats" in /tail`) surfaces in logs instead of a
 /// bare status code (issue #42). Truncated and collapsed to a single line.
+///
+/// At most [`ERROR_BODY_MAX_BYTES`] are read, for at most
+/// [`ERROR_BODY_READ_TIMEOUT`]: a proxy streaming an endless error body must
+/// not block the task.
 async fn response_error_body(resp: reqwest::Response) -> String {
-    let text = resp.text().await.unwrap_or_default();
+    let bytes = read_body_prefix(resp, ERROR_BODY_MAX_BYTES, ERROR_BODY_READ_TIMEOUT).await;
+    let text = String::from_utf8_lossy(&bytes);
     let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.is_empty() {
         return "<empty body>".to_string();
@@ -152,6 +210,17 @@ impl TailConfig {
             tls: source.tls.clone(),
         }
     }
+
+    /// True when a custom `Authorization` header (any case) replaces the one
+    /// generated from `basic_auth`.
+    pub fn custom_authorization_overrides_basic_auth(&self) -> bool {
+        self.basic_auth.is_some()
+            && self.headers.as_ref().is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(AUTHORIZATION.as_str()))
+            })
+    }
 }
 
 /// Client for streaming logs from VictoriaLogs tail endpoint.
@@ -161,6 +230,7 @@ impl TailConfig {
 pub struct TailClient {
     config: TailConfig,
     client: Client,
+    headers: HeaderMap,
     buffer: StreamBuffer,
 }
 
@@ -169,7 +239,8 @@ impl TailClient {
     ///
     /// # Errors
     ///
-    /// Returns `StreamError::ConnectionFailed` if the HTTP client cannot be built.
+    /// Returns `StreamError::ConnectionFailed` if the HTTP client cannot be
+    /// built or if a custom header name or value is not a valid HTTP header.
     pub fn new(config: TailConfig) -> Result<Self, StreamError> {
         let mut builder = Client::builder();
 
@@ -186,41 +257,29 @@ impl TailClient {
             .build()
             .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
 
+        let headers = build_headers(&client, &config)?;
+
         Ok(Self {
             config,
             client,
+            headers,
             buffer: StreamBuffer::new(),
         })
     }
 
     /// Build a request with all configured auth and headers.
     fn build_request(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut request = self
-            .client
-            .get(url)
-            .header("Accept", "application/x-ndjson")
-            .header("Connection", "keep-alive");
-
-        // Add Basic Auth if configured (AC #1)
-        if let Some(ref auth) = self.config.basic_auth {
-            request = request.basic_auth(&auth.username, Some(auth.password.expose()));
-        }
-
-        // Add custom headers if configured (AC #3, #5)
-        if let Some(ref headers) = self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value.expose());
-            }
-        }
-
-        request
+        self.client.get(url).headers(self.headers.clone())
     }
 
     /// Build the full URL for the VictoriaLogs tail endpoint.
+    ///
+    /// Trailing slashes of `base_url` are dropped so `http://vl:9428/` does
+    /// not produce `//select/logsql/tail`.
     pub fn build_url(&self) -> String {
         let mut url = format!(
             "{}/select/logsql/tail?query={}",
-            self.config.base_url,
+            self.config.base_url.trim_end_matches('/'),
             urlencoding::encode(&self.config.query)
         );
 
@@ -230,94 +289,6 @@ impl TailClient {
         }
 
         url
-    }
-
-    /// Connect to VictoriaLogs and stream log lines.
-    ///
-    /// This method establishes a streaming HTTP connection to the VictoriaLogs
-    /// tail endpoint and processes incoming chunks through the `StreamBuffer`
-    /// to handle UTF-8 boundaries correctly.
-    ///
-    /// # Arguments
-    ///
-    /// * `rule_name` - Name of the rule for tracing and metrics
-    /// * `on_reconnect` - Callback invoked when connection is restored after failure (FR7)
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(Vec<String>)` with complete log lines, or an error if the
-    /// connection fails or encounters invalid UTF-8.
-    ///
-    /// # Errors
-    ///
-    /// - `StreamError::ConnectionFailed` if HTTP connection fails
-    /// - `StreamError::Utf8Error` if stream contains invalid UTF-8
-    pub async fn connect_and_receive(
-        &mut self,
-        rule_name: &str,
-        vl_source: &str,
-    ) -> Result<Vec<String>, StreamError> {
-        let url = self.build_url();
-
-        let response = self
-            .build_request(&url)
-            .send()
-            .await
-            .map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response_error_body(response).await;
-            return Err(StreamError::ConnectionFailed(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
-
-        // Get the bytes stream
-        let mut stream = response.bytes_stream();
-
-        // Collect lines from this connection attempt
-        let mut all_lines = Vec::new();
-
-        // Process chunks as they arrive
-        while let Some(chunk_result) = stream.next().await {
-            let chunk: Bytes =
-                chunk_result.map_err(|e| StreamError::ConnectionFailed(e.to_string()))?;
-
-            // Push chunk to buffer and extract complete lines
-            if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk) {
-                warn!(
-                    rule_name = %rule_name,
-                    vl_source = %vl_source,
-                    size_bytes = size,
-                    max_bytes = max,
-                    "Discarding oversized log line, buffer cleared"
-                );
-                metrics::counter!(
-                    "valerter_lines_discarded_total",
-                    "rule_name" => rule_name.to_string(),
-                    "vl_source" => vl_source.to_string(),
-                    "reason" => "oversized",
-                )
-                .increment(1);
-                continue;
-            }
-            let lines = drain_lines_lenient(&mut self.buffer, rule_name, vl_source);
-
-            for line in lines {
-                if !line.is_empty() {
-                    trace!(
-                        rule_name = %rule_name,
-                        vl_source = %vl_source,
-                        line_len = line.len(),
-                        "Received log line"
-                    );
-                    all_lines.push(line);
-                }
-            }
-        }
-
-        Ok(all_lines)
     }
 
     /// Get a reference to the internal buffer for testing.
@@ -340,7 +311,8 @@ impl TailClient {
     ///
     /// # Errors
     ///
-    /// - `StreamError::Utf8Error` if stream contains invalid UTF-8 (not retried)
+    /// Returns the first error produced by `line_handler`; connection and
+    /// stream errors are retried.
     ///
     /// # Example
     ///
@@ -398,7 +370,8 @@ impl TailClient {
             debug!(
                 rule_name = %rule_name,
                 vl_source = %vl_source,
-                url = %url,
+                url = %redact_url(&url),
+                query = %self.config.query,
                 "Connecting to VictoriaLogs tail endpoint"
             );
 
@@ -478,16 +451,16 @@ impl TailClient {
                     }
 
                     had_failure = true;
+                    warn!(
+                        rule_name = %rule_name,
+                        vl_source = %vl_source,
+                        error = %e.without_url(),
+                        "Connection failed"
+                    );
                     let delay = backoff_delay_with_jitter(attempt);
                     log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
-                    warn!(
-                        rule_name = %rule_name,
-                        vl_source = %vl_source,
-                        error = %e,
-                        "Connection failed"
-                    );
                     continue;
                 }
             };
@@ -523,36 +496,10 @@ impl TailClient {
                         )
                         .set(now);
 
-                        if let Err(StreamError::LineTooLarge(size, max)) = self.buffer.push(&chunk)
-                        {
-                            warn!(
-                                rule_name = %rule_name,
-                                vl_source = %vl_source,
-                                size_bytes = size,
-                                max_bytes = max,
-                                "Discarding oversized log line, buffer cleared"
-                            );
-                            metrics::counter!(
-                                "valerter_lines_discarded_total",
-                                "rule_name" => rule_name.to_string(),
-                                "vl_source" => vl_source.to_string(),
-                                "reason" => "oversized",
-                            )
-                            .increment(1);
-                            continue;
-                        }
-                        let lines = drain_lines_lenient(&mut self.buffer, rule_name, vl_source);
-
+                        let lines =
+                            process_chunk_logged(&mut self.buffer, &chunk, rule_name, vl_source);
                         for line in lines {
-                            if !line.is_empty() {
-                                trace!(
-                                    rule_name = %rule_name,
-                                    vl_source = %vl_source,
-                                    line_len = line.len(),
-                                    "Received log line"
-                                );
-                                line_handler(line).await?;
-                            }
+                            line_handler(line).await?;
                         }
                     }
                     Err(e) => {
@@ -568,16 +515,16 @@ impl TailClient {
                         }
 
                         had_failure = true;
+                        warn!(
+                            rule_name = %rule_name,
+                            vl_source = %vl_source,
+                            error = %e.without_url(),
+                            "Stream read error"
+                        );
                         let delay = backoff_delay_with_jitter(attempt);
                         log_reconnection_attempt(rule_name, vl_source, attempt, delay);
                         tokio::time::sleep(delay).await;
                         attempt = attempt.saturating_add(1);
-                        warn!(
-                            rule_name = %rule_name,
-                            vl_source = %vl_source,
-                            error = %e,
-                            "Stream read error"
-                        );
                         break; // Break inner loop to reconnect
                     }
                 }
@@ -592,12 +539,14 @@ impl TailClient {
             if had_failure {
                 continue; // mid-stream error path already slept
             }
+            // ~1s after a connection that received data; ~1s, 2s, 4s... for
+            // consecutive empty EOFs.
             if first_chunk_received {
                 empty_eof_streak = 0;
             } else {
                 empty_eof_streak = empty_eof_streak.saturating_add(1);
             }
-            let delay = backoff_delay_with_jitter(empty_eof_streak);
+            let delay = backoff_delay_with_jitter(empty_eof_streak.saturating_sub(1));
             debug!(
                 rule_name = %rule_name,
                 vl_source = %vl_source,
@@ -605,8 +554,10 @@ impl TailClient {
                 delay_ms = delay.as_millis(),
                 "Stream ended, reconnecting"
             );
+            // A clean end is not a failure: `valerter_reconnections_total`
+            // only counts reconnections after a failure.
             metrics::counter!(
-                "valerter_reconnections_total",
+                "valerter_stream_ends_total",
                 "rule_name" => rule_name.to_string(),
                 "vl_source" => vl_source.to_string(),
             )
@@ -614,6 +565,48 @@ impl TailClient {
             tokio::time::sleep(delay).await;
         }
     }
+}
+
+/// Build the request headers once: defaults, then Basic Auth, then custom
+/// headers. Custom headers are inserted last (sorted by name for a
+/// deterministic result) so they replace a default or Basic Auth header of the
+/// same name (case-insensitive) instead of duplicating it.
+///
+/// Invalid header names or values are normally rejected when the configuration
+/// is loaded; this is a defensive guard so such a header fails the task at
+/// startup instead of looping on reconnection without ever sending a request.
+fn build_headers(client: &Client, config: &TailConfig) -> Result<HeaderMap, StreamError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/x-ndjson"));
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+
+    if let Some(ref auth) = config.basic_auth {
+        // Let reqwest encode the credentials (same encoding as before).
+        let request = client
+            .get("http://localhost/")
+            .basic_auth(&auth.username, Some(auth.password.expose()))
+            .build()
+            .map_err(|_| invalid_header_error(AUTHORIZATION.as_str()))?;
+        if let Some(mut value) = request.headers().get(AUTHORIZATION).cloned() {
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+
+    if let Some(ref custom) = config.headers {
+        let mut custom: Vec<_> = custom.iter().collect();
+        custom.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, value) in custom {
+            let header_name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid_header_error(name))?;
+            let mut header_value =
+                HeaderValue::from_str(value.expose()).map_err(|_| invalid_header_error(name))?;
+            header_value.set_sensitive(true);
+            headers.insert(header_name, header_value);
+        }
+    }
+
+    Ok(headers)
 }
 
 /// Calculate exponential backoff delay.
@@ -706,7 +699,7 @@ pub fn log_reconnection_attempt(rule_name: &str, vl_source: &str, attempt: u32, 
         rule_name = %rule_name,
         vl_source = %vl_source,
         attempt = attempt,
-        delay_secs = delay.as_secs(),
+        delay_ms = delay.as_millis() as u64,
         "Connection failed, retrying"
     );
 
@@ -1073,51 +1066,187 @@ mod tests {
         );
     }
 
-    // Test that StreamBuffer integration works correctly
     #[test]
-    fn test_buffer_integration_simulation() {
-        // Simulate what happens when chunks are received
+    fn test_process_chunk_logged_simulates_vl_chunks() {
         let mut buffer = StreamBuffer::new();
 
         // Simulate receiving chunked JSON lines like VictoriaLogs sends
-        buffer.push(br#"{"_msg":"test1"}"#).unwrap();
-        buffer.push(b"\n").unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], r#"{"_msg":"test1"}"#);
-
-        // Simulate multiple lines in one chunk
-        buffer
-            .push(
-                br#"{"_msg":"test2"}
-{"_msg":"test3"}
-"#,
-            )
-            .unwrap();
-
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], r#"{"_msg":"test2"}"#);
-        assert_eq!(lines[1], r#"{"_msg":"test3"}"#);
+        assert!(process_chunk_logged(&mut buffer, br#"{"_msg":"partial"#, "r", "s").is_empty());
+        let lines = process_chunk_logged(&mut buffer, b"\"}\n{\"_msg\":\"test2\"}\n", "r", "s");
+        assert_eq!(lines, vec![r#"{"_msg":"partial"}"#, r#"{"_msg":"test2"}"#]);
     }
 
     #[test]
-    fn test_buffer_partial_json() {
-        let mut buffer = StreamBuffer::new();
+    fn test_process_chunk_logged_counts_discarded_lines_per_line() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
 
-        // Partial JSON (no newline yet)
-        buffer.push(br#"{"_msg":"partial"#).unwrap();
+        let lines = metrics::with_local_recorder(&recorder, || {
+            let mut buffer = StreamBuffer::new();
+            let mut lines = process_chunk_logged(
+                &mut buffer,
+                b"ok1\n\xff\n\xfe\nok2\n\x80\n",
+                "rule1",
+                "src1",
+            );
+            // Two oversized lines: one complete, one pending then finished.
+            let mut chunk = vec![b'x'; MAX_LINE_SIZE + 1];
+            chunk.extend_from_slice(b"\nok3\n");
+            chunk.extend(vec![b'y'; MAX_LINE_SIZE + 1]);
+            lines.extend(process_chunk_logged(&mut buffer, &chunk, "rule1", "src1"));
+            lines.extend(process_chunk_logged(
+                &mut buffer,
+                b"yyy\nok4\n",
+                "rule1",
+                "src1",
+            ));
+            lines
+        });
 
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert!(lines.is_empty()); // No complete lines yet
+        assert_eq!(lines, vec!["ok1", "ok2", "ok3", "ok4"]);
+        let rendered = handle.render();
+        for series in [
+            r#"valerter_lines_discarded_total{rule_name="rule1",vl_source="src1",reason="invalid_utf8"} 3"#,
+            r#"valerter_lines_discarded_total{rule_name="rule1",vl_source="src1",reason="oversized"} 2"#,
+        ] {
+            assert!(
+                rendered.contains(series),
+                "missing {series} in:\n{rendered}"
+            );
+        }
+    }
 
-        // Complete it
-        buffer.push(br#""}"#).unwrap();
-        buffer.push(b"\n").unwrap();
+    // ==========================================================================
+    // URL normalization and request headers
+    // ==========================================================================
 
-        let lines = buffer.drain_complete_lines().unwrap();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], r#"{"_msg":"partial"}"#);
+    #[test]
+    fn test_build_url_strips_trailing_slashes() {
+        for (base, expected) in [
+            (
+                "http://vl:9428/",
+                "http://vl:9428/select/logsql/tail?query=q",
+            ),
+            (
+                "https://proxy.example.com/vl//",
+                "https://proxy.example.com/vl/select/logsql/tail?query=q",
+            ),
+            (
+                "http://vl:9428",
+                "http://vl:9428/select/logsql/tail?query=q",
+            ),
+        ] {
+            let client = TailClient::new(test_config(base, "q", None)).unwrap();
+            assert_eq!(client.build_url(), expected, "base_url {base}");
+        }
+    }
+
+    fn custom_headers(pairs: &[(&str, &str)]) -> Option<HashMap<String, SecretString>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), SecretString::new(v.to_string())))
+                .collect(),
+        )
+    }
+
+    fn basic_auth() -> Option<BasicAuthConfig> {
+        Some(BasicAuthConfig {
+            username: "user".to_string(),
+            password: SecretString::new("pass".to_string()),
+        })
+    }
+
+    #[test]
+    fn test_custom_authorization_overrides_basic_auth_predicate() {
+        let mut config = test_config("http://vl:9428", "q", None);
+        assert!(!config.custom_authorization_overrides_basic_auth());
+
+        config.headers = custom_headers(&[("Authorization", "Bearer abc")]);
+        assert!(!config.custom_authorization_overrides_basic_auth());
+
+        config.basic_auth = basic_auth();
+        assert!(config.custom_authorization_overrides_basic_auth());
+
+        config.headers = custom_headers(&[("authorization", "Bearer abc")]);
+        assert!(config.custom_authorization_overrides_basic_auth());
+
+        config.headers = custom_headers(&[("Authorization-Token", "Bearer abc")]);
+        assert!(!config.custom_authorization_overrides_basic_auth());
+
+        config.headers = None;
+        assert!(!config.custom_authorization_overrides_basic_auth());
+    }
+
+    #[test]
+    fn test_headers_defaults_and_basic_auth() {
+        let mut config = test_config("http://vl:9428", "q", None);
+        config.basic_auth = basic_auth();
+        let client = TailClient::new(config).unwrap();
+
+        assert_eq!(client.headers[ACCEPT], "application/x-ndjson");
+        assert_eq!(client.headers[CONNECTION], "keep-alive");
+        // base64("user:pass")
+        assert_eq!(client.headers[AUTHORIZATION], "Basic dXNlcjpwYXNz");
+        assert!(client.headers[AUTHORIZATION].is_sensitive());
+    }
+
+    #[test]
+    fn test_custom_headers_replace_defaults_and_basic_auth() {
+        let mut config = test_config("http://vl:9428", "q", None);
+        config.basic_auth = basic_auth();
+        config.headers = custom_headers(&[
+            ("accept", "application/json"),
+            ("Authorization", "Bearer abc"),
+            ("X-Tenant", "t1"),
+        ]);
+        let client = TailClient::new(config).unwrap();
+
+        assert_eq!(client.headers.get_all(ACCEPT).iter().count(), 1);
+        assert_eq!(client.headers[ACCEPT], "application/json");
+        assert_eq!(client.headers.get_all(AUTHORIZATION).iter().count(), 1);
+        assert_eq!(client.headers[AUTHORIZATION], "Bearer abc");
+        assert_eq!(client.headers["x-tenant"], "t1");
+        assert!(client.headers["x-tenant"].is_sensitive());
+    }
+
+    #[test]
+    fn test_custom_headers_case_duplicates_are_deterministic() {
+        let mut config = test_config("http://vl:9428", "q", None);
+        // Sorted by name: "X-Tenant" < "x-tenant", so the latter wins.
+        config.headers = custom_headers(&[("x-tenant", "lower"), ("X-Tenant", "upper")]);
+        let client = TailClient::new(config).unwrap();
+
+        assert_eq!(client.headers.get_all("x-tenant").iter().count(), 1);
+        assert_eq!(client.headers["x-tenant"], "lower");
+    }
+
+    #[test]
+    fn test_invalid_header_value_fails_without_leaking_value() {
+        let mut config = test_config("http://vl:9428", "q", None);
+        config.headers = custom_headers(&[("X-Token", "secret\nvalue")]);
+
+        let err = TailClient::new(config)
+            .err()
+            .expect("invalid header must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("'X-Token'"), "{msg}");
+        assert!(!msg.contains("secret"), "{msg}");
+    }
+
+    #[test]
+    fn test_invalid_header_name_is_truncated() {
+        let long_name = format!("bad name {}", "n".repeat(100));
+        let mut config = test_config("http://vl:9428", "q", None);
+        config.headers = custom_headers(&[(long_name.as_str(), "secret")]);
+
+        let err = TailClient::new(config)
+            .err()
+            .expect("invalid header must fail");
+        let msg = err.to_string();
+        let expected: String = long_name.chars().take(HEADER_NAME_MAX_CHARS).collect();
+        assert!(msg.contains(&format!("'{expected}'")), "{msg}");
+        assert!(!msg.contains(&long_name), "{msg}");
+        assert!(!msg.contains("secret"), "{msg}");
     }
 }

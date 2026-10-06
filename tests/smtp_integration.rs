@@ -171,6 +171,7 @@ fn create_mailhog_notifier(name: &str) -> EmailNotifier {
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
         body_template: None,
         body_template_file: None,
+        format: None,
     };
 
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -200,6 +201,7 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
         subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
         body_template: None,
         body_template_file: None,
+        format: None,
     };
 
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -210,17 +212,20 @@ fn create_mailhog_notifier_multi_recipient(name: &str, recipients: Vec<&str>) ->
 /// Create a test alert payload.
 fn make_alert_payload(rule_name: &str, title: &str, body: &str) -> AlertPayload {
     AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: title.to_string(),
             body: body.to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
         destinations: vec![],
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     }
 }
 
@@ -396,6 +401,7 @@ async fn test_send_email_html_format() {
     // email_body_html is used for pre-rendered HTML content (from TemplateEngine)
     // This simulates what TemplateEngine produces when rendering email_body_html
     let alert = AlertPayload {
+        mattermost_channel: None,
         message: RenderedMessage {
             title: "HTML Alert".to_string(),
             body: "Fallback plain text".to_string(),
@@ -403,12 +409,14 @@ async fn test_send_email_html_format() {
                 "<h1>Alert!</h1><p>Something <strong>important</strong> happened.</p>".to_string(),
             ),
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: "html_rule".to_string(),
         vl_source: "vlprod".to_string(),
         destinations: vec![],
         log_timestamp: "2026-01-15T10:49:35.799Z".to_string(),
         log_timestamp_formatted: "15/01/2026 10:49:35 UTC".to_string(),
+        log: AlertPayload::log_from_fields(&serde_json::json!({})),
     };
 
     let result = notifier.send(&alert).await;
@@ -538,6 +546,7 @@ async fn test_tls_mode_none_with_mailhog() {
         subject_template: "{{ title }}".to_string(),
         body_template: None,
         body_template_file: None,
+        format: None,
     };
 
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -653,6 +662,7 @@ async fn test_send_email_with_body_template_inline() {
                 .to_string(),
         ),
         body_template_file: None,
+        format: None,
     };
 
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -734,6 +744,7 @@ async fn test_send_email_with_body_template_file() {
         subject_template: "{{ title }}".to_string(),
         body_template: None,
         body_template_file: Some("templates/default-email.html.j2".to_string()),
+        format: None,
     };
 
     let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
