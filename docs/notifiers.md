@@ -35,6 +35,10 @@ default of its type applies:
   value.
 - Each rendering is computed once per alert and shared by the destinations
   that use it.
+- Values of the log are shown as text in every rendering (unless inserted with
+  `| safe`), but the client still detects what it detects in any text: bare
+  URLs, `@channel`/`@here` (Mattermost), mentions. valerter does not filter
+  them.
 - An alert whose template has no `body_format` (or `body_format: text`) sends
   its `body` as before, whatever the `format`.
 
@@ -204,18 +208,33 @@ A webhook targets services valerter knows nothing about (PagerDuty, ticketing,
 SMS gateways, in-house APIs), most of which do not render Markdown: by default,
 the body of a [Markdown alert](#output-format-per-notifier) is plain text
 (`**{{ host }}** [logs](https://vl.example.com)` gives
-`web-01 logs (https://vl.example.com)`). Declare `format: markdown` for a target
-that renders Markdown (Discord, Rocket.Chat, GitHub, a Mattermost reached
-through a generic webhook), and `format: html` for one that expects HTML
-(Microsoft Teams, an HTML API):
+`web-01 logs (https://vl.example.com)`). Declare `format: html` for a target
+that expects HTML (Microsoft Teams, an HTML API), and `format: markdown` for a
+Mattermost reached through a generic webhook or another CommonMark/GFM engine:
 
 ```yaml
 notifiers:
-  discord-md:
+  mattermost-md:
+    type: webhook
+    url: "${MATTERMOST_WEBHOOK_URL}"
+    format: markdown
+    body_template: '{"text": {{ body | tojson }}}'
+```
+
+The `markdown` rendering follows Mattermost's engine: it writes `<` as `&lt;`
+and a `&` that starts an entity as `&amp;`, which CommonMark engines decode.
+Discord does not decode entities (a value `a < b` would show `a &lt; b`), and
+Rocket.Chat has not been checked: keep the default `plain` for them. Discord
+then reads the plain text as its own Markdown, so a value holding `*`, `_` or
+`~` may be formatted:
+
+```yaml
+notifiers:
+  discord:
     type: webhook
     url: "${DISCORD_WEBHOOK_URL}"
-    format: markdown
-    body_template: '{"content": {{ body | tojson }}}'
+    # format: plain (the default)
+    body_template: '{"content": {{ ("**" ~ title ~ "**\n" ~ body) | tojson }}}'
 ```
 
 An `html` body is already escaped: insert it with `{{ body }}` in an HTML
@@ -609,11 +628,16 @@ If at least one chat succeeds, the alert is delivered (`Ok`) and `valerter_alert
 
 Telegram's hard limit is **4096 Unicode codepoints** per message. Longer messages are truncated to 4095 codepoints + `…` (one Unicode codepoint). Each truncation increments `valerter_alerts_truncated_total{notifier_type="telegram"}` **once per alert** (not per chat) and emits a `warn` log.
 
-The cut is a plain codepoint cut: with `parse_mode: HTML` it can split a tag (`<pre>` left open, `</b` cut in half) or an entity (`&am`). Telegram then rejects the message with a 400 `can't parse entities`, and the plain-text fallback below delivers it.
+With `parse_mode: HTML`, only the visible text is counted, as Telegram does: a tag counts zero (a long `href` included) and an entity (`&lt;`, `&amp;`, `&#60;`) counts one. The cut never falls inside a tag or an entity, and the tags still open after the `…` are closed (`<b>xxx…</b>`, `<pre><code class="language-rust">…</code></pre>`), so a truncated message stays valid HTML. With `parse_mode: MarkdownV2` or `Markdown`, the text is cut as is, codepoint by codepoint.
 
 ### Plain-text fallback on HTML rejection
 
-When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat with a `description` containing `can't parse entities` (any case; e.g. `Bad Request: can't parse entities: Unclosed start tag at byte offset 4090`), the same text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text: the alert is delivered, with its HTML tags and entities shown literally. A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
+When `parse_mode` is `HTML` (any case) and Telegram answers **400** for a chat with a `description` containing `can't parse entities` (any case; e.g. `Bad Request: can't parse entities: Unsupported start tag "x" at byte offset 12`), the text is resent **once** to that chat without `parse_mode`, so Telegram displays it as plain text and the alert is delivered:
+
+- for an alert whose template has `body_format: markdown`, the resent text is the title (when not empty), a line break and the `plain` rendering of the body, without tags nor entities (`Disk\na_b < 10%`), truncated to 4096 codepoints;
+- for any other alert, the same text is resent, its HTML tags and entities shown literally.
+
+A `warn` log `Telegram rejected HTML message, resending as plain text` is emitted (notifier, rule, chat and status; never the bot token, the API URL or the text).
 
 The resend follows the usual retry policy (5xx, 429 and network errors, up to 3 attempts). A 4xx on the resend fails the chat for good (`client error: <status>`). There is no fallback for any other 400 (`chat not found`, `message text is empty`, a body without that description), for other 4xx statuses (401, 403, 404...) or with `parse_mode: MarkdownV2` or `Markdown`: those fail immediately.
 
@@ -633,8 +657,9 @@ The simplest way to format a Telegram message is a rule template with
 [`body_format: markdown`](configuration.md#markdown-bodies-body_format): its
 body, written once in Markdown, reaches Telegram as HTML of the Bot API subset
 (`<b>`, `<i>`, `<s>`, `<code>`, `<pre>`, `<a>`, `<blockquote>`), always well
-formed, with the values of the log escaped. The default `body_template` works
-unchanged (`{{ body|e }}` leaves this HTML intact):
+formed and nested as the Bot API allows, with the values of the log escaped.
+The default `body_template` works unchanged (`{{ body|e }}` leaves this HTML
+intact):
 
 ```yaml
 templates:
@@ -648,6 +673,11 @@ With `host=a_b`, the message is `<b>Disk a_b</b>\n<b>a_b</b> &lt; 10% free`.
 The same template gives Markdown to Mattermost and HTML to email.
 
 - The `telegram_html` rendering needs `parse_mode: HTML` (the default).
+- Telegram refuses some nestings, so the rendering flattens them: a code span
+  in bold, italics, strikethrough, a heading or a link is shown without
+  monospace (`**a `x` b**` gives `<b>a x b</b>`), bold in bold (or in a
+  heading, itself bold) is shown once, a quote in a quote is merged into the
+  outer one, and a link in a link is shown as text.
 - With `parse_mode: MarkdownV2`, the notifier receives the plain-text rendering
   by default: escape it with `mdv2_escape` in a `body_template` written for
   MarkdownV2, `*{{ title | mdv2_escape }}*\n{{ body | mdv2_escape }}`.

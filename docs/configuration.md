@@ -393,6 +393,16 @@ with bracket notation:
 
 `valerter --validate` detects this pattern and prints the rewritten expression.
 
+Expansion has two limits, each logged as a warning and never stopping the
+alert. A dotted key whose first segment is already a plain field (`a` and
+`a.b`) is not expanded: `{{ a }}` keeps the plain value
+(`skipping dotted-key expansion: top-level scalar already exists`). A dotted
+key of more than 32 segments is not expanded either: only the flat key exists,
+reachable with bracket notation (`{{ log["a.b.c…"] }}`), so that a malformed
+log line cannot build objects thousands of levels deep
+(`skipping dotted-key expansion: too many segments`, the key truncated to 128
+bytes in the log).
+
 A **top-level** field whose name contains `/` (e.g. `io/user-name`, with no dot
 before it) has no parent object to index, so it cannot be referenced from a
 template. Rename it in the rule query with the LogsQL `rename` pipe, then use
@@ -412,7 +422,7 @@ detected and must be renamed the same way.
 ### valerter filters
 
 Besides the built-in filters of minijinja (`default`, `upper`, `lower`,
-`length`, `replace`, `tojson`, `e`...), valerter provides two escaping filters,
+`length`, `replace`, `tojson`, `urlencode`, `e`...), valerter provides two escaping filters,
 available in every template (rule templates, `throttle.key`, notifier
 templates). Filters that minijinja does not provide, such as `truncate`, are
 unknown and refused by the [test render](#template-validation).
@@ -444,7 +454,7 @@ HTML afterwards. In the `body` of a `body_format: markdown` template, values are
 already escaped: `md_escape` there is the automatic escaping itself, applied
 once.
 
-The filters `code`, `codeblock` and the function `link` build Markdown from
+The filters `code`, `codeblock` and the function `md_link` build Markdown from
 values; they are meant for [Markdown bodies](#markdown-bodies-body_format).
 
 ### Markdown bodies (`body_format`)
@@ -454,7 +464,10 @@ Markdown, and valerter renders it in the format of each notifier: Markdown for
 Mattermost, the HTML subset of the Bot API for Telegram, HTML for email, plain
 text for a webhook by default (see
 [Output format per notifier](notifiers.md#output-format-per-notifier)). The
-values of the log cannot become markup on any channel.
+values of the log are shown as text on every channel, unless you insert them
+with `| safe`. As in a text body, the client may still detect bare URLs,
+`@channel`/`@here` (Mattermost) and mentions in a value: valerter does not
+filter them.
 
 ```yaml
 templates:
@@ -463,7 +476,7 @@ templates:
     body_format: markdown
     body: |
       **{{ host }}** is at {{ usage }}% on {{ mount | code }}
-      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
       {{ _msg | codeblock }}
 ```
 
@@ -472,7 +485,7 @@ Mattermost receives:
 
 ````
 **web\_01** is at 97% on `/var`
-[Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host:web_01)
+[Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host%3Aweb_01)
 
 ```
 disk <full> & read-only
@@ -484,7 +497,7 @@ its default `body_template`:
 
 ```
 <b>web_01</b> is at 97% on <code>/var</code>
-<a href="https://vl.example.com/select/vmui?query=host:web_01">Logs in VictoriaLogs</a>
+<a href="https://vl.example.com/select/vmui?query=host%3Aweb_01">Logs in VictoriaLogs</a>
 
 <pre>disk &lt;full&gt; &amp; read-only</pre>
 ```
@@ -497,20 +510,46 @@ present, is still rendered as HTML. A template without `body_format`, or with
 `{{ ... }}` is escaped: each ASCII punctuation character gets a backslash, so a
 value is always read as literal text (`a_b*c` stays `a_b*c`, never italics).
 The markup written in the template itself (`**...**`, `[...](...)`, lists...)
-is interpreted. To insert a value without escaping:
+is interpreted.
 
-- `{{ summary | safe }}`: the value is trusted Markdown (bold, links...);
-- `{{ value | tojson }}`: a JSON value, inserted as is;
+- `{{ summary | safe }}` is the only way to insert a value without escaping:
+  the value is trusted Markdown (bold, links...).
+- `{{ value | tojson }}` is escaped like any value: the JSON text is shown
+  literally.
 - `| e` escapes for the current context, which is Markdown here, not HTML (and
   never twice): `{{ v | e }}` is the same as `{{ v }}`.
+- The line breaks of a value stay line breaks, but a value cannot change the
+  structure around it: each leading space of a line of the value becomes a
+  no-break space (U+00A0, four for a tab) and an empty line a lone U+00A0. So
+  `**{{ _msg }}**` stays bold over a multi-line message, `- {{ _msg }}` stays one
+  item, and the indentation of a stack trace stays visible instead of turning
+  into a code block. The renderings, `plain` included, contain these U+00A0.
+- The characters U+E000 and U+E001 of a value are shown as U+FFFD (valerter
+  uses them internally for `code`, `codeblock` and `md_link`).
 
 **Filters and function.**
 
 | Name | Use | Result |
 |------|-----|--------|
 | `code` | `{{ host \| code }}` | A code span showing the value literally, whatever backticks it contains; a line break becomes a space. |
-| `codeblock(lang)` | `{{ _msg \| codeblock('json') }}` | A fenced code block showing the value literally; `lang` is optional and keeps only `A-Z a-z 0-9 _ + - . #`. Put it alone on its line. |
-| `link(text, url)` | `{{ link("Logs", vl_url) }}` | A link whose text is escaped; spaces, control characters, `<`, `>`, `(`, `)` and `\` of the URL are percent-encoded. A scheme other than `http`, `https` or `mailto` gives `text (url)`, without a link. |
+| `codeblock(lang)` | `{{ _msg \| codeblock('json') }}` | A fenced code block showing the value literally; `lang` is optional and keeps only `A-Z a-z 0-9 _ + - . #`. |
+| `md_link(text, url)` | `{{ md_link("Logs", vl_url) }}` | A link whose text is literal (on one line); spaces, control characters, `<`, `>`, `(`, `)` and `\` of the URL are percent-encoded. A scheme other than `http`, `https` or `mailto` gives `text (url)`, without a link. |
+
+Their content is always literal, wherever they are written: after a list
+marker, in a quote, on an indented line or in the middle of a line.
+
+- `codeblock` cuts the paragraph it is written in: `Log: {{ _msg | codeblock }}`
+  gives the paragraph `Log:`, then the block. Where a block cannot stand (in
+  `**...**`, a heading or the text of a link), it becomes a code span; in a
+  code block of the template, its text is written as is.
+- A Markdown filter must end its expression: `{{ (v | code) ~ '!' }}` or
+  `{{ v | code | upper }}` gives an ordinary string, escaped like any value
+  (backticks shown).
+- `md_link` does not encode the query of the URL: encode the values you put in
+  it with the built-in `urlencode` filter, as in the example above
+  (`("host:" ~ host) | urlencode` gives `host%3Aweb_01`).
+- An event field named `md_link` would hide the function, as any field hides
+  a global function of the same name.
 
 Outside a Markdown body, they return ordinary strings, escaped like any value
 (in `email_body_html`, `{{ x | code }}` gives an HTML-escaped `` `x` ``).
@@ -525,7 +564,10 @@ becomes a link to the image (its alternative text as link text).
   interpreted.
 - Tables are not recognised: their lines are shown as text.
 - Links are only emitted for the `http`, `https` and `mailto` schemes, in the
-  template as with `link`; `[x](javascript:...)` shows `x (javascript:...)`.
+  template as with `md_link`; `[x](javascript:...)` shows `x (javascript:...)`.
+- Nesting is limited to 32 levels (quotes, lists, emphasis...): a deeper
+  element is not recognised, its text is kept. A log line inserted with
+  `| safe` cannot exhaust the stack of the process.
 
 **Pitfall: `{{ x }}` inside a fence or backticks.** A value written inside a
 code block or a code span of the template is escaped too, and code shows its
@@ -538,8 +580,7 @@ content literally, backslashes included. With `_msg=disk <full> & read-only`:
 ````
 
 shows `disk \<full\> \& read\-only`, and `` `{{ mount }}` `` shows `\/var`.
-Write `{{ _msg | codeblock }}` (alone on its line) and `{{ mount | code }}`
-instead.
+Write `{{ _msg | codeblock }}` and `{{ mount | code }}` instead.
 
 **Email.** A Markdown template needs no `email_body_html`: the HTML rendering of
 the body is the email body (`email_body_html` still wins when present).
@@ -568,9 +609,9 @@ in either pass:
 - the `/` operator applied to a field path (see above).
 
 The `body` of a `body_format: markdown` template is test-rendered with the
-Markdown escaping active, as in production; `code`, `codeblock` and `link` are
-checked like the other valerter filters (an unknown filter after them is
-reported).
+Markdown escaping active, as in production; `code`, `codeblock`, `md_link`,
+`urlencode` and `tojson` are checked like the other filters (an unknown filter
+after them is reported).
 
 In a notifier template (`body_template`, `subject_template`), a top-level
 variable that is not part of its context (see

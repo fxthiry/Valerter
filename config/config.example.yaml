@@ -180,12 +180,14 @@ templates:
 
   # ── Example: Markdown body, rendered for each notifier ─────────────────────
   # body_format: markdown (default: text) makes `body` a Markdown source:
-  # every {{ value }} is escaped (| safe to insert trusted Markdown), and the
-  # body is rendered per notifier (Mattermost: Markdown, Telegram: HTML,
-  # email: HTML, so no email_body_html is needed; webhook: plain text by
-  # default, see the `format` key of notifiers). Raw HTML and tables are shown
-  # as text. `code`, `codeblock` and `link` build Markdown from values; never
-  # write {{ value }} inside backticks or a ``` fence (use them instead).
+  # every {{ value }} is escaped, | tojson included (| safe, and only it,
+  # inserts trusted Markdown), and the body is rendered per notifier
+  # (Mattermost: Markdown, Telegram: HTML, email: HTML, so no email_body_html
+  # is needed; webhook: plain text by default, see the `format` key of
+  # notifiers). Raw HTML and tables are shown as text. `code`, `codeblock` and
+  # `md_link` build Markdown from values and keep them literal wherever they
+  # are written; never write {{ value }} inside backticks or a ``` fence (use
+  # them instead). Encode values put in a URL with | urlencode.
   # See docs/configuration.md#markdown-bodies-body_format.
   #
   # markdown_alert:
@@ -193,7 +195,7 @@ templates:
   #   body_format: markdown
   #   body: |
   #     **{{ host }}** reported an error at {{ _time }}
-  #     {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+  #     {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
   #     {{ _msg | codeblock }}
 
 
@@ -225,7 +227,8 @@ notifiers:
   # Required: url
   # Optional: method (default: POST), headers, body_template,
   #           format (body of a Markdown alert: plain (default), markdown or
-  #           html; markdown for Discord/Rocket.Chat, html for Teams)
+  #           html; markdown for Mattermost through a generic webhook or
+  #           another CommonMark engine, html for Teams; Discord: plain)
   #
   # Default payload when body_template is omitted:
   # {

@@ -243,7 +243,14 @@ Tests that valerter recovers from VictoriaLogs outages.
 | With throttle (any load) | ~18-20 MB |
 | Without throttle (extreme) | ~22 MB |
 
-Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied), so even dozens of notifiers keep the pending alerts within a few MB. Each pending alert also keeps the fields of its event (the `log` variable of notifier templates), at most one log line of 1 MiB, shared between destinations like the rest of the payload.
+Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied): with ordinary log lines (a few hundred bytes), even dozens of notifiers keep the pending alerts within a few MB.
+
+The size of a pending alert grows with its log line (at most 1 MiB). For a line of L bytes:
+
+- the fields of the event (the `log` variable of notifier templates) take up to 2L: the flat keys, plus a copy of each dotted key expanded into objects;
+- a `body_format: markdown` body that inserts the line once takes up to 2L for its source (a backslash before each punctuation character), then, only for the formats used by its destinations: up to L for `plain`, 4L for `markdown` (`<` written `&lt;`), 6L for `html` (`"` written `&quot;`) and 5L for `telegram_html` (`&` written `&amp;`). Each rendering is computed once and shared.
+
+That is about 20 MiB per alert in the worst case (a 1 MiB line of such characters, every format used), times the number of times the body inserts the line. The leading blanks and empty lines of a value are the exception: in a Markdown body, a leading space becomes a no-break space (2 bytes), a leading tab four (8 bytes) and an empty line one, which multiplies these figures for a value made of them. A text body keeps its rendered text only (about L per insertion).
 
 ---
 
