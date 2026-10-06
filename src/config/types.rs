@@ -3,8 +3,8 @@
 use super::notifiers::{NotifiersConfig, default_true};
 use super::secret::SecretString;
 use super::validation::{
-    validate_hex_color, validate_jinja_template, validate_resolved_url, validate_template_render,
-    validate_url,
+    validate_hex_color, validate_jinja_template, validate_markdown_template_render,
+    validate_resolved_url, validate_template_render, validate_url,
 };
 use crate::error::ConfigError;
 use regex::Regex;
@@ -255,6 +255,91 @@ pub struct ThrottleConfig {
     pub window: Duration,
 }
 
+/// Source format of a template's `body`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyFormat {
+    /// The body is sent as rendered, without any escaping.
+    #[default]
+    Text,
+    /// The body is Markdown: inserted values are Markdown-escaped, and the
+    /// result is rendered in each notifier's [`OutputFormat`].
+    Markdown,
+}
+
+/// Format in which a notifier receives the body of a Markdown alert
+/// (`format` key of a notifier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// Text without any markup.
+    Plain,
+    /// Markdown escaped for Mattermost's engine.
+    Markdown,
+    /// HTML (email).
+    Html,
+    /// The HTML subset of the Telegram Bot API (`parse_mode: HTML`).
+    TelegramHtml,
+}
+
+impl OutputFormat {
+    /// Every format, in the order of their render cache slots.
+    pub const ALL: [OutputFormat; 4] = [
+        OutputFormat::Plain,
+        OutputFormat::Markdown,
+        OutputFormat::Html,
+        OutputFormat::TelegramHtml,
+    ];
+
+    /// The name used in the configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Plain => "plain",
+            OutputFormat::Markdown => "markdown",
+            OutputFormat::Html => "html",
+            OutputFormat::TelegramHtml => "telegram_html",
+        }
+    }
+
+    /// Whether a rendered body in this format is already escaped for an HTML
+    /// notifier template (`| e` leaves it intact).
+    pub fn is_safe(self) -> bool {
+        matches!(self, OutputFormat::Html | OutputFormat::TelegramHtml)
+    }
+
+    /// Resolves the `format` key of a notifier: `configured`, or `default`
+    /// when absent; a format outside `accepted` is refused with
+    /// `invalid notifier '<name>': format '<f>' is not supported for <kind>
+    /// notifiers (expected <list>)`.
+    pub fn resolve(
+        configured: Option<OutputFormat>,
+        default: OutputFormat,
+        accepted: &[OutputFormat],
+        notifier: &str,
+        kind: &str,
+    ) -> Result<OutputFormat, ConfigError> {
+        let format = configured.unwrap_or(default);
+        if accepted.contains(&format) {
+            return Ok(format);
+        }
+        let expected: Vec<&str> = accepted.iter().map(|f| f.as_str()).collect();
+        Err(ConfigError::InvalidNotifier {
+            name: notifier.to_string(),
+            message: format!(
+                "format '{}' is not supported for {kind} notifiers (expected {})",
+                format.as_str(),
+                expected.join(", ")
+            ),
+        })
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Template configuration for message formatting.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,6 +350,8 @@ pub struct TemplateConfig {
     pub email_body_html: Option<String>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default)]
+    pub body_format: BodyFormat,
 }
 
 /// Alert rule configuration.
@@ -915,7 +1002,11 @@ impl Config {
                     message: format!("title render: {}", e),
                 });
             }
-            if let Err(e) = validate_template_render(&template.body) {
+            let body_render = match template.body_format {
+                BodyFormat::Text => validate_template_render(&template.body),
+                BodyFormat::Markdown => validate_markdown_template_render(&template.body),
+            };
+            if let Err(e) = body_render {
                 errors.push(ConfigError::InvalidTemplate {
                     rule: format!("template:{}", name),
                     message: format!("body render: {}", e),

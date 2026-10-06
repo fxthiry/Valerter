@@ -207,32 +207,48 @@ fn filter_substitute(name: &str, pass: Pass) -> Value {
     }
 }
 
+/// Wraps a filter or function so that a failure caused by a sentinel
+/// argument returns [`filter_substitute`] instead of stopping the render.
+fn wrap(
+    name: &'static str,
+    callable: Value,
+    pass: Pass,
+) -> impl Fn(&State, Rest<Value>) -> Result<Value, Error> + Send + Sync + 'static {
+    move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
+        match callable.call(state, &args) {
+            Err(err) if !is_value_independent(err.kind()) && args.iter().any(is_sentinel) => {
+                Ok(filter_substitute(name, pass))
+            }
+            other => other,
+        }
+    }
+}
+
 /// Builds the environment of a validation render: lenient undefined values
-/// as in production, every built-in and valerter filter wrapped so that a
-/// failure caused by a sentinel argument returns [`filter_substitute`]
-/// instead of stopping the render, and, in the falsy pass,
-/// `defined`/`undefined` tests that treat a sentinel as undefined (so
+/// as in production, every built-in and valerter filter and valerter's
+/// functions wrapped (see [`wrap`]), the Markdown auto-escaping of a
+/// `body_format: markdown` body when `markdown` is set, and, in the falsy
+/// pass, `defined`/`undefined` tests that treat a sentinel as undefined (so
 /// `{% if x is not defined %}` bodies are walked).
-fn validation_env(pass: Pass) -> Environment<'static> {
+///
+/// The Markdown formatter is required: without it, minijinja's default
+/// formatter fails on the first value written, an error that depends on the
+/// values and is therefore accepted, which would end the pass silently.
+fn validation_env(pass: Pass, markdown: bool) -> Environment<'static> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    if markdown {
+        crate::template::filters::install_markdown_escape(&mut env);
+    }
     let filters = builtin_filters()
         .into_iter()
         .chain(crate::template::filters::valerter_filters());
     for (name, filter) in filters {
-        env.add_filter(
-            name,
-            move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
-                match filter.call(state, &args) {
-                    Err(err)
-                        if !is_value_independent(err.kind()) && args.iter().any(is_sentinel) =>
-                    {
-                        Ok(filter_substitute(name, pass))
-                    }
-                    other => other,
-                }
-            },
-        );
+        env.add_filter(name, wrap(name, filter, pass));
+    }
+    // Globals: reachable through `ValidationRoot`, which skips them.
+    for (name, function) in crate::template::filters::valerter_functions() {
+        env.add_global(name, Value::from_function(wrap(name, function, pass)));
     }
     if pass == Pass::Falsy {
         env.add_test("defined", |v: &Value| !v.is_undefined() && !is_sentinel(v));
@@ -270,12 +286,19 @@ pub(crate) fn validate_jinja_template(source: &str) -> Result<(), String> {
 /// Returns an error string if the template syntax is invalid, uses an unknown
 /// filter, test, function or method, or divides field paths.
 pub fn validate_template_render(source: &str) -> Result<(), String> {
-    render_pass(source, Pass::Truthy)?;
-    render_pass(source, Pass::Falsy)
+    render_pass(source, Pass::Truthy, false)?;
+    render_pass(source, Pass::Falsy, false)
 }
 
-fn render_pass(source: &str, pass: Pass) -> Result<(), String> {
-    let mut env = validation_env(pass);
+/// [`validate_template_render`] for the `body` of a `body_format: markdown`
+/// template, rendered with the Markdown auto-escaping as in production.
+pub fn validate_markdown_template_render(source: &str) -> Result<(), String> {
+    render_pass(source, Pass::Truthy, true)?;
+    render_pass(source, Pass::Falsy, true)
+}
+
+fn render_pass(source: &str, pass: Pass, markdown: bool) -> Result<(), String> {
+    let mut env = validation_env(pass, markdown);
     env.add_template("_render_test", source)
         .map_err(|e| e.to_string())?;
 
@@ -606,7 +629,7 @@ mod tests {
     #[test]
     fn sentinel_tojson_and_nested_loops_do_not_overflow() {
         for pass in [Pass::Truthy, Pass::Falsy] {
-            let env = validation_env(pass);
+            let env = validation_env(pass, false);
             let root = || {
                 Value::from_object(ValidationRoot {
                     globals: Vec::new(),
@@ -626,7 +649,7 @@ mod tests {
     #[test]
     fn validation_env_keeps_builtin_filter_results() {
         for pass in [Pass::Truthy, Pass::Falsy] {
-            let env = validation_env(pass);
+            let env = validation_env(pass, false);
             assert_eq!(env.render_str("{{ '7' | int + 1 }}", ()).unwrap(), "8");
             assert_eq!(
                 env.render_str("{{ 3.14159 | round(2) }}", ()).unwrap(),
@@ -725,10 +748,57 @@ mod tests {
                 "{{{{ x | {name}{} }}}}{{{{ y | nosuchfilter }}}}",
                 required_args(name)
             );
-            let err = validate_template_render(&source)
-                .expect_err(&format!("{source} should be rejected"));
-            assert!(err.contains("nosuchfilter"), "{source}: {err}");
+            for validate in [validate_template_render, validate_markdown_template_render] {
+                let err = validate(&source).expect_err(&format!("{source} should be rejected"));
+                assert!(err.contains("nosuchfilter"), "{source}: {err}");
+            }
         }
+        for (name, _) in crate::template::filters::valerter_functions() {
+            let source = format!("{{{{ {name}(x, y) }}}}{{{{ y | nosuchfilter }}}}");
+            for validate in [validate_template_render, validate_markdown_template_render] {
+                let err = validate(&source).expect_err(&format!("{source} should be rejected"));
+                assert!(err.contains("nosuchfilter"), "{source}: {err}");
+            }
+        }
+    }
+
+    // ============================================================
+    // Markdown bodies (markdown-body-format)
+    // ============================================================
+
+    /// Without the Markdown formatter, the first value written would fail
+    /// (accepted as value-dependent) and hide the unknown filter after it.
+    #[test]
+    fn markdown_render_reports_unknown_filter_after_an_escaped_value() {
+        let err = validate_markdown_template_render("{{ host }} {{ host | nosuch }}")
+            .expect_err("unknown filter must be reported");
+        assert!(err.contains("nosuch"), "{err}");
+    }
+
+    #[test]
+    fn markdown_render_accepts_markdown_filters() {
+        let source = "{{ _msg | codeblock('json') }} {{ host | code }} {{ link(host, url) }} \
+            {{ x | safe }} {{ x | tojson }} {{ x | e }} {{ x | md_escape }} \
+            {% autoescape false %}{{ x }}{% endautoescape %}";
+        assert_eq!(validate_markdown_template_render(source), Ok(()));
+        assert_eq!(validate_template_render(source), Ok(()));
+    }
+
+    #[test]
+    fn markdown_render_rejects_unknown_function() {
+        let err = validate_markdown_template_render("{{ lnk(a, b) }}").unwrap_err();
+        assert!(err.contains("lnk"), "{err}");
+    }
+
+    #[test]
+    fn notifier_template_reports_unknown_filter_after_link() {
+        let err = validate_notifier_template(
+            "body_template",
+            "{{ link(log.a, log.b) }} {{ log.c | nosuch }}",
+        )
+        .unwrap_err();
+        assert!(err.contains("body_template render"), "{err}");
+        assert!(err.contains("nosuch"), "{err}");
     }
 
     #[test]

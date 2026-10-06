@@ -1,0 +1,97 @@
+# Fixture: the YAML examples added by the "Markdown bodies" change, copied from
+# docs/configuration.md ("Markdown bodies", disk_alert), docs/notifiers.md
+# (Webhook > Markdown alerts: choosing `format`, discord-md; Telegram >
+# Formatting messages, disk_alert, renamed telegram_disk_alert here) and
+# config/config.example.yaml (markdown_alert, uncommented). Keep them in sync:
+# every template and notifier must pass --validate without an unknown-variable
+# warning. MIGRATION.md has no example for this opt-in change.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  # docs/configuration.md, Markdown bodies (`body_format`)
+  disk_alert:
+    title: "Disk {{ host }}"
+    body_format: markdown
+    body: |
+      **{{ host }}** is at {{ usage }}% on {{ mount | code }}
+      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ _msg | codeblock }}
+
+  # docs/notifiers.md, Telegram > Formatting messages
+  telegram_disk_alert:
+    title: "Disk {{ host }}"
+    body_format: markdown
+    body: "**{{ host }}** < 10% free"
+
+  # config/config.example.yaml, Example: Markdown body
+  markdown_alert:
+    title: "{{ rule_name }} on {{ host }}"
+    body_format: markdown
+    body: |
+      **{{ host }}** reported an error at {{ _time }}
+      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ _msg | codeblock }}
+
+notifiers:
+  # docs/notifiers.md, Webhook > Markdown alerts: choosing `format`
+  discord-md:
+    type: webhook
+    url: "${DISCORD_WEBHOOK_URL}"
+    format: markdown
+    body_template: '{"content": {{ body | tojson }}}'
+
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/abc123"
+
+  telegram-alerts:
+    type: telegram
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_ids:
+      - "-100123456789"
+
+  # A Markdown template needs no email_body_html.
+  email-ops:
+    type: email
+    smtp:
+      host: smtp.example.com
+      port: 587
+    from: "valerter@example.com"
+    to:
+      - "ops@example.com"
+    subject_template: "[{{ rule_name | upper }}] {{ title }}"
+
+rules:
+  - name: "disk"
+    query: '_stream:{app="node"}'
+    parser:
+      json:
+        fields: ["host", "usage", "mount"]
+    notify:
+      template: "disk_alert"
+      destinations: [discord-md, mattermost-ops, telegram-alerts, email-ops]
+
+  - name: "telegram_disk"
+    query: '_stream:{app="node"}'
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "telegram_disk_alert"
+      destinations: [telegram-alerts, email-ops]
+
+  - name: "errors"
+    query: '_stream:{app="myapp"} error'
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "markdown_alert"
+      destinations: [mattermost-ops, discord-md, email-ops]

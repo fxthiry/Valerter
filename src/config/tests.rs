@@ -489,6 +489,7 @@ fn make_runtime_config_with_destinations(destinations: Vec<String>) -> RuntimeCo
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: crate::config::BodyFormat::Text,
                 },
             );
             t
@@ -604,6 +605,7 @@ fn validate_collects_all_errors() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -691,6 +693,7 @@ fn validate_throttle_key_template() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -763,6 +766,7 @@ fn validate_nonexistent_notify_template_fails() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: BodyFormat::Text,
                 },
             );
             t
@@ -1200,6 +1204,7 @@ fn validate_rule_destinations_collects_all_errors() {
                     body: "{{ body }}".to_string(),
                     email_body_html: None,
                     accent_color: None,
+                    body_format: crate::config::BodyFormat::Text,
                 },
             );
             t
@@ -3226,4 +3231,150 @@ fn validate_reports_template_errors_in_name_order() {
         let beta = msg.find("template:beta").expect(&msg);
         assert!(alpha < beta, "{msg}");
     }
+}
+
+// ============================================================
+// body_format (markdown-body-format)
+// ============================================================
+
+fn template_yaml(extra: &str) -> String {
+    format!("title: \"T\"\nbody: \"B\"\n{extra}")
+}
+
+#[test]
+fn template_without_body_format_defaults_to_text() {
+    let template: TemplateConfig = serde_yaml::from_str(&template_yaml("")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Text);
+}
+
+#[test]
+fn template_accepts_body_format_markdown_and_text() {
+    let template: TemplateConfig =
+        serde_yaml::from_str(&template_yaml("body_format: markdown")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Markdown);
+    let template: TemplateConfig =
+        serde_yaml::from_str(&template_yaml("body_format: text")).unwrap();
+    assert_eq!(template.body_format, BodyFormat::Text);
+}
+
+#[test]
+fn template_rejects_unknown_body_format() {
+    let err = serde_yaml::from_str::<TemplateConfig>(&template_yaml("body_format: md"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`text`"), "{err}");
+    assert!(err.contains("`markdown`"), "{err}");
+}
+
+#[test]
+fn compile_carries_body_format() {
+    let yaml = r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  md:
+    title: "T"
+    body: "**{{ host }}**"
+    body_format: markdown
+  plain:
+    title: "T"
+    body: "B"
+rules: []
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let runtime = config
+        .compile(std::path::Path::new("/tmp/config.yaml"))
+        .unwrap();
+    assert_eq!(runtime.templates["md"].body_format, BodyFormat::Markdown);
+    assert_eq!(runtime.templates["plain"].body_format, BodyFormat::Text);
+}
+
+#[test]
+fn output_format_resolve_reports_expected_list() {
+    let err = OutputFormat::resolve(
+        Some(OutputFormat::Plain),
+        OutputFormat::Html,
+        &[OutputFormat::Html],
+        "mail",
+        "email",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid notifier 'mail': format 'plain' is not supported for email notifiers (expected html)"
+    );
+    assert_eq!(
+        OutputFormat::resolve(
+            None,
+            OutputFormat::Plain,
+            &[OutputFormat::Plain, OutputFormat::Markdown],
+            "w",
+            "webhook"
+        )
+        .unwrap(),
+        OutputFormat::Plain
+    );
+}
+
+fn markdown_template_config(body: &str) -> Config {
+    let yaml = format!(
+        r#"
+victorialogs:
+  default:
+    url: http://localhost:9428
+notifiers:
+  test:
+    type: mattermost
+    webhook_url: "https://example.com/hooks/test"
+defaults:
+  throttle:
+    count: 5
+    window: 1m
+templates:
+  md:
+    title: "T"
+    body: {body:?}
+    body_format: markdown
+rules:
+  - name: r
+    query: "_msg:test"
+    parser:
+      regex: ".*"
+    notify:
+      template: md
+      destinations: [test]
+"#
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn validate_markdown_body_reports_unknown_filter_after_escaped_value() {
+    let errors = markdown_template_config("{{ host }} {{ host | nosuch }}")
+        .validate()
+        .unwrap_err();
+    assert!(
+        errors.iter().any(|e| {
+            let msg = e.to_string();
+            msg.contains("body render") && msg.contains("nosuch")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn validate_markdown_body_accepts_markdown_filters() {
+    let config = markdown_template_config(
+        "{{ _msg | codeblock('json') }} {{ host | code }} {{ link(host, url) }} {{ x | safe }}",
+    );
+    assert!(config.validate().is_ok());
 }

@@ -1,0 +1,39 @@
+# Fixture: an email notifier declares a format its type does not accept.
+# Passes Config::validate(); rejected by the preflight (Notifier configuration error).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "**{{ _msg }}**"
+    body_format: markdown
+
+notifiers:
+  mail:
+    type: email
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+    from: "alerts@example.com"
+    to: ["team@example.com"]
+    subject_template: "{{ title }}"
+    format: plain
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "mail"

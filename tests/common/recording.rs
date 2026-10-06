@@ -43,6 +43,10 @@ impl Notifier for RecordingNotifier {
         "recording"
     }
 
+    fn output_format(&self) -> valerter::config::OutputFormat {
+        valerter::config::OutputFormat::Plain
+    }
+
     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
         // The receiver may be gone once the test stopped draining.
         let _ = self.tx.send(alert.clone());

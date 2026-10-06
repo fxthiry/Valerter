@@ -137,4 +137,4 @@ Ce change MODIFIE trois requirements que le change précédent modifie aussi : `
 
 ## Migration Plan
 
-Aucune action : fonctionnalité opt-in. MIGRATION « Upgrading to 2.1.0 » présente `body_format: markdown`, les formats par défaut, la dispense d'`email_body_html` et l'échappement du `body` texte dans le corps email (message de repli). Retour arrière : supprimer `body_format` et `format` des fichiers de configuration.
+Aucune action : fonctionnalité opt-in, sans entrée dans MIGRATION. `docs/configuration.md` et `docs/notifiers.md` présentent `body_format: markdown`, les formats par défaut et la dispense d'`email_body_html` ; le CHANGELOG signale l'échappement du `body` texte dans le corps email (message de repli). Retour arrière : supprimer `body_format` et `format` des fichiers de configuration.

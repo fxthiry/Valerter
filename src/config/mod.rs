@@ -21,9 +21,9 @@ pub use runtime::{
 };
 pub use secret::{SecretString, redact_url};
 pub use types::{
-    BasicAuthConfig, Config, DEFAULT_CONFIG_PATH, DEFAULT_MAX_STREAMS, DefaultsConfig,
-    JsonParserConfig, MetricsConfig, NotifyConfig, ParserConfig, RuleConfig, TemplateConfig,
-    ThrottleConfig, TlsConfig, VlSourceConfig,
+    BasicAuthConfig, BodyFormat, Config, DEFAULT_CONFIG_PATH, DEFAULT_MAX_STREAMS, DefaultsConfig,
+    JsonParserConfig, MetricsConfig, NotifyConfig, OutputFormat, ParserConfig, RuleConfig,
+    TemplateConfig, ThrottleConfig, TlsConfig, VlSourceConfig,
 };
 pub use validation::{validate_notifier_template, validate_resolved_url, validate_template_render};
 

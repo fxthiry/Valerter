@@ -183,6 +183,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: Some("<p>Inline: {{ body }}</p>".to_string()),
             body_template_file: None,
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -209,6 +210,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -289,6 +291,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some("templates/default-email.html.j2".to_string()),
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -316,6 +319,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some("nonexistent/template.html".to_string()),
+            format: None,
         };
 
         let config_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -353,6 +357,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some(large_file_path.to_string_lossy().to_string()),
+            format: None,
         };
 
         let result = resolve_body_template(&config, temp_dir.path());
@@ -392,6 +397,7 @@ mod tests {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: Some(invalid_utf8_path.to_string_lossy().to_string()),
+            format: None,
         };
 
         let result = resolve_body_template(&config, temp_dir.path());

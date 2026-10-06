@@ -6,7 +6,7 @@ Cette capacité décrit le notifier `mattermost`, qui publie les alertes dans Ma
 ## Requirements
 
 ### Requirement: Configuration du notifier Mattermost
-Le système SHALL accepter pour un notifier `type: mattermost` la clé obligatoire `webhook_url` et les clés optionnelles `channel`, `username` et `icon_url`, et MUST rejeter la configuration si `webhook_url` est absente ou si une autre clé est présente.
+Le système SHALL accepter pour un notifier `type: mattermost` la clé obligatoire `webhook_url` et les clés optionnelles `channel`, `username`, `icon_url` et `format` (seule valeur acceptée : `markdown`, voir `notification-dispatch`), et MUST rejeter la configuration si `webhook_url` est absente ou si une autre clé est présente.
 
 #### Scenario: Configuration minimale
 - **WHEN** un notifier déclare seulement `type: mattermost` et `webhook_url`
@@ -15,6 +15,10 @@ Le système SHALL accepter pour un notifier `type: mattermost` la clé obligatoi
 #### Scenario: webhook_url manquante
 - **WHEN** un notifier `type: mattermost` ne déclare que `channel: "test"`
 - **THEN** le chargement de la configuration échoue
+
+#### Scenario: Format explicite
+- **WHEN** un notifier Mattermost déclare `format: markdown`
+- **THEN** il est accepté, avec le même comportement que sans cette clé
 
 ### Requirement: Résolution de webhook_url
 Le système SHALL substituer les variables `${NOM}` de `webhook_url` à l'instanciation du notifier et MUST, en cas de variable non définie, échouer avec `invalid notifier '<nom>': webhook_url: invalid configuration: undefined environment variable: <NOM>`, l'erreur étant signalée par les logs et le code de sortie du démarrage, sans métrique dédiée.
@@ -39,11 +43,15 @@ Le système SHALL inclure au premier niveau du JSON les champs `channel`, `usern
 - **THEN** le JSON contient `"channel":"alerts"` et `"username":"bot"` et aucune clé `icon_url`
 
 ### Requirement: Attachment unique
-Le système SHALL placer le message dans un tableau `attachments` contenant exactement un élément dont `fallback` et `title` valent le titre rendu et `text` vaut le corps rendu, sans transformation (le Markdown est interprété par Mattermost).
+Le système SHALL placer le message dans un tableau `attachments` contenant exactement un élément dont `fallback` et `title` valent le titre rendu et `text` vaut le corps transmis au notifier (voir « Corps transmis aux notifiers selon le format » de `notification-dispatch`) : le corps rendu sans transformation pour un template `text`, le rendu `markdown` pour un template `markdown` (le Markdown est interprété par Mattermost).
 
 #### Scenario: Structure de l'attachment
 - **WHEN** le titre rendu est `Test Alert` et le corps `Something happened`
 - **THEN** l'unique attachment contient `"fallback":"Test Alert"`, `"title":"Test Alert"` et `"text":"Something happened"`
+
+#### Scenario: Corps Markdown
+- **WHEN** une alerte d'un template `markdown` a pour corps `**{{ host }}** at {{ ts }}` avec `host=web_01` et `ts=10:49:35`
+- **THEN** l'attachment contient `"text":"**web\\_01** at 10:49:35"` (JSON de `**web\_01** at 10:49:35`)
 
 ### Requirement: Couleur de l'attachment
 Le système SHALL renseigner `color` de l'attachment avec l'`accent_color` du message rendu et MUST omettre la clé `color` lorsque le template ne définit pas d'`accent_color`.

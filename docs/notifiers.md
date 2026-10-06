@@ -11,6 +11,33 @@ Valerter supports multiple notification channels. Configure them in the `notifie
 | `mattermost` | Mattermost incoming webhook | Team chat notifications |
 | `telegram` | Telegram Bot API | Mobile alerts, small teams, channels |
 
+## Output format per notifier
+
+A rule template with
+[`body_format: markdown`](configuration.md#markdown-bodies-body_format) has a
+Markdown body that valerter renders in the format of each notifier. The
+optional `format` key of a notifier chooses that format; without it, the
+default of its type applies:
+
+| Type | Default `format` | Accepted values | `body` received for a Markdown alert |
+|------|------------------|-----------------|--------------------------------------|
+| `mattermost` | `markdown` | `markdown` | Markdown escaped for Mattermost (`**web\_01**`) |
+| `telegram` | `telegram_html` (`plain` when `parse_mode` is not `HTML`) | `telegram_html`, `plain` | HTML of the Bot API subset (`<b>web_01</b>`), already escaped |
+| `email` | `html` | `html` | HTML (`<p><strong>web_01</strong></p>`), already escaped |
+| `webhook` | `plain` | `plain`, `markdown`, `html` | Text without markup (`web_01`) by default |
+
+- A value outside the accepted list is refused at startup and by `--validate`:
+  `invalid notifier '<name>': format '<value>' is not supported for <type>
+  notifiers (expected <list>)`.
+- The `html` and `telegram_html` renderings are already escaped: `{{ body|e }}`
+  (the default Telegram template) and the HTML auto-escaping of the email body
+  leave them intact. `plain` and `markdown` are ordinary text, escaped like any
+  value.
+- Each rendering is computed once per alert and shared by the destinations
+  that use it.
+- An alert whose template has no `body_format` (or `body_format: text`) sends
+  its `body` as before, whatever the `format`.
+
 ## Webhook (Generic HTTP)
 
 The most flexible notifier - works with any HTTP API.
@@ -71,6 +98,7 @@ every field of the log line, secrets included: prefer an explicit selection.
 | `method` | No | HTTP method (default: `POST`) |
 | `headers` | No | Custom headers (supports `${VAR}` substitution) |
 | `body_template` | No | Custom JSON body (Jinja2 template, supports `${VAR}` substitution in its source) |
+| `format` | No | Format of the body of a [Markdown alert](#output-format-per-notifier): `plain` (default), `markdown` or `html` |
 
 ### `${VAR}` in `body_template`
 
@@ -139,6 +167,7 @@ If `body_template` is omitted, sends:
 
 | Field | Description |
 |-------|-------------|
+| `body` | The alert body; for a [Markdown alert](#output-format-per-notifier), its rendering in the notifier `format` (`plain` by default) |
 | `timestamp` | When the alert was sent |
 | `log_timestamp` | Original log timestamp (ISO 8601, for VictoriaLogs search) |
 | `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
@@ -150,7 +179,7 @@ When using `body_template`, these variables are available:
 | Variable | Description |
 |----------|-------------|
 | `title` | Alert title |
-| `body` | Alert body |
+| `body` | Alert body (for a Markdown alert, its rendering in the notifier `format`) |
 | `rule_name` | Name of the rule |
 | `vl_source` | Name of the VictoriaLogs source the event came from |
 | `log_timestamp` | Original log timestamp (ISO 8601) |
@@ -168,6 +197,29 @@ exists only in notifier templates, not in the rule template (see
 [Rule templates and notifier templates](configuration.md#rule-templates-and-notifier-templates)).
 `{{ log | tojson }}` renders the whole event as a JSON object, dotted keys
 included twice. Values are inserted as is, never resolved as `${VAR}`.
+
+### Markdown alerts: choosing `format`
+
+A webhook targets services valerter knows nothing about (PagerDuty, ticketing,
+SMS gateways, in-house APIs), most of which do not render Markdown: by default,
+the body of a [Markdown alert](#output-format-per-notifier) is plain text
+(`**{{ host }}** [logs](https://vl.example.com)` gives
+`web-01 logs (https://vl.example.com)`). Declare `format: markdown` for a target
+that renders Markdown (Discord, Rocket.Chat, GitHub, a Mattermost reached
+through a generic webhook), and `format: html` for one that expects HTML
+(Microsoft Teams, an HTML API):
+
+```yaml
+notifiers:
+  discord-md:
+    type: webhook
+    url: "${DISCORD_WEBHOOK_URL}"
+    format: markdown
+    body_template: '{"content": {{ body | tojson }}}'
+```
+
+An `html` body is already escaped: insert it with `{{ body }}` in an HTML
+document, or with `{{ body | tojson }}` in JSON.
 
 ### Writing JSON bodies: the `tojson` filter
 
@@ -277,16 +329,26 @@ notifiers:
 | `subject_template` | Yes | Email subject (Jinja2 template) |
 | `body_template` | No | Inline HTML body template |
 | `body_template_file` | No | Path to HTML template file |
+| `format` | No | Format of the body of a [Markdown alert](#output-format-per-notifier): `html`, the only value (the message is a single HTML part) |
 
 ### Template Variables
 
 `subject_template` and the body template see `title`, `body`, `rule_name`,
 `vl_source`, `accent_color`, `log_timestamp`, `log_timestamp_formatted` and
 `log`, the event fields (`{{ log.host }}`, `{{ log["k8s.pod"] }}`, see the
-[webhook variables](#template-variables)). In the body template, `body` is the
-rendered `email_body_html` (the plain `body` when it is missing), inserted
-without escaping; every other value, `log` fields included, is escaped as HTML
-automatically:
+[webhook variables](#template-variables)). In the body template, `body` is, by
+priority:
+
+1. the rendered `email_body_html`, inserted without escaping;
+2. for a [Markdown alert](#output-format-per-notifier) without
+   `email_body_html`, the HTML rendering of its body, inserted without escaping
+   (already escaped);
+3. otherwise the plain `body` (the message sent when a rule template fails to
+   render), escaped as HTML.
+
+In `subject_template`, `body` is the plain-text rendering of a Markdown body (a
+subject is text). Every other value, `log` fields included, is escaped as HTML
+automatically in the body template:
 
 ```yaml
 notifiers:
@@ -333,6 +395,11 @@ templates:
 ```
 
 Valerter validates this at startup and in `valerter --validate`, and fails if missing.
+
+A template with `body_format: markdown` does not need `email_body_html`: the HTML
+rendering of its body is the email body (see
+[Markdown bodies](configuration.md#markdown-bodies-body_format)).
+`email_body_html`, when present, still takes priority.
 
 ### Retries and SMTP errors
 
@@ -385,7 +452,10 @@ Send alerts to Mattermost channels via incoming webhooks.
 > **Note about `email_body_html`** — Mattermost reads the outer template's `body`
 > output key, **not** `email_body_html`. `email_body_html` is email-only. Mattermost
 > renders Markdown in `body` (`**bold**`, `*italic*`, fenced code blocks,
-> lists, links); write your formatting there.
+> lists, links); write your formatting there. With
+> [`body_format: markdown`](configuration.md#markdown-bodies-body_format), the
+> values inserted in `body` are escaped, so `web_01` is not read as italics:
+> the attachment text is `**web\_01**`.
 
 ### Configuration
 
@@ -407,6 +477,7 @@ notifiers:
 | `channel` | No | Override default channel (a rule's `notify.mattermost_channel` takes precedence) |
 | `username` | No | Bot username |
 | `icon_url` | No | Bot avatar URL |
+| `format` | No | Format of the body of a [Markdown alert](#output-format-per-notifier): `markdown`, the only value |
 
 `webhook_url` is checked again once `${VAR}` placeholders are resolved, at
 daemon startup and by `valerter --validate`: a value that does not parse or does
@@ -525,6 +596,7 @@ notifiers:
 | `parse_mode` | No | `HTML` (default), `MarkdownV2` or `Markdown`, case-insensitive (`html` is sent as `HTML`). Any other value is refused at startup and by `--validate`: `parse_mode '<value>' is not supported (expected HTML, MarkdownV2 or Markdown)`. |
 | `disable_notification` | No | When `true`, Telegram delivers silently (no push sound). |
 | `disable_web_page_preview` | No | When `true`, Telegram does not expand link previews. |
+| `format` | No | Format of the body of a [Markdown alert](#output-format-per-notifier): `telegram_html` (default with `parse_mode: HTML`) or `plain` (default with another `parse_mode`). `telegram_html` with another `parse_mode` is refused: `invalid notifier '<name>': format 'telegram_html' requires parse_mode HTML`. |
 | `body_template` | No | Jinja template for the message text. Defaults to `<b>{{ title\|e }}</b>\n{{ body\|e }}`. Sees `title`, `body`, `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted` and `log` (the event fields, see the [webhook variables](#template-variables)). Checked at startup and by `--validate`: a syntax error (`body_template: ...`) or an unknown filter, test, function or method (`body_template render: ...`) is refused; an unknown variable (`{{ host }}` instead of `{{ log.host }}`) logs `Notifier template references unknown variable`. |
 
 ### Multi-chat delivery
@@ -557,7 +629,31 @@ With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`
 
 ### Formatting messages
 
-The markup belongs in the Telegram `body_template`, which is written for
+The simplest way to format a Telegram message is a rule template with
+[`body_format: markdown`](configuration.md#markdown-bodies-body_format): its
+body, written once in Markdown, reaches Telegram as HTML of the Bot API subset
+(`<b>`, `<i>`, `<s>`, `<code>`, `<pre>`, `<a>`, `<blockquote>`), always well
+formed, with the values of the log escaped. The default `body_template` works
+unchanged (`{{ body|e }}` leaves this HTML intact):
+
+```yaml
+templates:
+  disk_alert:
+    title: "Disk {{ host }}"
+    body_format: markdown
+    body: "**{{ host }}** < 10% free"
+```
+
+With `host=a_b`, the message is `<b>Disk a_b</b>\n<b>a_b</b> &lt; 10% free`.
+The same template gives Markdown to Mattermost and HTML to email.
+
+- The `telegram_html` rendering needs `parse_mode: HTML` (the default).
+- With `parse_mode: MarkdownV2`, the notifier receives the plain-text rendering
+  by default: escape it with `mdv2_escape` in a `body_template` written for
+  MarkdownV2, `*{{ title | mdv2_escape }}*\n{{ body | mdv2_escape }}`.
+
+Without `body_format: markdown`, the markup belongs in the Telegram
+`body_template`, which is written for
 Telegram only; the values come from the alert and the event, each one escaped
 with `|e`:
 
@@ -585,9 +681,8 @@ With `host=<web&01>`, the message shows `Host: <web&01>` in monospace, and a
 - With `parse_mode: MarkdownV2`, escape values with
   [`mdv2_escape`](configuration.md#valerter-filters) instead of `|e`:
   `*{{ title | mdv2_escape }}*`.
-- A rule template can also produce Markdown rendered for each notifier with
-  [`body_format: markdown`](configuration.md#markdown-bodies-body_format),
-  which follows the same approach without a `body_template` per notifier.
+- `body_format: markdown` (above) follows the same approach without a
+  `body_template` per notifier.
 
 Background and next steps: [issue #24](https://github.com/fxthiry/valerter/issues/24).
 

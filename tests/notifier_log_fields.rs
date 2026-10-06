@@ -38,6 +38,7 @@ fn make_webhook_notifier(name: &str, url: &str, body_template: &str) -> WebhookN
         method: "POST".to_string(),
         headers: HashMap::new(),
         body_template: Some(body_template.to_string()),
+        format: None,
     };
     WebhookNotifier::from_config(name, &config, make_client()).unwrap()
 }
@@ -125,6 +126,7 @@ async fn run_engine_to_webhook(
                 body: "pod {{ k8s.pod }}".to_string(),
                 email_body_html: None,
                 accent_color: None,
+                body_format: valerter::config::BodyFormat::Text,
             },
         )]),
         rules: vec![CompiledRule {

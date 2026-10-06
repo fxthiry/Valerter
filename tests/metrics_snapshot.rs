@@ -104,6 +104,7 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
             body: "{{ _msg }}".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
 
@@ -133,6 +134,7 @@ fn webhook(name: &str, server: &MockServer) -> Arc<WebhookNotifier> {
         method: "POST".to_string(),
         headers: std::collections::HashMap::new(),
         body_template: None,
+        format: None,
     };
     Arc::new(WebhookNotifier::from_config(name, &config, reqwest::Client::new()).unwrap())
 }

@@ -139,6 +139,7 @@ mod tests {
                 body: "b".to_string(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: "r".to_string(),
             vl_source: "vlprod".to_string(),

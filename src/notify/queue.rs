@@ -580,6 +580,7 @@ mod tests {
                 body: String::new(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: rule_name.to_string(),
             vl_source: "vlprod".to_string(),

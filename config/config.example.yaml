@@ -178,6 +178,24 @@ templates:
   #     <p>{{ message | default(_msg) }}</p>
   #   accent_color: "#e74c3c"
 
+  # ── Example: Markdown body, rendered for each notifier ─────────────────────
+  # body_format: markdown (default: text) makes `body` a Markdown source:
+  # every {{ value }} is escaped (| safe to insert trusted Markdown), and the
+  # body is rendered per notifier (Mattermost: Markdown, Telegram: HTML,
+  # email: HTML, so no email_body_html is needed; webhook: plain text by
+  # default, see the `format` key of notifiers). Raw HTML and tables are shown
+  # as text. `code`, `codeblock` and `link` build Markdown from values; never
+  # write {{ value }} inside backticks or a ``` fence (use them instead).
+  # See docs/configuration.md#markdown-bodies-body_format.
+  #
+  # markdown_alert:
+  #   title: "{{ rule_name }} on {{ host }}"
+  #   body_format: markdown
+  #   body: |
+  #     **{{ host }}** reported an error at {{ _time }}
+  #     {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+  #     {{ _msg | codeblock }}
+
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
 # │ NOTIFIERS                                                        [REQUIRED]│
@@ -191,7 +209,8 @@ notifiers:
   # Incoming webhook integration.
   #
   # Required: webhook_url
-  # Optional: channel (override default), username, icon_url
+  # Optional: channel (override default), username, icon_url,
+  #           format (body of a Markdown alert; only value: markdown)
 
   mattermost-ops:
     type: mattermost
@@ -204,7 +223,9 @@ notifiers:
   # Send alerts to any HTTP endpoint (Slack, PagerDuty, custom APIs).
   #
   # Required: url
-  # Optional: method (default: POST), headers, body_template
+  # Optional: method (default: POST), headers, body_template,
+  #           format (body of a Markdown alert: plain (default), markdown or
+  #           html; markdown for Discord/Rocket.Chat, html for Teams)
   #
   # Default payload when body_template is omitted:
   # {
@@ -268,7 +289,8 @@ notifiers:
   # ── Email (SMTP) ───────────────────────────────────────────────────────────
   # Required: smtp.host, smtp.port, from, to, subject_template
   # Optional: smtp.username, smtp.password, smtp.tls, smtp.tls_verify,
-  #           body_template (inline), body_template_file (path)
+  #           body_template (inline), body_template_file (path),
+  #           format (body of a Markdown alert; only value: html)
   #
   # TLS modes:
   #   none     - No encryption (port 25, internal networks only)
@@ -301,7 +323,9 @@ notifiers:
   #
   # Required: bot_token, chat_ids (non-empty)
   # Optional: parse_mode (default: HTML), disable_notification,
-  #           disable_web_page_preview, body_template
+  #           disable_web_page_preview, body_template,
+  #           format (body of a Markdown alert: telegram_html, the default
+  #           with parse_mode HTML, or plain, the default otherwise)
   #
   # The endpoint URL is built internally and never logged (contains the token).
   # Each chat_id triggers one sequential HTTP call; a 429 response honors

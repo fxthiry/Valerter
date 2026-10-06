@@ -27,27 +27,108 @@
 
 pub mod filters;
 
-use crate::config::CompiledTemplate;
+use crate::config::{BodyFormat, CompiledTemplate, OutputFormat};
 use crate::error::TemplateError;
 use minijinja::value::merge_maps;
 use minijinja::{Environment, UndefinedBehavior, context};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 /// Rendered message ready for notification.
 ///
 /// Contains all fields needed to construct a Mattermost attachment or email.
-#[derive(Debug, Clone, PartialEq)]
+/// Notifiers read the body through [`RenderedMessage::body_for`].
+#[derive(Debug, Clone, Default)]
 pub struct RenderedMessage {
     /// Title of the message (attachment fallback and title).
     pub title: String,
-    /// Body text of the message (attachment text for Mattermost).
+    /// Body of the message as rendered from the template: the text sent to
+    /// notifiers for a `text` body, the Markdown source for a `markdown` one.
     pub body: String,
     /// Optional HTML body for email notifications (rendered with HTML auto-escape).
     pub email_body_html: Option<String>,
     /// Optional accent color for visual indicators (hex format: #rrggbb).
     /// Used for email colored dot and Mattermost sidebar color.
     pub accent_color: Option<String>,
+    /// Format of `body`.
+    pub body_format: BodyFormat,
+    /// Renderings of a Markdown `body`, computed on first use.
+    pub renders: RenderCache,
+}
+
+/// Renderings of a Markdown body, one slot per [`OutputFormat`], each
+/// computed at most once and shared by every clone of the message (so by
+/// every destination of an alert).
+#[derive(Debug, Clone, Default)]
+pub struct RenderCache(Arc<[OnceLock<String>; 4]>);
+
+impl RenderCache {
+    fn slot(&self, format: OutputFormat) -> &OnceLock<String> {
+        let index = OutputFormat::ALL
+            .iter()
+            .position(|f| *f == format)
+            .expect("ALL lists every format");
+        &self.0[index]
+    }
+
+    /// Whether the rendering in `format` has been computed.
+    pub fn is_rendered(&self, format: OutputFormat) -> bool {
+        self.slot(format).get().is_some()
+    }
+}
+
+/// Body handed to a notifier: the text, and whether it is already escaped
+/// for HTML (`html`, `telegram_html` renderings), in which case notifier
+/// templates insert it as a safe value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyText<'a> {
+    pub text: &'a str,
+    pub safe: bool,
+}
+
+impl BodyText<'_> {
+    /// The body as a template value: safe when already escaped, so `| e`
+    /// and HTML auto-escaping leave it intact.
+    pub fn to_value(self) -> minijinja::Value {
+        if self.safe {
+            minijinja::Value::from_safe_string(self.text.to_string())
+        } else {
+            minijinja::Value::from(self.text)
+        }
+    }
+}
+
+impl RenderedMessage {
+    /// The body a notifier whose output format is `format` sends: `body` as
+    /// is for a `text` body, its rendering in `format` for a `markdown` one
+    /// (parsed and rendered on first use, then shared).
+    pub fn body_for(&self, format: OutputFormat) -> BodyText<'_> {
+        match self.body_format {
+            BodyFormat::Text => BodyText {
+                text: &self.body,
+                safe: false,
+            },
+            BodyFormat::Markdown => BodyText {
+                text: self
+                    .renders
+                    .slot(format)
+                    .get_or_init(|| crate::markdown::render(&self.body, format)),
+                safe: format.is_safe(),
+            },
+        }
+    }
+}
+
+/// Messages compare by content: the render cache is derived from `body`.
+impl PartialEq for RenderedMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.title == other.title
+            && self.body == other.body
+            && self.email_body_html == other.email_body_html
+            && self.accent_color == other.accent_color
+            && self.body_format == other.body_format
+    }
 }
 
 /// Template engine for rendering messages with Jinja2 syntax.
@@ -64,6 +145,9 @@ pub struct TemplateEngine {
     env: Environment<'static>,
     /// Pre-created Jinja environment with HTML auto-escape (for email_body_html rendering).
     html_env: Environment<'static>,
+    /// Pre-created Jinja environment with Markdown auto-escape (for the body
+    /// of a `body_format: markdown` template).
+    md_env: Environment<'static>,
     /// Compiled templates indexed by name.
     templates: HashMap<String, CompiledTemplate>,
 }
@@ -97,9 +181,15 @@ impl TemplateEngine {
         html_env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         filters::register(&mut html_env);
 
+        let mut md_env = Environment::new();
+        md_env.set_undefined_behavior(UndefinedBehavior::Lenient);
+        filters::install_markdown_escape(&mut md_env);
+        filters::register(&mut md_env);
+
         Self {
             env,
             html_env,
+            md_env,
             templates,
         }
     }
@@ -153,7 +243,10 @@ impl TemplateEngine {
         // (layer 2) contexts.
         let ctx = layer1_context(fields, rule_name, vl_source);
         let title = self.render_string(&template.title, &ctx)?;
-        let body = self.render_string(&template.body, &ctx)?;
+        let body = match template.body_format {
+            BodyFormat::Text => self.render_string(&template.body, &ctx)?,
+            BodyFormat::Markdown => render_with(&self.md_env, &template.body, &ctx)?,
+        };
 
         // Render email_body_html with HTML auto-escape if present
         let email_body_html = if let Some(email_body_html_template) = &template.email_body_html {
@@ -175,6 +268,8 @@ impl TemplateEngine {
             body,
             email_body_html,
             accent_color: template.accent_color.clone(),
+            body_format: template.body_format,
+            renders: RenderCache::default(),
         })
     }
 
@@ -184,11 +279,7 @@ impl TemplateEngine {
         template_str: &str,
         ctx: &minijinja::Value,
     ) -> Result<String, TemplateError> {
-        self.env
-            .render_str(template_str, ctx)
-            .map_err(|e| TemplateError::RenderFailed {
-                message: e.to_string(),
-            })
+        render_with(&self.env, template_str, ctx)
     }
 
     /// Render a single template string with HTML auto-escape for security.
@@ -248,16 +339,53 @@ impl TemplateEngine {
 
                 // Fallback message with basic info
                 // Note: We don't include raw fields to avoid exposing potentially
-                // sensitive data (tokens, credentials) that might be in extracted logs
+                // sensitive data (tokens, credentials) that might be in extracted logs.
+                // Always a `text` body, whatever the template's format: it is
+                // sent as is, never parsed as Markdown.
                 RenderedMessage {
                     title: format!("[{}] Alert", rule_name),
                     body: format!("Template render failed: {}\n\nCheck logs for details.", e),
                     email_body_html: None,
                     accent_color: Some("#ff0000".to_string()), // Red for error
+                    body_format: BodyFormat::Text,
+                    renders: RenderCache::default(),
                 }
             }
         }
     }
+}
+
+/// A message rendered from a one-off template (`title`, `body` of format
+/// `body_format`) with `fields`, as the engine renders alerts (tests).
+#[cfg(test)]
+pub(crate) fn render_test_message(
+    title: &str,
+    body: &str,
+    body_format: BodyFormat,
+    fields: &serde_json::Value,
+) -> RenderedMessage {
+    let template = CompiledTemplate {
+        title: title.to_string(),
+        body: body.to_string(),
+        email_body_html: None,
+        accent_color: None,
+        body_format,
+    };
+    TemplateEngine::new(HashMap::from([("t".to_string(), template)]))
+        .render("t", fields, "r", "vl")
+        .expect("test template renders")
+}
+
+/// Renders `template_str` in `env`.
+fn render_with(
+    env: &Environment<'static>,
+    template_str: &str,
+    ctx: &minijinja::Value,
+) -> Result<String, TemplateError> {
+    env.render_str(template_str, ctx)
+        .map_err(|e| TemplateError::RenderFailed {
+            message: e.to_string(),
+        })
 }
 
 /// Layer 1 render context: the event fields plus the synthetic `rule_name`
@@ -298,6 +426,7 @@ mod tests {
             body: body.to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: crate::config::BodyFormat::Text,
         }
     }
 
@@ -311,6 +440,7 @@ mod tests {
             body: body.to_string(),
             email_body_html: None,
             accent_color: accent_color.map(String::from),
+            body_format: crate::config::BodyFormat::Text,
         }
     }
 
@@ -618,6 +748,7 @@ mod tests {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: Some("#000000".to_string()),
+            ..Default::default()
         };
 
         let msg2 = RenderedMessage {
@@ -625,6 +756,7 @@ mod tests {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: Some("#000000".to_string()),
+            ..Default::default()
         };
 
         assert_eq!(msg1, msg2);
@@ -712,6 +844,7 @@ mod tests {
             body: body.to_string(),
             email_body_html: Some(email_body_html.to_string()),
             accent_color: None,
+            body_format: crate::config::BodyFormat::Text,
         }
     }
 
@@ -1050,6 +1183,260 @@ mod tests {
         assert!(
             result.email_body_html.is_none(),
             "email_body_html should be None when template doesn't have it"
+        );
+    }
+
+    // ===================================================================
+    // Markdown bodies (markdown-body-format)
+    // ===================================================================
+
+    fn markdown_engine(title: &str, body: &str, email_body_html: Option<&str>) -> TemplateEngine {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "md".to_string(),
+            CompiledTemplate {
+                title: title.to_string(),
+                body: body.to_string(),
+                email_body_html: email_body_html.map(String::from),
+                accent_color: None,
+                body_format: BodyFormat::Markdown,
+            },
+        );
+        TemplateEngine::new(templates)
+    }
+
+    fn markdown_body(body: &str, fields: serde_json::Value) -> String {
+        markdown_engine("t", body, None)
+            .render("md", &fields, "r", "vl")
+            .unwrap()
+            .body
+    }
+
+    #[test]
+    fn markdown_body_escapes_inserted_values() {
+        assert_eq!(
+            markdown_body("**{{ host }}** down", json!({"host": "a_b*c"})),
+            r"**a\_b\*c** down"
+        );
+        assert_eq!(markdown_body("[{{ missing }}]", json!({})), "[]");
+        // Non-string values are written as in a text body, then escaped.
+        let mut templates = HashMap::new();
+        templates.insert("t".to_string(), make_template("t", "{{ n }} {{ nil }}"));
+        let text = TemplateEngine::new(templates)
+            .render("t", &json!({"n": 1.5, "nil": null}), "r", "vl")
+            .unwrap()
+            .body;
+        assert_eq!(text, "1.5 None");
+        assert_eq!(
+            markdown_body("{{ n }} {{ nil }}", json!({"n": 1.5, "nil": null})),
+            r"1\.5 None"
+        );
+    }
+
+    #[test]
+    fn markdown_body_opt_outs() {
+        assert_eq!(
+            markdown_body("{{ summary | safe }}", json!({"summary": "**OK**"})),
+            "**OK**"
+        );
+        assert_eq!(
+            markdown_body("{{ v | tojson }}", json!({"v": "a_b"})),
+            r#""a_b""#
+        );
+        // `| e` escapes for the current context: Markdown, not HTML.
+        assert_eq!(
+            markdown_body("{{ v | e }}", json!({"v": "<a_b>"})),
+            r"\<a\_b\>"
+        );
+        assert_eq!(
+            markdown_body("{{ v | e | e }}", json!({"v": "a_b"})),
+            r"a\_b"
+        );
+        assert_eq!(
+            markdown_body("{{ host | md_escape }}", json!({"host": "a_b"})),
+            r"a\_b"
+        );
+    }
+
+    #[test]
+    fn markdown_template_keeps_title_and_email_body_html_unchanged() {
+        let engine = markdown_engine(
+            "{{ host }} down",
+            "{{ host }}",
+            Some("<p>{{ host }} {{ host | code }}</p>"),
+        );
+        let msg = engine
+            .render("md", &json!({"host": "web_01<b>"}), "r", "vl")
+            .unwrap();
+        assert_eq!(msg.title, "web_01<b> down");
+        assert_eq!(
+            msg.email_body_html.as_deref(),
+            Some("<p>web_01&lt;b&gt; `web_01&lt;b&gt;`</p>")
+        );
+        assert_eq!(msg.body_format, BodyFormat::Markdown);
+    }
+
+    #[test]
+    fn text_template_is_unchanged() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "t".to_string(),
+            make_template("{{ host }}", "**{{ host }}** <{{ v | e }}>"),
+        );
+        let msg = TemplateEngine::new(templates)
+            .render("t", &json!({"host": "a_b*c", "v": "<x>"}), "r", "vl")
+            .unwrap();
+        assert_eq!(msg.body, "**a_b*c** <&lt;x&gt;>");
+        assert_eq!(msg.body_format, BodyFormat::Text);
+        for format in OutputFormat::ALL {
+            assert_eq!(
+                msg.body_for(format),
+                BodyText {
+                    text: "**a_b*c** <&lt;x&gt;>",
+                    safe: false
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_filters_and_link_function() {
+        assert_eq!(
+            markdown_body("{{ v | code }}", json!({"v": "a`b"})),
+            "``a`b``"
+        );
+        assert_eq!(
+            markdown_body("{{ v | codeblock('js;x') }}", json!({"v": "a"})),
+            "```jsx\na\n```"
+        );
+        assert_eq!(
+            markdown_body(
+                r#"{{ link("logs " ~ host, "https://vl.example.com/q?h=" ~ host) }}"#,
+                json!({"host": "web_01"})
+            ),
+            r"[logs web\_01](https://vl.example.com/q?h=web_01)"
+        );
+        assert_eq!(
+            markdown_body(r#"{{ link("x", "javascript:alert(1)") }}"#, json!({})),
+            r"x \(javascript\:alert\(1\)\)"
+        );
+    }
+
+    #[test]
+    fn markdown_filters_are_plain_strings_outside_markdown() {
+        let mut templates = HashMap::new();
+        templates.insert(
+            "t".to_string(),
+            make_template(
+                "{{ v | code }}",
+                r#"{{ v | code }} {{ link(v, "https://h") }}"#,
+            ),
+        );
+        let msg = TemplateEngine::new(templates)
+            .render("t", &json!({"v": "<a>"}), "r", "vl")
+            .unwrap();
+        assert_eq!(msg.title, "`<a>`");
+        assert_eq!(msg.body, r"`<a>` [\<a\>](https://h)");
+    }
+
+    #[test]
+    fn body_for_renders_markdown_once_per_format() {
+        let msg = markdown_engine("t", "**{{ host }}**", None)
+            .render("md", &json!({"host": "a_b"}), "r", "vl")
+            .unwrap();
+        assert!(!msg.renders.is_rendered(OutputFormat::TelegramHtml));
+        let first = msg.body_for(OutputFormat::TelegramHtml);
+        assert_eq!(
+            first,
+            BodyText {
+                text: "<b>a_b</b>",
+                safe: true
+            }
+        );
+        assert!(msg.renders.is_rendered(OutputFormat::TelegramHtml));
+        assert!(!msg.renders.is_rendered(OutputFormat::Plain));
+        // Same allocation: the rendering is reused, and shared by clones.
+        let clone = msg.clone();
+        let second = clone.body_for(OutputFormat::TelegramHtml);
+        assert!(std::ptr::eq(first.text, second.text));
+        assert_eq!(
+            msg.body_for(OutputFormat::Markdown),
+            BodyText {
+                text: r"**a\_b**",
+                safe: false
+            }
+        );
+        assert_eq!(msg.body_for(OutputFormat::Plain).text, "a_b");
+        assert!(msg.body_for(OutputFormat::Html).safe);
+    }
+
+    #[test]
+    fn body_for_is_shared_between_threads() {
+        let msg = std::sync::Arc::new(
+            markdown_engine("t", "**{{ host }}**", None)
+                .render("md", &json!({"host": "a_b"}), "r", "vl")
+                .unwrap(),
+        );
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let msg = std::sync::Arc::clone(&msg);
+                std::thread::spawn(move || {
+                    msg.body_for(OutputFormat::TelegramHtml).text.as_ptr() as usize
+                })
+            })
+            .collect();
+        let pointers: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(pointers[0], pointers[1], "rendered once, shared");
+        assert_eq!(msg.body_for(OutputFormat::TelegramHtml).text, "<b>a_b</b>");
+    }
+
+    #[test]
+    fn markdown_fallback_message_is_text() {
+        let engine = markdown_engine("t", "{{ x | nosuchfilter }}", None);
+        let msg = engine.render_with_fallback("md", &json!({}), "r", "vl");
+        assert_eq!(msg.body_format, BodyFormat::Text);
+        assert!(msg.body.starts_with("Template render failed"));
+        let body = msg.body_for(OutputFormat::TelegramHtml);
+        assert_eq!(body.text, msg.body);
+        assert!(!body.safe);
+    }
+
+    #[test]
+    fn rendered_messages_compare_by_content() {
+        let msg = markdown_engine("t", "**{{ host }}**", None)
+            .render("md", &json!({"host": "a"}), "r", "vl")
+            .unwrap();
+        let fresh = msg.clone();
+        msg.body_for(OutputFormat::Plain);
+        let other = RenderedMessage {
+            renders: RenderCache::default(),
+            ..fresh
+        };
+        assert_eq!(msg, other);
+    }
+
+    /// The example of docs/configuration.md, "Markdown bodies".
+    #[test]
+    fn markdown_documentation_example() {
+        let msg = render_test_message(
+            "Disk {{ host }}",
+            "**{{ host }}** is at {{ usage }}% on {{ mount | code }}\n\
+             {{ link(\"Logs in VictoriaLogs\", \"https://vl.example.com/select/vmui?query=host:\" ~ host) }}\n\
+             {{ _msg | codeblock }}\n",
+            BodyFormat::Markdown,
+            &json!({"host": "web_01", "usage": 97, "mount": "/var", "_msg": "disk <full> & read-only"}),
+        );
+        assert_eq!(
+            msg.body_for(OutputFormat::Markdown).text,
+            "**web\\_01** is at 97% on `/var`\n\
+             [Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host:web_01)\n\n\
+             ```\ndisk <full> & read-only\n```"
+        );
+        assert_eq!(
+            msg.body_for(OutputFormat::TelegramHtml).text,
+            "<b>web_01</b> is at 97% on <code>/var</code>\n\
+             <a href=\"https://vl.example.com/select/vmui?query=host:web_01\">Logs in VictoriaLogs</a>\n\n\
+             <pre>disk &lt;full&gt; &amp; read-only</pre>"
         );
     }
 }

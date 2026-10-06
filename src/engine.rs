@@ -853,6 +853,10 @@ mod tests {
             "noop"
         }
 
+        fn output_format(&self) -> crate::config::OutputFormat {
+            crate::config::OutputFormat::Plain
+        }
+
         async fn send(&self, _alert: &AlertPayload) -> Result<(), crate::error::NotifyError> {
             Ok(())
         }
@@ -918,6 +922,7 @@ mod tests {
                         body: "{{ body }}".to_string(),
                         email_body_html: None,
                         accent_color: None,
+                        body_format: crate::config::BodyFormat::Text,
                     },
                 );
                 t
@@ -1521,6 +1526,7 @@ mod tests {
                 body: "Log: {{ _msg }}".to_string(),
                 email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
+                body_format: crate::config::BodyFormat::Text,
             },
         );
         t
@@ -1774,6 +1780,7 @@ mod tests {
             body: "{{ host }}".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: crate::config::BodyFormat::Text,
         };
         let payload = payload_for_line(line, template).await;
 
@@ -1805,6 +1812,7 @@ mod tests {
             body: "b".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: crate::config::BodyFormat::Text,
         };
         let payload = payload_for_line(line, template).await;
 

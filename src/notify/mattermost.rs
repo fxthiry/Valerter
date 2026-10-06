@@ -3,7 +3,7 @@
 //! Implements the `Notifier` trait for sending alerts to Mattermost
 //! via incoming webhooks with exponential backoff retry.
 
-use crate::config::SecretString;
+use crate::config::{OutputFormat, SecretString};
 use crate::error::NotifyError;
 use crate::notify::{AlertPayload, Notifier, backoff_delay, record_permanent_failure};
 use async_trait::async_trait;
@@ -62,7 +62,7 @@ fn build_mattermost_payload(
             fallback: message.title.clone(),
             color: message.accent_color.clone(),
             title: message.title.clone(),
-            text: message.body.clone(),
+            text: message.body_for(OutputFormat::Markdown).text.to_string(),
             footer: format!(
                 "valerter | {} | {} | {}",
                 rule_name, vl_source, log_timestamp_formatted
@@ -221,6 +221,11 @@ impl Notifier for MattermostNotifier {
         "mattermost"
     }
 
+    /// Mattermost renders Markdown natively: `markdown` is its only format.
+    fn output_format(&self) -> OutputFormat {
+        OutputFormat::Markdown
+    }
+
     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
         let span = tracing::info_span!(
             "send_mattermost",
@@ -323,6 +328,7 @@ mod tests {
             body: "Something happened".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         };
 
         let payload = build_mattermost_payload(
@@ -358,6 +364,7 @@ mod tests {
             body: "Body text".to_string(),
             email_body_html: None,
             accent_color: None,
+            ..Default::default()
         };
 
         let payload = build_mattermost_payload(
@@ -381,6 +388,7 @@ mod tests {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: None,
+            ..Default::default()
         };
 
         let payload = build_mattermost_payload(
@@ -408,6 +416,7 @@ mod tests {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: Some("#00ff00".to_string()),
+            ..Default::default()
         };
 
         let payload = build_mattermost_payload(
@@ -440,6 +449,7 @@ mod tests {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: None,
+            ..Default::default()
         };
 
         let payload = build_mattermost_payload(
@@ -538,6 +548,7 @@ mod tests {
                 body: "Something happened".to_string(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: "r".to_string(),
             vl_source: "vlprod".to_string(),
@@ -635,6 +646,51 @@ mod tests {
             logs: logs.text(),
             metrics,
         }
+    }
+
+    fn alert_with_message(message: RenderedMessage) -> AlertPayload {
+        AlertPayload {
+            message,
+            ..make_alert(None)
+        }
+    }
+
+    #[test]
+    fn markdown_body_is_sent_as_mattermost_markdown() {
+        let message = crate::template::render_test_message(
+            "Disk",
+            "**{{ host }}** at {{ ts }}",
+            crate::config::BodyFormat::Markdown,
+            &serde_json::json!({"host": "web_01", "ts": "10:49:35"}),
+        );
+        let out = send_with_responses(None, alert_with_message(message), &[]);
+
+        assert!(out.result.is_ok());
+        assert_eq!(
+            out.bodies[0]["attachments"][0]["text"],
+            r"**web\_01** at 10:49:35"
+        );
+        assert!(
+            serde_json::to_string(&out.bodies[0])
+                .unwrap()
+                .contains(r#""text":"**web\\_01** at 10:49:35""#)
+        );
+    }
+
+    #[test]
+    fn text_body_is_sent_unchanged() {
+        let message = crate::template::render_test_message(
+            "Disk",
+            "**{{ host }}** at {{ ts }}",
+            crate::config::BodyFormat::Text,
+            &serde_json::json!({"host": "web_01", "ts": "10:49:35"}),
+        );
+        let out = send_with_responses(None, alert_with_message(message), &[]);
+
+        assert_eq!(
+            out.bodies[0]["attachments"][0]["text"],
+            "**web_01** at 10:49:35"
+        );
     }
 
     #[test]

@@ -1,0 +1,37 @@
+# Fixture: a Telegram notifier asks for the telegram_html format with
+# parse_mode MarkdownV2. Passes Config::validate(); rejected by the preflight
+# (Notifier configuration error).
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  alert:
+    title: "Alert: {{ _msg }}"
+    body: "**{{ _msg }}**"
+    body_format: markdown
+
+notifiers:
+  tg:
+    type: telegram
+    bot_token: "123456:dummy"
+    chat_ids: ["-100"]
+    parse_mode: MarkdownV2
+    format: telegram_html
+
+rules:
+  - name: "r"
+    enabled: true
+    query: '_stream:{app="myapp"}'
+    parser:
+      json:
+        fields: ["message"]
+    notify:
+      template: "alert"
+      destinations:
+        - "tg"

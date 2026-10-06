@@ -29,6 +29,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
             body: "Test body content".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
@@ -491,6 +492,7 @@ fn make_webhook_notifier(
             .map(|(k, v)| (k, SecretString::new(v)))
             .collect(),
         body_template,
+        format: None,
     };
     let client = make_client();
     WebhookNotifier::from_config(name, &config, client).unwrap()
@@ -852,6 +854,7 @@ fn make_isolation_registry(webhook_url: &str, mattermost_url: &str) -> Arc<Notif
         method: "POST".to_string(),
         headers: HashMap::new(),
         body_template: None,
+        format: None,
     };
     let mut registry = NotifierRegistry::new();
     registry

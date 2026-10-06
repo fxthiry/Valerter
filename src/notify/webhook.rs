@@ -4,8 +4,8 @@
 //! with customizable body templates and headers.
 
 use crate::config::{
-    SecretString, WebhookNotifierConfig, resolve_env_vars, validate_notifier_template,
-    validate_resolved_url,
+    OutputFormat, SecretString, WebhookNotifierConfig, resolve_env_vars,
+    validate_notifier_template, validate_resolved_url,
 };
 use crate::error::{ConfigError, NotifyError};
 use crate::notify::notifier_template::{CONTEXT_VARIABLES, NotifierTemplate};
@@ -55,14 +55,15 @@ pub struct DefaultWebhookPayload {
 }
 
 impl DefaultWebhookPayload {
-    /// Create a DefaultWebhookPayload from an AlertPayload and notifier name.
-    pub fn from_alert(alert: &AlertPayload, notifier_name: &str) -> Self {
+    /// Create a DefaultWebhookPayload from an AlertPayload and notifier name,
+    /// the body rendered in `format`.
+    pub fn from_alert(alert: &AlertPayload, notifier_name: &str, format: OutputFormat) -> Self {
         Self {
             alert_name: notifier_name.to_string(),
             rule_name: alert.rule_name.clone(),
             vl_source: alert.vl_source.clone(),
             title: alert.message.title.clone(),
-            body: alert.message.body.clone(),
+            body: alert.message.body_for(format).text.to_string(),
             timestamp: Utc::now().to_rfc3339(),
             log_timestamp: alert.log_timestamp.clone(),
             log_timestamp_formatted: alert.log_timestamp_formatted.clone(),
@@ -98,6 +99,8 @@ pub struct WebhookNotifier {
     /// variables resolved (if configured). The resolved source may hold a
     /// secret: it is never logged nor shown by `Debug`.
     body_template: Option<NotifierTemplate>,
+    /// Format of the body of a Markdown alert (`format`, default `plain`).
+    format: OutputFormat,
 }
 
 /// Render a compiled body template with alert context.
@@ -108,11 +111,12 @@ pub struct WebhookNotifier {
 fn render_body_template(
     template: &NotifierTemplate,
     alert: &AlertPayload,
+    format: OutputFormat,
 ) -> Result<String, NotifyError> {
     template
         .render(context! {
             title => &alert.message.title,
-            body => &alert.message.body,
+            body => alert.message.body_for(format).to_value(),
             rule_name => &alert.rule_name,
             vl_source => &alert.vl_source,
             log_timestamp => &alert.log_timestamp,
@@ -186,6 +190,18 @@ impl WebhookNotifier {
             name: name.to_string(),
             message: format!("url: {}", e),
         })?;
+
+        let format = OutputFormat::resolve(
+            config.format,
+            OutputFormat::Plain,
+            &[
+                OutputFormat::Plain,
+                OutputFormat::Markdown,
+                OutputFormat::Html,
+            ],
+            name,
+            "webhook",
+        )?;
 
         // Parse and validate HTTP method (AC6: only POST and PUT supported)
         let method_upper = config.method.to_uppercase();
@@ -269,6 +285,7 @@ impl WebhookNotifier {
             method,
             headers,
             body_template,
+            format,
         })
     }
 
@@ -277,7 +294,7 @@ impl WebhookNotifier {
     fn build_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
         match &self.body_template {
             Some(template) => {
-                let rendered = render_body_template(template, alert)?;
+                let rendered = render_body_template(template, alert, self.format)?;
                 // Safety net: warn (without the body, which may hold secrets or
                 // log data) but still send, as some endpoints tolerate it.
                 if let Some(e) = json_body_error(&self.headers, &rendered) {
@@ -290,7 +307,7 @@ impl WebhookNotifier {
                 Ok(rendered)
             }
             None => {
-                let payload = DefaultWebhookPayload::from_alert(alert, &self.name);
+                let payload = DefaultWebhookPayload::from_alert(alert, &self.name, self.format);
                 serde_json::to_string(&payload).map_err(|e| {
                     NotifyError::SendFailed(format!("JSON serialization error: {}", e))
                 })
@@ -331,6 +348,10 @@ impl Notifier for WebhookNotifier {
 
     fn notifier_type(&self) -> &str {
         "webhook"
+    }
+
+    fn output_format(&self) -> OutputFormat {
+        self.format
     }
 
     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
@@ -446,7 +467,11 @@ mod tests {
 
     /// Compile `source` and render it for `alert`.
     fn render_source(source: &str, alert: &AlertPayload) -> Result<String, NotifyError> {
-        render_body_template(&compile_body_template(source.to_string()).unwrap(), alert)
+        render_body_template(
+            &compile_body_template(source.to_string()).unwrap(),
+            alert,
+            OutputFormat::Plain,
+        )
     }
 
     fn make_alert_payload(rule_name: &str) -> AlertPayload {
@@ -457,6 +482,7 @@ mod tests {
                 body: "Something happened".to_string(),
                 email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
+                ..Default::default()
             },
             rule_name: rule_name.to_string(),
             vl_source: "vlprod".to_string(),
@@ -491,6 +517,7 @@ mod tests {
                     h
                 },
                 body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
+                format: None,
             };
 
             let client = reqwest::Client::new();
@@ -511,6 +538,7 @@ mod tests {
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -533,6 +561,7 @@ mod tests {
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
+                    format: None,
                 };
 
                 let client = reqwest::Client::new();
@@ -553,6 +582,7 @@ mod tests {
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
+                format: None,
             };
 
             let client = reqwest::Client::new();
@@ -587,6 +617,7 @@ mod tests {
                     h
                 },
                 body_template: None,
+                format: None,
             };
 
             let client = reqwest::Client::new();
@@ -613,6 +644,7 @@ mod tests {
             method: "PATCH".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -638,6 +670,7 @@ mod tests {
             method: "PUT".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -655,6 +688,7 @@ mod tests {
             method: "DELETE".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -670,6 +704,7 @@ mod tests {
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: Some("{% if unclosed".to_string()),
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -693,7 +728,7 @@ mod tests {
     #[test]
     fn default_webhook_payload_from_alert() {
         let alert = make_alert_payload("test_rule");
-        let payload = DefaultWebhookPayload::from_alert(&alert, "my-webhook");
+        let payload = DefaultWebhookPayload::from_alert(&alert, "my-webhook", OutputFormat::Plain);
 
         assert_eq!(payload.alert_name, "my-webhook");
         assert_eq!(payload.rule_name, "test_rule");
@@ -709,7 +744,7 @@ mod tests {
     #[test]
     fn default_webhook_payload_serializes_correctly() {
         let alert = make_alert_payload("cpu_alert");
-        let payload = DefaultWebhookPayload::from_alert(&alert, "webhook-1");
+        let payload = DefaultWebhookPayload::from_alert(&alert, "webhook-1", OutputFormat::Plain);
         let json = serde_json::to_string(&payload).unwrap();
 
         assert!(json.contains("\"alert_name\":\"webhook-1\""));
@@ -733,6 +768,7 @@ mod tests {
                 body: "Body".to_string(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: "simple_rule".to_string(),
             vl_source: "vlprod".to_string(),
@@ -741,7 +777,7 @@ mod tests {
             log_timestamp_formatted: "15/01/2026 10:00:00 UTC".to_string(),
             log: AlertPayload::log_from_fields(&serde_json::json!({})),
         };
-        let payload = DefaultWebhookPayload::from_alert(&alert, "webhook");
+        let payload = DefaultWebhookPayload::from_alert(&alert, "webhook", OutputFormat::Plain);
         let json = serde_json::to_string(&payload).unwrap();
 
         // Generic webhook payload should not contain accent_color or icon
@@ -761,6 +797,7 @@ mod tests {
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -777,6 +814,7 @@ mod tests {
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -803,6 +841,7 @@ mod tests {
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
+                    format: None,
                 };
 
                 let client = reqwest::Client::new();
@@ -836,6 +875,7 @@ mod tests {
                     h
                 },
                 body_template: None,
+                format: None,
             };
 
             let client = reqwest::Client::new();
@@ -876,6 +916,7 @@ mod tests {
                 body: "Body".to_string(),
                 email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
+                ..Default::default()
             },
             rule_name: "test_rule".to_string(),
             vl_source: "vlprod".to_string(),
@@ -897,6 +938,7 @@ mod tests {
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: Some(template.to_string()),
+            format: None,
         }
     }
 
@@ -989,6 +1031,7 @@ mod tests {
                 h
             },
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -1017,6 +1060,7 @@ mod tests {
                     .map(|k| (k.to_string(), SecretString::new("value".to_string())))
                     .collect(),
                 body_template: None,
+                format: None,
             };
 
             let Err(err) = WebhookNotifier::from_config("wh", &config, reqwest::Client::new())
@@ -1047,6 +1091,7 @@ mod tests {
                 h
             },
             body_template: None,
+            format: None,
         };
 
         let client = reqwest::Client::new();
@@ -1077,6 +1122,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), SecretString::new(v.to_string())))
                 .collect(),
             body_template: None,
+            format: None,
         }
     }
 
@@ -1378,6 +1424,7 @@ mod tests {
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
+                format: None,
             };
             let mut notifier =
                 WebhookNotifier::from_config("hook", &config, reqwest::Client::new()).unwrap();
@@ -1410,5 +1457,104 @@ mod tests {
             );
         }
         assert_eq!(counter_total(&rendered, "valerter_alerts_sent_total"), 0);
+    }
+
+    // ===================================================================
+    // Markdown bodies (markdown-body-format)
+    // ===================================================================
+
+    /// Sends `message` through a webhook notifier with `format` and
+    /// `body_template`, returning the request body received.
+    async fn send_markdown(
+        message: RenderedMessage,
+        format: Option<OutputFormat>,
+        body_template: Option<&str>,
+    ) -> String {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let config = WebhookNotifierConfig {
+            url: SecretString::new(format!("{}/hook", server.uri())),
+            method: "POST".to_string(),
+            headers: HashMap::new(),
+            body_template: body_template.map(str::to_string),
+            format,
+        };
+        let notifier =
+            WebhookNotifier::from_config("hook", &config, reqwest::Client::new()).unwrap();
+        let alert = AlertPayload {
+            message,
+            ..make_alert_payload("r")
+        };
+        notifier.send(&alert).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        String::from_utf8(requests[0].body.clone()).unwrap()
+    }
+
+    fn message(body: &str, body_format: crate::config::BodyFormat, host: &str) -> RenderedMessage {
+        crate::template::render_test_message(
+            "t",
+            body,
+            body_format,
+            &serde_json::json!({"host": host}),
+        )
+    }
+
+    #[tokio::test]
+    async fn markdown_body_is_plain_text_by_default() {
+        let body = send_markdown(
+            message(
+                "**{{ host }}** [logs](https://vl.example.com)",
+                crate::config::BodyFormat::Markdown,
+                "web-01",
+            ),
+            None,
+            None,
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["body"], "web-01 logs (https://vl.example.com)");
+    }
+
+    #[tokio::test]
+    async fn markdown_format_for_a_markdown_target() {
+        let body = send_markdown(
+            message("**{{ host }}**", crate::config::BodyFormat::Markdown, "a_b"),
+            Some(OutputFormat::Markdown),
+            Some(r#"{"content": {{ body | tojson }}}"#),
+        )
+        .await;
+        assert_eq!(body, r#"{"content": "**a\\_b**"}"#);
+    }
+
+    #[tokio::test]
+    async fn html_format_body_is_safe_in_the_template() {
+        let body = send_markdown(
+            message("**{{ host }}**", crate::config::BodyFormat::Markdown, "<x>"),
+            Some(OutputFormat::Html),
+            Some("{{ body }} {{ body | e }}"),
+        )
+        .await;
+        assert_eq!(
+            body,
+            "<p><strong>&lt;x&gt;</strong></p> <p><strong>&lt;x&gt;</strong></p>"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_body_is_unchanged_whatever_the_format() {
+        for format in [None, Some(OutputFormat::Markdown), Some(OutputFormat::Html)] {
+            let body = send_markdown(
+                message("**{{ host }}**", crate::config::BodyFormat::Text, "a_b"),
+                format,
+                Some(r#"{"content": {{ body | tojson }}}"#),
+            )
+            .await;
+            assert_eq!(body, r#"{"content": "**a_b**"}"#, "{format:?}");
+        }
     }
 }

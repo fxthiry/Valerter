@@ -1,6 +1,7 @@
 //! Notifier configurations (Mattermost, Webhook, Email).
 
 use super::secret::SecretString;
+use super::types::OutputFormat;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -47,6 +48,9 @@ pub struct MattermostNotifierConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub icon_url: Option<String>,
+    /// Output format of the body of a Markdown alert (`markdown`).
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 /// Configuration for a generic webhook notifier.
@@ -61,6 +65,9 @@ pub struct WebhookNotifierConfig {
     pub headers: HashMap<String, SecretString>,
     #[serde(default)]
     pub body_template: Option<String>,
+    /// Output format of the body of a Markdown alert (`plain, markdown or html; default plain`).
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 /// Configuration for an email notifier.
@@ -75,6 +82,9 @@ pub struct EmailNotifierConfig {
     pub body_template: Option<String>,
     #[serde(default)]
     pub body_template_file: Option<String>,
+    /// Output format of the body of a Markdown alert (`html`).
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 /// Configuration for a Telegram Bot notifier instance.
@@ -97,6 +107,9 @@ pub struct TelegramNotifierConfig {
     /// Optional Jinja template for the message body. Defaults to the built-in HTML template.
     #[serde(default)]
     pub body_template: Option<String>,
+    /// Output format of the body of a Markdown alert (`telegram_html or plain; default telegram_html, plain when parse_mode is not HTML`).
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 /// SMTP server configuration.
