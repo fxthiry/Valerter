@@ -1,0 +1,45 @@
+# Fixture: a `body_format: markdown` template using the Markdown filters
+# wherever they can be written (codeblock after a list marker, md_link with
+# an urlencoded query, tojson escaped like any value). Valid.
+victorialogs:
+  default:
+    url: "http://vl.invalid:9428"
+
+defaults:
+  throttle:
+    count: 5
+    window: 60s
+
+templates:
+  filters:
+    title: "Errors on {{ host }}"
+    body_format: markdown
+    body: |
+      **{{ host }}**: {{ md_link("logs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
+      - message:
+      - {{ _msg | codeblock }}
+
+      > {{ _msg | codeblock('json') }}
+
+      Fields: {{ log_fields | tojson }} {{ host | code }}
+
+notifiers:
+  mattermost-ops:
+    type: mattermost
+    webhook_url: "https://mattermost.example.com/hooks/abc123"
+
+  hook:
+    type: webhook
+    url: "https://hooks.example.com/alerts"
+    format: markdown
+    body_template: '{"text": {{ body | tojson }}, "q": {{ log.host | urlencode | tojson }}}'
+
+rules:
+  - name: "errors"
+    query: '_stream:{app="myapp"} error'
+    parser:
+      json:
+        fields: ["host"]
+    notify:
+      template: "filters"
+      destinations: [mattermost-ops, hook]

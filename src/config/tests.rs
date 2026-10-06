@@ -3374,7 +3374,7 @@ fn validate_markdown_body_reports_unknown_filter_after_escaped_value() {
 #[test]
 fn validate_markdown_body_accepts_markdown_filters() {
     let config = markdown_template_config(
-        "{{ _msg | codeblock('json') }} {{ host | code }} {{ link(host, url) }} {{ x | safe }}",
+        "{{ _msg | codeblock('json') }} {{ host | code }} {{ md_link(host, url) }} {{ x | safe }}",
     );
     assert!(config.validate().is_ok());
 }

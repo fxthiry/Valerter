@@ -6,7 +6,7 @@
 //! least one chat succeeds (partial success); `Err` only when all fail.
 
 use crate::config::{
-    OutputFormat, SecretString, TelegramNotifierConfig, resolve_env_vars,
+    BodyFormat, OutputFormat, SecretString, TelegramNotifierConfig, resolve_env_vars,
     validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
@@ -77,19 +77,159 @@ struct TelegramPayload<'a> {
     disable_web_page_preview: Option<bool>,
 }
 
+/// Unit of a Telegram HTML text: a tag (no visible character) or a visible
+/// character (an entity counts as one).
+enum HtmlUnit<'a> {
+    Open(&'a str),
+    Close(&'a str),
+    /// A tag that opens nothing (`<br/>`, `<>`).
+    Empty,
+    Visible,
+}
+
+/// Name of a tag (`b` in `<b>`, `a` in `<a href="…">`, `b` in `</b>`).
+fn tag_name(tag: &str) -> &str {
+    let tag = tag.strip_prefix('/').unwrap_or(tag);
+    let end = tag
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(tag.len());
+    &tag[..end]
+}
+
+/// Length of the entity starting `rest` (after its `&`, `;` included), if
+/// any: `#` and 1 to 7 digits, `#x` and 1 to 6 hexadecimal digits, or a
+/// letter and up to 31 letters or digits.
+fn entity_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let end = match bytes.first() {
+        Some(b'#') => match bytes.get(1) {
+            Some(b'x' | b'X') => {
+                let n = bytes[2..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit())
+                    .count();
+                (1..=6).contains(&n).then_some(2 + n)
+            }
+            _ => {
+                let n = bytes[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                (1..=7).contains(&n).then_some(1 + n)
+            }
+        },
+        Some(b) if b.is_ascii_alphabetic() => {
+            let n = bytes
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count();
+            (n <= 32).then_some(n)
+        }
+        _ => None,
+    }?;
+    (bytes.get(end) == Some(&b';')).then_some(end + 1)
+}
+
+/// The unit starting `text` and its length in bytes. A `<` followed by a
+/// `>` is a tag; a `<` without one is a visible character (malformed text,
+/// which Telegram rejects: the plain-text resend handles it).
+fn html_unit(text: &str) -> (HtmlUnit<'_>, usize) {
+    match text.as_bytes()[0] {
+        b'<' => {
+            if let Some(end) = text.find('>') {
+                let tag = &text[1..end];
+                let name = tag_name(tag);
+                let unit = if tag.starts_with('/') {
+                    HtmlUnit::Close(name)
+                } else if tag.ends_with('/') || name.is_empty() {
+                    HtmlUnit::Empty
+                } else {
+                    HtmlUnit::Open(name)
+                };
+                return (unit, end + 1);
+            }
+            (HtmlUnit::Visible, 1)
+        }
+        b'&' => (
+            HtmlUnit::Visible,
+            entity_len(&text[1..]).map_or(1, |n| n + 1),
+        ),
+        _ => {
+            let len = text.chars().next().map_or(1, char::len_utf8);
+            (HtmlUnit::Visible, len)
+        }
+    }
+}
+
 /// Truncate `text` so that it does not exceed [`TELEGRAM_TEXT_MAX_CODEPOINTS`]
 /// Unicode codepoints. When truncation happens, a single `…` (U+2026) is
-/// appended so the final codepoint count is exactly the limit.
-fn truncate_text(text: &str) -> (String, bool) {
-    if text.chars().count() <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+/// appended so the final count is exactly the limit.
+///
+/// With `html` (`parse_mode: HTML`), only the visible text is counted: a tag
+/// counts zero, an entity one. The cut never falls in a tag or an entity,
+/// and the tags still open after the `…` are closed, innermost first.
+fn truncate_text(text: &str, html: bool) -> (String, bool) {
+    if !html {
+        if text.chars().count() <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+            return (text.to_string(), false);
+        }
+        let mut out: String = text
+            .chars()
+            .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
+            .collect();
+        out.push('…');
+        return (out, true);
+    }
+
+    let mut visible = 0;
+    let mut i = 0;
+    while i < text.len() && visible <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+        let (unit, len) = html_unit(&text[i..]);
+        if matches!(unit, HtmlUnit::Visible) {
+            visible += 1;
+        }
+        i += len;
+    }
+    if visible <= TELEGRAM_TEXT_MAX_CODEPOINTS {
         return (text.to_string(), false);
     }
-    let mut out: String = text
-        .chars()
-        .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
-        .collect();
+
+    let mut open: Vec<&str> = Vec::new();
+    let mut visible = 0;
+    let mut i = 0;
+    while visible < TELEGRAM_TEXT_MAX_CODEPOINTS - 1 {
+        let (unit, len) = html_unit(&text[i..]);
+        match unit {
+            HtmlUnit::Visible => visible += 1,
+            HtmlUnit::Open(name) => open.push(name),
+            HtmlUnit::Close(name) => {
+                if let Some(at) = open.iter().rposition(|o| o.eq_ignore_ascii_case(name)) {
+                    open.truncate(at);
+                }
+            }
+            HtmlUnit::Empty => {}
+        }
+        i += len;
+    }
+    let mut out = String::with_capacity(i + 64);
+    out.push_str(&text[..i]);
     out.push('…');
+    for name in open.iter().rev() {
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
     (out, true)
+}
+
+/// Text of an alert, rendered and truncated once before the fan-out to chats.
+#[derive(Debug)]
+struct Prepared {
+    /// Text sent with the configured `parse_mode`.
+    text: String,
+    /// Whether `text` was truncated.
+    truncated: bool,
+    /// Text resent without `parse_mode` after an HTML rejection, when it
+    /// differs from `text`: for a Markdown alert in `parse_mode: HTML`, the
+    /// title and the `plain` rendering of the body (raw truncation).
+    plain: Option<String>,
 }
 
 /// Render the compiled body template with alert context.
@@ -375,8 +515,9 @@ impl TelegramNotifier {
         })
     }
 
-    /// Render and truncate the message text once, before fan-out to chats.
-    fn prepare_text(&self, alert: &AlertPayload) -> Result<(String, bool), NotifyError> {
+    /// Render and truncate the message text once, before fan-out to chats,
+    /// with the text of the plain-text resend (see [`Prepared`]).
+    fn prepare_text(&self, alert: &AlertPayload) -> Result<Prepared, NotifyError> {
         let rendered = render_body_template(&self.body_template, alert, self.format)?;
         let guarded = if let Some((fallback, reason)) = fallback_if_empty(&rendered, alert) {
             tracing::warn!(
@@ -389,27 +530,43 @@ impl TelegramNotifier {
         } else {
             rendered
         };
-        Ok(truncate_text(&guarded))
+        let html = self.parse_mode == "HTML";
+        let (text, truncated) = truncate_text(&guarded, html);
+        let plain = (html && alert.message.body_format == BodyFormat::Markdown).then(|| {
+            let message = &alert.message;
+            let body = message.body_for(OutputFormat::Plain).text;
+            let plain = if message.title.is_empty() {
+                body.to_string()
+            } else {
+                format!("{}\n{body}", message.title)
+            };
+            truncate_text(&plain, false).0
+        });
+        Ok(Prepared {
+            text,
+            truncated,
+            plain,
+        })
     }
 
     /// Send the prepared text to a single chat_id with retry. Returns `Ok` on
     /// success, `Err` on permanent failure (retries exhausted or 4xx other
     /// than 429).
     ///
-    /// A 400 `can't parse entities` on an HTML message (malformed markup: a
-    /// tag cut by truncation, an unescaped `<` or `&` in a custom template) is
-    /// resent once as plain text, so the alert is delivered with its tags
-    /// shown literally rather than lost. Any other 400 (`chat not found`,
-    /// `message text is empty`…) fails the chat at once.
+    /// A 400 `can't parse entities` on an HTML message (malformed markup: an
+    /// unescaped `<` or `&` in a custom template) is resent once as plain
+    /// text (`plain`, or `text` itself), so the alert is delivered rather
+    /// than lost. Any other 400 (`chat not found`, `message text is empty`…)
+    /// fails the chat at once.
     async fn send_to_chat(
         &self,
         alert: &AlertPayload,
         chat_id: &str,
-        text: &str,
+        prepared: &Prepared,
     ) -> Result<(), NotifyError> {
         let mut payload = TelegramPayload {
             chat_id,
-            text,
+            text: &prepared.text,
             parse_mode: Some(&self.parse_mode),
             disable_notification: self.disable_notification,
             disable_web_page_preview: self.disable_web_page_preview,
@@ -431,6 +588,7 @@ impl TelegramNotifier {
                     "Telegram rejected HTML message, resending as plain text"
                 );
                 payload.parse_mode = None;
+                payload.text = prepared.plain.as_deref().unwrap_or(&prepared.text);
                 self.post_with_retry(chat_id, &payload).await
             }
             other => other,
@@ -567,14 +725,14 @@ impl Notifier for TelegramNotifier {
         async {
             // A render error is a permanent failure for this alert: count it,
             // send nothing.
-            let (text, truncated) = match self.prepare_text(alert) {
+            let prepared = match self.prepare_text(alert) {
                 Ok(prepared) => prepared,
                 Err(e) => {
                     record_permanent_failure(alert, &self.name, "telegram");
                     return Err(e);
                 }
             };
-            if truncated {
+            if prepared.truncated {
                 tracing::warn!(
                     rule_name = %alert.rule_name,
                     limit = TELEGRAM_TEXT_MAX_CODEPOINTS,
@@ -593,7 +751,7 @@ impl Notifier for TelegramNotifier {
             // counted in `valerter_telegram_chat_errors_total`.
             let mut any_success = false;
             for chat_id in &self.chat_ids {
-                match self.send_to_chat(alert, chat_id, &text).await {
+                match self.send_to_chat(alert, chat_id, &prepared).await {
                     Ok(()) => any_success = true,
                     Err(e) => {
                         tracing::error!(
@@ -681,6 +839,15 @@ mod tests {
     use super::*;
     use crate::template::RenderedMessage;
 
+    /// A prepared text without truncation nor distinct plain-text resend.
+    fn prepared(text: &str) -> Prepared {
+        Prepared {
+            text: text.to_string(),
+            truncated: false,
+            plain: None,
+        }
+    }
+
     fn sample_alert(title: &str, body: &str) -> AlertPayload {
         AlertPayload {
             mattermost_channel: None,
@@ -712,10 +879,132 @@ mod tests {
         }
     }
 
+    /// Visible characters of a Telegram HTML text, counted independently of
+    /// [`truncate_text`]: tags removed, each entity one character.
+    fn visible_count(text: &str) -> usize {
+        let mut count = 0;
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // Output of `telegram_html` and of valerter's templates: a
+                // `<` always opens a tag, a `&` always an entity.
+                '<' => chars.by_ref().take_while(|c| *c != '>').for_each(drop),
+                '&' => {
+                    chars.by_ref().take_while(|c| *c != ';').for_each(drop);
+                    count += 1;
+                }
+                _ => count += 1,
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn html_truncation_closes_open_tags() {
+        let input = format!("<b>{}</b>", "x".repeat(5000));
+        let (out, truncated) = truncate_text(&input, true);
+        assert!(truncated);
+        assert_eq!(out, format!("<b>{}…</b>", "x".repeat(4095)));
+    }
+
+    #[test]
+    fn html_truncation_never_cuts_an_entity() {
+        let input = format!("{}&amp;&lt;{}", "a".repeat(4094), "b".repeat(100));
+        let (out, truncated) = truncate_text(&input, true);
+        assert!(truncated);
+        assert_eq!(out, format!("{}&amp;…", "a".repeat(4094)));
+    }
+
+    #[test]
+    fn html_truncation_does_not_count_tags_or_destinations() {
+        let input = format!(
+            "<a href=\"https://vl.example.com/{}\">logs</a>{}",
+            "q".repeat(3000),
+            "x".repeat(4000)
+        );
+        assert_eq!(truncate_text(&input, true), (input.clone(), false));
+        let exact = format!("<b>{}</b>", "&lt;".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS));
+        assert_eq!(truncate_text(&exact, true), (exact.clone(), false));
+    }
+
+    #[test]
+    fn html_truncation_of_code_blocks_and_malformed_text() {
+        let input = format!(
+            "<pre><code class=\"language-rust\">{}</code></pre>",
+            "x".repeat(5000)
+        );
+        let (out, _) = truncate_text(&input, true);
+        assert!(
+            out.ends_with("…</code></pre>"),
+            "{}",
+            &out[out.len() - 20..]
+        );
+        assert_eq!(visible_count(&out), TELEGRAM_TEXT_MAX_CODEPOINTS);
+
+        // A `<` without `>` is visible text (Telegram rejects it; the
+        // plain-text resend handles it).
+        let input = format!("a < b{}", "x".repeat(5000));
+        let (out, _) = truncate_text(&input, true);
+        assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(out.starts_with("a < bx"));
+
+        // An orphan closing tag is kept and closes nothing.
+        let input = format!("</i><b>{}", "x".repeat(5000));
+        let (out, _) = truncate_text(&input, true);
+        assert!(
+            out.starts_with("</i><b>x") && out.ends_with("x…</b>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn markdownv2_truncation_is_raw() {
+        let input = format!("*{}*", "x".repeat(5000));
+        let (out, truncated) = truncate_text(&input, false);
+        assert!(truncated);
+        assert_eq!(out, format!("*{}…", "x".repeat(4094)));
+    }
+
+    /// Long `telegram_html` renderings of random Markdown sources: the
+    /// truncated text is well formed, follows the nesting rules and counts
+    /// exactly the limit.
+    #[test]
+    fn html_truncation_of_rendered_bodies_is_well_formed() {
+        use crate::markdown::tests::{Rng, check_telegram, random_source};
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut checked = 0;
+        while checked < 2000 {
+            let source = random_source(&mut rng);
+            let once = crate::markdown::render(&source, &[], OutputFormat::TelegramHtml);
+            let per_copy = visible_count(&once);
+            if per_copy == 0 {
+                continue;
+            }
+            // Repeated as paragraphs: a well-formed rendering, cheaper than
+            // rendering the repeated source.
+            let copies = TELEGRAM_TEXT_MAX_CODEPOINTS / per_copy + 2;
+            let long = vec![once; copies].join("\n\n");
+            if visible_count(&long) <= TELEGRAM_TEXT_MAX_CODEPOINTS {
+                continue;
+            }
+            let (out, truncated) = truncate_text(&long, true);
+            assert!(truncated);
+            if let Err(err) = check_telegram(&out) {
+                panic!("source {source:?}: {err}\n{out}");
+            }
+            assert_eq!(
+                visible_count(&out),
+                TELEGRAM_TEXT_MAX_CODEPOINTS,
+                "{source:?}"
+            );
+            checked += 1;
+        }
+    }
+
     #[test]
     fn truncate_text_leaves_short_text_alone() {
         let input = "hello";
-        let (out, was_truncated) = truncate_text(input);
+        let (out, was_truncated) = truncate_text(input, false);
         assert_eq!(out, "hello");
         assert!(!was_truncated);
     }
@@ -723,7 +1012,7 @@ mod tests {
     #[test]
     fn truncate_text_allows_exact_limit() {
         let input: String = "a".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS);
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
         assert!(!was_truncated);
     }
@@ -731,7 +1020,7 @@ mod tests {
     #[test]
     fn truncate_text_cuts_over_limit_to_exactly_4096_codepoints() {
         let input: String = "a".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 1);
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert!(was_truncated);
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
         assert!(out.ends_with('…'));
@@ -746,7 +1035,7 @@ mod tests {
             input.len() > TELEGRAM_TEXT_MAX_CODEPOINTS * 2,
             "input should be byte-heavy"
         );
-        let (out, was_truncated) = truncate_text(&input);
+        let (out, was_truncated) = truncate_text(&input, false);
         assert!(was_truncated);
         // Limit is in codepoints, not bytes.
         assert_eq!(out.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
@@ -892,7 +1181,7 @@ mod tests {
         let mut alert = sample_alert("Disk", "body");
         alert.log = AlertPayload::log_from_fields(&serde_json::json!({"host": "<web&01>"}));
 
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
 
         assert_eq!(text, "<b>Disk</b>\n<code>&lt;web&amp;01&gt;</code>");
     }
@@ -910,7 +1199,7 @@ mod tests {
             &serde_json::json!({"host": "web-01", "k8s.pod": "api-7f"}),
         );
 
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
 
         assert_eq!(text, "web-01: disk full api-7f|api-7f||");
     }
@@ -925,7 +1214,7 @@ mod tests {
         alert.log =
             AlertPayload::log_from_fields(&serde_json::json!({"host": "a.b", "msg": "x_y"}));
 
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
 
         assert_eq!(text, r"a\.b X\_Y");
     }
@@ -1352,7 +1641,7 @@ mod tests {
             let notifier = scripted_responses(&server, responses, "HTML").await;
 
             let err = notifier
-                .send_to_chat(&sample_alert("hi", "body"), "-100A", "text")
+                .send_to_chat(&sample_alert("hi", "body"), "-100A", &prepared("text"))
                 .await
                 .unwrap_err();
 
@@ -1434,7 +1723,7 @@ mod tests {
         let notifier = scripted_notifier(&server, &[400, 400], "HTML").await;
 
         let err = notifier
-            .send_to_chat(&sample_alert("hi", "body"), "-100A", "text")
+            .send_to_chat(&sample_alert("hi", "body"), "-100A", &prepared("text"))
             .await
             .unwrap_err();
 
@@ -1496,7 +1785,6 @@ mod tests {
             rt.block_on(async {
                 let server = MockServer::start().await;
                 let mut notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
-                // `<pre>` opened and never closed once the text is cut.
                 notifier.set_body_template_for_tests(Some("<pre>{{ body }}</pre>"));
                 let long_body = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS + 100);
 
@@ -1509,11 +1797,14 @@ mod tests {
         });
 
         assert_eq!(bodies.len(), 2);
-        assert!(bodies[1].get("parse_mode").is_none());
-        let text = bodies[1]["text"].as_str().unwrap();
+        // The `<pre>` is closed after the cut; the text of a `text` template
+        // is resent as is.
+        let text = bodies[0]["text"].as_str().unwrap();
         assert!(text.starts_with("<pre>"));
-        assert!(text.ends_with('…'));
-        assert_eq!(text.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(text.ends_with("…</pre>"));
+        assert_eq!(visible_count(text), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], bodies[0]["text"]);
 
         let rendered = handle.render();
         let truncated: Vec<_> = rendered
@@ -1637,7 +1928,7 @@ mod tests {
         cfg.body_template = Some("".to_string());
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let alert = sample_alert("Disk full", "");
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert!(!text.trim().is_empty(), "fallback text must not be empty");
         assert_eq!(text, "<b>Disk full</b>");
     }
@@ -1650,7 +1941,7 @@ mod tests {
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let mut alert = sample_alert("", "");
         alert.rule_name = "nginx-5xx".to_string();
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert_eq!(text, "Alert: nginx-5xx");
     }
 
@@ -1660,7 +1951,7 @@ mod tests {
         let cfg = config_with(vec!["-100".to_string()]);
         let notifier = TelegramNotifier::from_config("tg", &cfg, client).unwrap();
         let alert = sample_alert("hello", "world");
-        let (text, _) = notifier.prepare_text(&alert).unwrap();
+        let text = notifier.prepare_text(&alert).unwrap().text;
         assert_eq!(text, "<b>hello</b>\nworld");
     }
 
@@ -1891,7 +2182,40 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn long_markdown_body_is_truncated_then_resent_as_plain_text() {
+    async fn long_markdown_body_is_truncated_as_html() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[200], "HTML").await;
+        let long = format!(
+            "{}end",
+            "x <y> & z ".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS / 5)
+        );
+
+        notifier
+            .send(&markdown_alert(
+                "t",
+                "**{{ v }}** `c`\n\n> {{ v }}",
+                serde_json::json!({"v": long}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let text = bodies[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("<b>t</b>\n<b>x &lt;y&gt; &amp; z"),
+            "{text}"
+        );
+        assert!(text.ends_with("…</b>"), "{text}");
+        assert_eq!(visible_count(text), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        if let Err(err) = crate::markdown::tests::check_telegram(text) {
+            panic!("{err}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_is_resent_as_its_plain_rendering() {
         let server = MockServer::start().await;
         let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
         let long = "x".repeat(TELEGRAM_TEXT_MAX_CODEPOINTS);
@@ -1907,12 +2231,72 @@ mod tests {
 
         let bodies = request_bodies(&server).await;
         assert_eq!(bodies.len(), 2);
-        let text = bodies[0]["text"].as_str().unwrap();
-        assert!(text.starts_with("<b>t</b>\n<b>xxx"), "{text}");
-        assert!(text.ends_with('…'));
-        assert_eq!(text.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
         assert!(bodies[1].get("parse_mode").is_none());
-        assert_eq!(bodies[0]["text"], bodies[1]["text"]);
+        let plain = bodies[1]["text"].as_str().unwrap();
+        let expected: String = format!("t\n{long}")
+            .chars()
+            .take(TELEGRAM_TEXT_MAX_CODEPOINTS - 1)
+            .chain(['…'])
+            .collect();
+        assert_eq!(plain, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_resend_has_no_markup() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&markdown_alert(
+                "Disk",
+                "**{{ host }}** < 10%",
+                serde_json::json!({"host": "a_b"}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies[0]["text"], "<b>Disk</b>\n<b>a_b</b> &lt; 10%");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], "Disk\na_b < 10%");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_markdown_alert_with_long_plain_rendering() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier
+            .send(&markdown_alert(
+                "",
+                "{{ v }}",
+                serde_json::json!({"v": "é".repeat(5000)}),
+            ))
+            .await
+            .unwrap();
+
+        let bodies = request_bodies(&server).await;
+        let plain = bodies[1]["text"].as_str().unwrap();
+        assert_eq!(plain.chars().count(), TELEGRAM_TEXT_MAX_CODEPOINTS);
+        assert!(plain.starts_with("éé"), "no title, no line break");
+        assert!(plain.ends_with('…'));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejected_text_alert_is_resent_unchanged() {
+        let server = MockServer::start().await;
+        let notifier = scripted_notifier(&server, &[400, 200], "HTML").await;
+
+        notifier.send(&sample_alert("Disk", "a < b")).await.unwrap();
+
+        let bodies = request_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1]["text"], bodies[0]["text"]);
     }
 
     #[test]

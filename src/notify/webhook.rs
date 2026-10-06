@@ -1271,6 +1271,25 @@ mod tests {
     }
 
     #[test]
+    fn whole_log_as_json_stays_valid_json() {
+        let notifier = WebhookNotifier::from_config(
+            "wh",
+            &body_template_config(r#"{"log": {{ log | tojson }}}"#),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let fields = serde_json::json!({"_msg": "**bold** <b>x</b> \"q\" a_b", "k8s.pod": "api"});
+        let mut alert = make_alert_with_body("b");
+        alert.log = AlertPayload::log_from_fields(&fields);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&notifier.build_body(&alert).unwrap()).unwrap();
+
+        assert_eq!(body["log"]["_msg"], fields["_msg"]);
+        assert_eq!(body["log"]["k8s"]["pod"], "api");
+    }
+
+    #[test]
     #[serial]
     fn escaped_placeholder_renders_literal_dollar_brace() {
         temp_env::with_var("NOT_A_VAR", None::<&str>, || {

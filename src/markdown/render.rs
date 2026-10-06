@@ -1,11 +1,12 @@
 //! Restricted tree → `plain`, `markdown`, `html` and `telegram_html`.
 
-use super::{Block, Inline, parse};
+use super::{Block, Inline, MarkdownElement, parse};
 use crate::config::OutputFormat;
 
-/// Parses `source` and renders it in `format`.
-pub fn render(source: &str, format: OutputFormat) -> String {
-    render_blocks(&parse(source), format)
+/// Parses `source`, whose tokens stand for the elements of `slots`, and
+/// renders it in `format`.
+pub fn render(source: &str, slots: &[MarkdownElement], format: OutputFormat) -> String {
+    render_blocks(&parse(source, slots), format)
 }
 
 /// Renders a parsed body in `format`.
@@ -13,18 +14,8 @@ pub fn render_blocks(blocks: &[Block], format: OutputFormat) -> String {
     match format {
         OutputFormat::Plain => plain_blocks(blocks, "\n\n"),
         OutputFormat::Markdown => md_blocks(blocks, 0),
-        OutputFormat::Html => Html {
-            telegram: false,
-            in_link: false,
-            in_quote: false,
-        }
-        .blocks(blocks, "\n"),
-        OutputFormat::TelegramHtml => Html {
-            telegram: true,
-            in_link: false,
-            in_quote: false,
-        }
-        .blocks(blocks, "\n\n"),
+        OutputFormat::Html => Html::new(false).blocks(blocks, "\n"),
+        OutputFormat::TelegramHtml => Html::new(true).blocks(blocks, "\n\n"),
     }
 }
 
@@ -231,6 +222,12 @@ fn sanitize_lang(lang: &str) -> String {
 }
 
 /// HTML writer: `html` (email) or `telegram_html` (Bot API subset).
+///
+/// `telegram_html` follows the nesting rules of the Bot API (tdlib's
+/// `are_entities_valid`): `code` and `pre` have no ancestor but
+/// `blockquote`, a link contains no link, a block quote is not nested, and
+/// `b`, `i`, `s` are not nested in the same tag. An element that cannot be
+/// nested is written as its content alone.
 #[derive(Clone, Copy)]
 struct Html {
     telegram: bool,
@@ -238,9 +235,29 @@ struct Html {
     in_link: bool,
     /// Inside a Telegram block quote, which cannot be nested.
     in_quote: bool,
+    /// Inside a Telegram `b`, `i`, `s` or `a` (a heading included, written
+    /// in `b`): a code span is written as text.
+    in_entity: bool,
+    /// Inside a Telegram `b`, `i`, `s`: the same emphasis is written as its
+    /// content.
+    open_strong: bool,
+    open_em: bool,
+    open_del: bool,
 }
 
 impl Html {
+    fn new(telegram: bool) -> Self {
+        Self {
+            telegram,
+            in_link: false,
+            in_quote: false,
+            in_entity: false,
+            open_strong: false,
+            open_em: false,
+            open_del: false,
+        }
+    }
+
     fn esc(&self, text: &str) -> String {
         escape_html(text, self.telegram)
     }
@@ -303,7 +320,14 @@ impl Html {
     fn telegram_block(&self, block: &Block) -> String {
         match block {
             Block::Paragraph(inlines) | Block::Plain(inlines) => self.inlines(inlines),
-            Block::Heading(_, inlines) => format!("<b>{}</b>", self.inlines(inlines)),
+            Block::Heading(_, inlines) => {
+                let inner = Html {
+                    in_entity: true,
+                    open_strong: true,
+                    ..*self
+                };
+                format!("<b>{}</b>", inner.inlines(inlines))
+            }
             Block::BlockQuote(blocks) if self.in_quote => self.blocks(blocks, "\n\n"),
             Block::BlockQuote(blocks) => {
                 let inner = Html {
@@ -331,6 +355,16 @@ impl Html {
         }
     }
 
+    /// Writes an emphasis in `tag`, or its content alone when the same
+    /// Telegram tag is already open (`open`).
+    fn emphasis(&self, out: &mut String, tag: &str, open: bool, inner: Html, children: &[Inline]) {
+        if self.telegram && open {
+            out.push_str(&self.inlines(children));
+        } else {
+            out.push_str(&format!("<{tag}>{}</{tag}>", inner.inlines(children)));
+        }
+    }
+
     fn inlines(&self, inlines: &[Inline]) -> String {
         let (strong, em, del, br) = if self.telegram {
             ("b", "i", "s", "\n")
@@ -341,19 +375,39 @@ impl Html {
         for inline in inlines {
             match inline {
                 Inline::Text(t) => out.push_str(&self.esc(t)),
+                // Telegram: no `code` inside `b`, `i`, `s` or `a`.
+                Inline::Code(t) if self.telegram && self.in_entity => out.push_str(&self.esc(t)),
                 Inline::Code(t) => out.push_str(&format!("<code>{}</code>", self.esc(t))),
                 Inline::LineBreak => out.push_str(br),
                 Inline::Strong(c) => {
-                    out.push_str(&format!("<{strong}>{}</{strong}>", self.inlines(c)))
+                    let inner = Html {
+                        in_entity: true,
+                        open_strong: true,
+                        ..*self
+                    };
+                    self.emphasis(&mut out, strong, self.open_strong, inner, c);
                 }
-                Inline::Emphasis(c) => out.push_str(&format!("<{em}>{}</{em}>", self.inlines(c))),
+                Inline::Emphasis(c) => {
+                    let inner = Html {
+                        in_entity: true,
+                        open_em: true,
+                        ..*self
+                    };
+                    self.emphasis(&mut out, em, self.open_em, inner, c);
+                }
                 Inline::Strikethrough(c) => {
-                    out.push_str(&format!("<{del}>{}</{del}>", self.inlines(c)))
+                    let inner = Html {
+                        in_entity: true,
+                        open_del: true,
+                        ..*self
+                    };
+                    self.emphasis(&mut out, del, self.open_del, inner, c);
                 }
                 Inline::Link { dest, children } => {
                     if allowed_scheme(dest) && !self.in_link {
                         let inner = Html {
                             in_link: true,
+                            in_entity: true,
                             ..*self
                         };
                         out.push_str(&format!(
