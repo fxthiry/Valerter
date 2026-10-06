@@ -1,6 +1,6 @@
 # Fixture: the YAML examples added by the "Markdown bodies" change, copied from
 # docs/configuration.md ("Markdown bodies", disk_alert), docs/notifiers.md
-# (Webhook > Markdown alerts: choosing `format`, discord-md; Telegram >
+# (Webhook > Markdown alerts: choosing `format`, mattermost-md and discord; Telegram >
 # Formatting messages, disk_alert, renamed telegram_disk_alert here) and
 # config/config.example.yaml (markdown_alert, uncommented). Keep them in sync:
 # every template and notifier must pass --validate without an unknown-variable
@@ -21,7 +21,7 @@ templates:
     body_format: markdown
     body: |
       **{{ host }}** is at {{ usage }}% on {{ mount | code }}
-      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
       {{ _msg | codeblock }}
 
   # docs/notifiers.md, Telegram > Formatting messages
@@ -36,16 +36,22 @@ templates:
     body_format: markdown
     body: |
       **{{ host }}** reported an error at {{ _time }}
-      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
       {{ _msg | codeblock }}
 
 notifiers:
   # docs/notifiers.md, Webhook > Markdown alerts: choosing `format`
-  discord-md:
+  mattermost-md:
+    type: webhook
+    url: "${MATTERMOST_WEBHOOK_URL}"
+    format: markdown
+    body_template: '{"text": {{ body | tojson }}}'
+
+  discord:
     type: webhook
     url: "${DISCORD_WEBHOOK_URL}"
-    format: markdown
-    body_template: '{"content": {{ body | tojson }}}'
+    # format: plain (the default)
+    body_template: '{"content": {{ ("**" ~ title ~ "**\n" ~ body) | tojson }}}'
 
   mattermost-ops:
     type: mattermost
@@ -76,7 +82,7 @@ rules:
         fields: ["host", "usage", "mount"]
     notify:
       template: "disk_alert"
-      destinations: [discord-md, mattermost-ops, telegram-alerts, email-ops]
+      destinations: [mattermost-md, discord, mattermost-ops, telegram-alerts, email-ops]
 
   - name: "telegram_disk"
     query: '_stream:{app="node"}'
@@ -94,4 +100,4 @@ rules:
         fields: ["host"]
     notify:
       template: "markdown_alert"
-      destinations: [mattermost-ops, discord-md, email-ops]
+      destinations: [mattermost-ops, mattermost-md, discord, email-ops]

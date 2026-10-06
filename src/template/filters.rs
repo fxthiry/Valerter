@@ -6,9 +6,10 @@
 //! templates) and the validation environment wraps the same list, so a
 //! template accepted by `--validate` renders the same way in production.
 
-use crate::markdown;
-use minijinja::value::Rest;
+use crate::markdown::{self, MarkdownElement};
+use minijinja::value::{Kwargs, Object, Rest};
 use minijinja::{AutoEscape, Environment, Error, State, Value};
+use std::sync::Mutex;
 
 /// Name of the auto-escape mode of a Markdown body (`body_format: markdown`).
 pub const MARKDOWN_AUTO_ESCAPE: &str = "markdown";
@@ -27,6 +28,12 @@ const MD_ESCAPE_CHARS: &[char] = &[
 const MDV2_ESCAPE_CHARS: &[char] = &[
     '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\',
 ];
+
+/// Text of a value given to a Markdown filter (see [`value_text`]), its
+/// token characters neutralised ([`markdown::neutralise_tokens`]).
+fn element_text(value: &Value) -> String {
+    markdown::neutralise_tokens(&value_text(value))
+}
 
 /// Converts `value` to a string: `none` and an undefined value give an empty
 /// string, a number its usual form.
@@ -56,22 +63,35 @@ fn in_markdown(state: &State) -> bool {
     state.auto_escape() == AutoEscape::Custom(MARKDOWN_AUTO_ESCAPE)
 }
 
-/// Markdown produced by a filter: safe (inserted as is) in a Markdown body,
-/// an ordinary string elsewhere, escaped by the context (HTML in
+/// Name of the state temp holding the [`Slots`] of a Markdown body render.
+const SLOTS: &str = "valerter.markdown.slots";
+
+/// Elements written by the formatter of a Markdown body, in token order: a
+/// token's index is the element's position.
+#[derive(Debug, Default)]
+struct Slots(Mutex<Vec<MarkdownElement>>);
+
+impl Object for Slots {}
+
+/// Element produced by a Markdown filter: a [`MarkdownElement`] in a Markdown
+/// body (written as a token by the formatter), its Markdown source as an
+/// ordinary string elsewhere, escaped by the context (HTML in
 /// `email_body_html`).
-fn markdown_value(state: &State, markdown: String) -> Value {
+fn markdown_value(state: &State, element: MarkdownElement) -> Value {
     if in_markdown(state) {
-        Value::from_safe_string(markdown)
+        Value::from_object(element)
     } else {
-        Value::from(markdown)
+        Value::from(element.to_string())
     }
 }
 
 /// Sets up the auto-escaping of a Markdown body in `env`: every template is
 /// rendered in the [`MARKDOWN_AUTO_ESCAPE`] mode, where an inserted value has
 /// all its ASCII punctuation escaped ([`markdown::escape`]) unless it is safe
-/// (`| safe`, `| tojson`, `code`, `codeblock`, `link`). Other modes
-/// (`{% autoescape %}` blocks) keep minijinja's formatting.
+/// (`| safe`), and an element of `code`, `codeblock` or `md_link` is written
+/// as a token ([`markdown::TOKEN_OPEN`]) and kept in the slots of the render
+/// ([`render_markdown`]). Other modes (`{% autoescape %}` blocks) keep
+/// minijinja's formatting.
 ///
 /// The formatter is required: minijinja's default one fails on a custom
 /// mode, at render time as in a validation render.
@@ -81,12 +101,43 @@ pub fn install_markdown_escape(env: &mut Environment<'_>) {
         if !in_markdown(state) {
             return minijinja::escape_formatter(out, state, value);
         }
+        if let Some(element) = value.downcast_object_ref::<MarkdownElement>() {
+            let slots = state.get_or_set_temp_object(SLOTS, Slots::default);
+            let mut slots = slots.0.lock().expect("slots lock");
+            slots.push(element.clone());
+            let index = slots.len() - 1;
+            return write!(
+                out,
+                "{}{index}{}",
+                markdown::TOKEN_OPEN,
+                markdown::TOKEN_CLOSE
+            )
+            .map_err(Error::from);
+        }
         let written = match value.as_str() {
             Some(text) if value.is_safe() => out.write_str(text),
             _ => out.write_str(&markdown::escape(&value.to_string())),
         };
         written.map_err(Error::from)
     });
+}
+
+/// Renders the Markdown body `source` in `env` (set up by
+/// [`install_markdown_escape`]): the Markdown source, holding tokens, and the
+/// elements they stand for, to be passed to [`markdown::render`].
+pub fn render_markdown<S: serde::Serialize>(
+    env: &Environment<'_>,
+    source: &str,
+    ctx: S,
+) -> Result<(String, Vec<MarkdownElement>), Error> {
+    let rendered = env.template_from_str(source)?.render_captured(ctx)?;
+    let slots = rendered
+        .state()
+        .get_temp(SLOTS)
+        .and_then(|slots| slots.downcast_object::<Slots>())
+        .map(|slots| std::mem::take(&mut *slots.0.lock().expect("slots lock")))
+        .unwrap_or_default();
+    Ok((rendered.into_output(), slots))
 }
 
 /// `md_escape` filter: escapes a value for a CommonMark body rendered by
@@ -107,17 +158,24 @@ pub fn mdv2_escape(value: &Value) -> String {
 }
 
 /// `code` filter: a Markdown code span showing the value literally
-/// ([`markdown::code_span`]; a line break becomes a space).
+/// ([`markdown::code_span`]; a line break becomes a space). An empty value
+/// gives an empty string.
 pub fn code(state: &State, value: &Value) -> Value {
-    markdown_value(state, markdown::code_span(&value_text(value)))
+    let text = element_text(value).replace(['\r', '\n'], " ");
+    if text.is_empty() {
+        return Value::from("");
+    }
+    markdown_value(state, MarkdownElement::Code(text))
 }
 
 /// `codeblock(lang)` filter: a fenced code block showing the value literally,
 /// with a fence of backticks longer than any run in the value (at least
 /// three). The language keeps only `A-Z`, `a-z`, `0-9`, `_`, `+`, `-`, `.`
-/// and `#`. The block must stand alone on its line in the template.
+/// and `#`. In a Markdown body, the block may be written anywhere: where a
+/// block cannot stand (in an emphasis, a heading, a link), it becomes a code
+/// span.
 pub fn codeblock(state: &State, value: &Value, lang: Option<Value>) -> Value {
-    let text = value_text(value);
+    let text = element_text(value);
     let lang: String = lang
         .as_ref()
         .map(value_text)
@@ -125,32 +183,41 @@ pub fn codeblock(state: &State, value: &Value, lang: Option<Value>) -> Value {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '.' | '#'))
         .collect();
-    let fence = "`".repeat((markdown::longest_backtick_run(&text) + 1).max(3));
-    let newline = if text.is_empty() || text.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    markdown_value(state, format!("{fence}{lang}\n{text}{newline}{fence}"))
+    markdown_value(state, MarkdownElement::CodeBlock { lang, text })
 }
 
-/// `link(text, url)` function: a Markdown link whose text is escaped and
+/// `md_link(text, url)` function: a Markdown link whose text is literal and
 /// whose destination is [encoded](markdown::encode_destination); for a scheme
-/// other than `http`, `https` or `mailto`, the escaped text followed by the
-/// URL in parentheses, without a link.
-pub fn link(state: &State, text: &Value, url: &Value) -> Value {
-    let text = value_text(text);
-    let url = value_text(url);
-    let markdown = if markdown::allowed_scheme(&url) {
-        format!(
-            "[{}]({})",
-            markdown::escape(&text),
-            markdown::encode_destination(&url)
-        )
+/// other than `http`, `https` or `mailto`, the text followed by the URL in
+/// parentheses, without a link.
+pub fn md_link(state: &State, text: &Value, url: &Value) -> Value {
+    let text = element_text(text);
+    let url = element_text(url);
+    let element = if markdown::allowed_scheme(&url) {
+        MarkdownElement::Link {
+            text,
+            dest: markdown::encode_destination(&url),
+        }
     } else {
-        markdown::escape(&format!("{text} ({url})"))
+        MarkdownElement::Text(format!("{text} ({url})"))
     };
-    markdown_value(state, markdown)
+    markdown_value(state, element)
+}
+
+/// `tojson` filter: minijinja's, whose result is safe (HTML and JSON), except
+/// in a Markdown body, where it is an ordinary string, escaped as any value:
+/// only `| safe` inserts a value as is.
+pub fn tojson(
+    state: &State,
+    value: &Value,
+    indent: Option<Value>,
+    kwargs: Kwargs,
+) -> Result<Value, Error> {
+    let json = minijinja::filters::tojson(value, indent, kwargs)?;
+    if in_markdown(state) {
+        return Ok(Value::from(json.to_string()));
+    }
+    Ok(json)
 }
 
 /// The filters valerter adds to minijinja's built-ins, by name.
@@ -160,12 +227,13 @@ pub fn valerter_filters() -> Vec<(&'static str, Value)> {
         ("mdv2_escape", Value::from_function(mdv2_escape)),
         ("code", Value::from_function(code)),
         ("codeblock", Value::from_function(codeblock)),
+        ("tojson", Value::from_function(tojson)),
     ]
 }
 
 /// The global functions valerter adds to minijinja's, by name.
 pub fn valerter_functions() -> Vec<(&'static str, Value)> {
-    vec![("link", Value::from_function(link))]
+    vec![("md_link", Value::from_function(md_link))]
 }
 
 /// Registers [`valerter_filters`] and [`valerter_functions`] in `env`.
@@ -294,11 +362,83 @@ mod tests {
         assert_eq!(out, r"&lt;i\&gt;\_x\_");
     }
 
+    /// `source` rendered as a Markdown body, each token replaced by the
+    /// Markdown source of its element.
     fn render_markdown(source: &str, v: Value) -> String {
         let mut env = Environment::new();
         install_markdown_escape(&mut env);
         register(&mut env);
-        env.render_str(source, context! { v => v }).unwrap()
+        let (out, slots) = super::render_markdown(&env, source, context! { v => v }).unwrap();
+        slots.iter().enumerate().fold(out, |out, (index, element)| {
+            out.replace(
+                &format!("{}{index}{}", markdown::TOKEN_OPEN, markdown::TOKEN_CLOSE),
+                &element.to_string(),
+            )
+        })
+    }
+
+    /// `source` rendered as a Markdown body: the source, holding tokens, and
+    /// the elements.
+    fn render_markdown_raw(source: &str, v: Value) -> (String, Vec<MarkdownElement>) {
+        let mut env = Environment::new();
+        install_markdown_escape(&mut env);
+        register(&mut env);
+        super::render_markdown(&env, source, context! { v => v }).unwrap()
+    }
+
+    fn token(index: usize) -> String {
+        format!("{}{index}{}", markdown::TOKEN_OPEN, markdown::TOKEN_CLOSE)
+    }
+
+    #[test]
+    fn markdown_element_is_written_as_a_token() {
+        let (out, slots) = render_markdown_raw("a {{ v | code }} {{ v | codeblock }}", "x".into());
+        assert_eq!(out, format!("a {} {}", token(0), token(1)));
+        assert_eq!(
+            slots,
+            vec![
+                MarkdownElement::Code("x".to_string()),
+                MarkdownElement::CodeBlock {
+                    lang: String::new(),
+                    text: "x".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_element_converted_to_a_string_is_escaped() {
+        let (out, slots) = render_markdown_raw("{{ (v | code) ~ '!' }}", "x".into());
+        assert_eq!(out, r"\`x\`\!");
+        assert!(slots.is_empty());
+        let (out, _) = render_markdown_raw("{{ v | code | upper }}", "x".into());
+        assert_eq!(out, r"\`X\`");
+    }
+
+    #[test]
+    fn captures_and_macros_keep_their_tokens() {
+        let (out, slots) =
+            render_markdown_raw("{% set x %}{{ v | code }}{% endset %}{{ x }}", "a_b".into());
+        assert_eq!(out, token(0));
+        assert_eq!(slots, vec![MarkdownElement::Code("a_b".to_string())]);
+        let (out, slots) = render_markdown_raw(
+            "{% macro m(x) %}[{{ x | codeblock }}]{% endmacro %}{{ m(v) }}",
+            "a_b".into(),
+        );
+        assert_eq!(out, format!("[{}]", token(0)));
+        assert_eq!(slots.len(), 1);
+    }
+
+    #[test]
+    fn empty_code_is_an_empty_string() {
+        assert_eq!(
+            render_markdown_raw("{{ v | code }}", "".into()),
+            (String::new(), vec![])
+        );
+        assert_eq!(
+            render_markdown_raw("{% if v | code %}x{% endif %}", "".into()).0,
+            ""
+        );
     }
 
     #[test]
@@ -344,19 +484,22 @@ mod tests {
     }
 
     #[test]
-    fn link_destination_and_schemes() {
-        let link = |text: &str, url: &str| {
+    fn md_link_destination_and_schemes() {
+        let md_link = |text: &str, url: &str| {
             render_markdown(
-                "{{ link(v[0], v[1]) }}",
+                "{{ md_link(v[0], v[1]) }}",
                 Value::from(vec![text.to_string(), url.to_string()]),
             )
         };
-        assert_eq!(link("a_b", "https://h/p?q=1"), r"[a\_b](https://h/p?q=1)");
-        assert_eq!(link("t", "HTTPS://h"), "[t](HTTPS://h)");
-        assert_eq!(link("t", "mailto:a@b.c"), "[t](mailto:a@b.c)");
-        assert_eq!(link("t", "https://h/a b"), "[t](https://h/a%20b)");
-        assert_eq!(link("t", "ftp://h"), r"t \(ftp\:\/\/h\)");
-        assert_eq!(link("t", "/relative"), r"t \(\/relative\)");
+        assert_eq!(
+            md_link("a_b", "https://h/p?q=1"),
+            r"[a\_b](https://h/p?q=1)"
+        );
+        assert_eq!(md_link("t", "HTTPS://h"), "[t](HTTPS://h)");
+        assert_eq!(md_link("t", "mailto:a@b.c"), "[t](mailto:a@b.c)");
+        assert_eq!(md_link("t", "https://h/a b"), "[t](https://h/a%20b)");
+        assert_eq!(md_link("t", "ftp://h"), r"t \(ftp\:\/\/h\)");
+        assert_eq!(md_link("t", "/relative"), r"t \(\/relative\)");
     }
 
     #[test]
@@ -366,7 +509,7 @@ mod tests {
         register(&mut env);
         let out = env
             .render_str(
-                "{{ v | code }} {{ v | codeblock }} {{ link(v, 'https://h') }}",
+                "{{ v | code }} {{ v | codeblock }} {{ md_link(v, 'https://h') }}",
                 context! { v => "<b>" },
             )
             .unwrap();

@@ -616,6 +616,10 @@ fn docs_markdown_examples_pass_validate() {
                 "DISCORD_WEBHOOK_URL",
                 "https://discord.example.com/api/webhooks/dummy",
             ),
+            (
+                "MATTERMOST_WEBHOOK_URL",
+                "https://mattermost.example.com/hooks/dummy",
+            ),
             ("TELEGRAM_BOT_TOKEN", "dummy_bot_token"),
         ],
     );
@@ -628,7 +632,7 @@ fn docs_markdown_examples_pass_validate() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Templates: 3"), "{stdout}");
-    assert!(stdout.contains("Notifiers: 4"), "{stdout}");
+    assert!(stdout.contains("Notifiers: 5"), "{stdout}");
     assert_no_unknown_variable_warning(&output);
 }
 
@@ -884,6 +888,10 @@ const DOC_EXAMPLE_ENV: &[(&str, &str)] = &[
         "DISCORD_WEBHOOK_URL",
         "https://discord.example.com/api/webhooks/dummy",
     ),
+    (
+        "MATTERMOST_WEBHOOK_URL",
+        "https://mattermost.example.com/hooks/dummy",
+    ),
     ("API_TOKEN", "dummy-token"),
     ("SMTP_USER", "dummy_smtp_user"),
     ("SMTP_PASSWORD", "dummy_smtp_pass"),
@@ -956,6 +964,27 @@ fn validate_email_markdown_template_without_email_body_html_exits_success() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(!stderr.contains("requires email_body_html"), "{stderr}");
+}
+
+// Test: the Markdown filters pass --validate wherever they are written:
+// md_link with an urlencoded query, codeblock after a list marker and in a
+// quote, tojson in a Markdown body, urlencode in a notifier template
+#[test]
+fn validate_markdown_filters_exits_success() {
+    let output = run_validate("config_markdown_filters.yaml", &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Configuration is valid"),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_no_unknown_variable_warning(&output);
 }
 
 // Test: --validate rejects a format the notifier type does not accept

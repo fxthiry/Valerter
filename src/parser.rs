@@ -264,6 +264,12 @@ impl RuleParser {
     }
 }
 
+/// Maximum number of segments of a dotted key that is unflattened. A longer
+/// key stays flat: unflattening, converting and dropping the nested objects
+/// are recursive, and a key of thousands of segments (a few dozen kilobytes
+/// of a log line) would overflow the stack.
+pub(crate) const MAX_DOTTED_SEGMENTS: usize = 32;
+
 /// Expand flat dotted keys (e.g. `"a.b.c": "x"`) into nested objects, additively.
 ///
 /// VictoriaLogs emits fields like `{"nginx.http.request_id": "x"}` as literal flat
@@ -275,6 +281,8 @@ impl RuleParser {
 /// - Nested objects are added; deep-merged with any pre-existing nested structure.
 /// - On collision (top-level scalar already exists for the first segment), the
 ///   scalar wins, the dotted key is left untouched, and a `warn!` is emitted.
+/// - A key of more than [`MAX_DOTTED_SEGMENTS`] segments is left flat and a
+///   `warn!` is emitted (key truncated to 128 bytes).
 /// - Non-objects pass through unchanged.
 pub(crate) fn unflatten_dotted_keys(value: &Value) -> Value {
     let Some(map) = value.as_object() else {
@@ -288,6 +296,14 @@ pub(crate) fn unflatten_dotted_keys(value: &Value) -> Value {
             continue;
         }
         let segments: Vec<&str> = key.split('.').collect();
+        if segments.len() > MAX_DOTTED_SEGMENTS {
+            tracing::warn!(
+                conflicting_key = %truncate_for_log(key, 128),
+                segments = segments.len(),
+                "skipping dotted-key expansion: too many segments"
+            );
+            continue;
+        }
         let head = segments[0];
 
         match out.get(head) {
@@ -306,6 +322,15 @@ pub(crate) fn unflatten_dotted_keys(value: &Value) -> Value {
     }
 
     Value::Object(out)
+}
+
+/// The first `max` bytes of `text`, cut at a character boundary.
+fn truncate_for_log(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn insert_nested(out: &mut Map<String, Value>, segments: &[&str], leaf: Value) {
@@ -339,22 +364,63 @@ mod tests {
     // unflatten_dotted_keys tests (issue #25)
     // ============================================================
 
+    /// Runs `f` on a thread with the 2 MiB stack of a Tokio worker: a stack
+    /// overflow aborts the test binary, a panic fails the test.
+    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn a thread")
+            .join()
+            .expect("unflattening on a 2 MiB stack");
+    }
+
+    /// A dotted key of `n` segments `a`.
+    fn dotted_key(n: usize) -> String {
+        vec!["a"; n].join(".")
+    }
+
     #[test]
-    fn unflatten_basic_single_dotted_key() {
-        let input = serde_json::json!({"nginx.http.request_id": "x"});
-        let out = unflatten_dotted_keys(&input);
-        let obj = out.as_object().unwrap();
-        // Original flat key preserved (additive)
-        assert_eq!(obj.get("nginx.http.request_id").unwrap(), "x");
-        // Nested structure added
+    fn unflatten_huge_dotted_key_stays_flat() {
+        on_small_stack(|| {
+            let key = dotted_key(20_000);
+            let mut map = Map::new();
+            map.insert(key.clone(), serde_json::json!(1));
+            let input = Value::Object(map);
+
+            let out = unflatten_dotted_keys(&input);
+            assert_eq!(out, input, "the key stays flat, no `a` object");
+
+            let log = crate::notify::AlertPayload::log_from_fields(&input);
+            assert_eq!(log.len(), Some(1));
+            assert_eq!(
+                log.get_item(&minijinja::Value::from(key)).unwrap(),
+                minijinja::Value::from(1)
+            );
+            assert!(log.get_attr("a").unwrap().is_undefined());
+        });
+    }
+
+    #[test]
+    fn unflatten_bounds_the_number_of_segments() {
+        let path = |n: usize| -> Value {
+            let mut map = Map::new();
+            map.insert(dotted_key(n), serde_json::json!(1));
+            unflatten_dotted_keys(&Value::Object(map))
+        };
+
+        let out = path(MAX_DOTTED_SEGMENTS);
+        let mut nested = &out["a"];
+        for _ in 1..MAX_DOTTED_SEGMENTS {
+            nested = &nested["a"];
+        }
+        assert_eq!(nested, &serde_json::json!(1), "32 segments are unflattened");
+
+        let out = path(MAX_DOTTED_SEGMENTS + 1);
+        assert!(out.get("a").is_none(), "33 segments stay flat: {out}");
         assert_eq!(
-            obj.get("nginx")
-                .unwrap()
-                .get("http")
-                .unwrap()
-                .get("request_id")
-                .unwrap(),
-            "x"
+            out[dotted_key(MAX_DOTTED_SEGMENTS + 1)],
+            serde_json::json!(1)
         );
     }
 

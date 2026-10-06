@@ -130,8 +130,8 @@ fn is_value_independent(kind: ErrorKind) -> bool {
     )
 }
 
-/// The built-in filters of minijinja 2.24 with the `builtins` and `json`
-/// features (keep in sync with `build_builtin_filters` in minijinja's
+/// The built-in filters of minijinja 2.24 with the `builtins`, `json` and
+/// `urlencode` features (keep in sync with `build_builtin_filters` in minijinja's
 /// `defaults.rs`; `builtin_filter_wrappers_still_report_unknown_filters`
 /// guards the list). Wrapped in the validation environment together with
 /// valerter's own filters ([`crate::template::filters::valerter_filters`]),
@@ -187,6 +187,7 @@ fn builtin_filters() -> Vec<(&'static str, Value)> {
         ("pprint", Value::from_function(f::pprint)),
         ("format", Value::from_function(f::format)),
         ("tojson", Value::from_function(f::tojson)),
+        ("urlencode", Value::from_function(f::urlencode)),
     ]
 }
 
@@ -762,6 +763,32 @@ mod tests {
         }
     }
 
+    /// The guard above iterates the lists: these entries must stay in them,
+    /// or the test render would refuse filters that production knows.
+    #[test]
+    fn wrapped_lists_hold_urlencode_tojson_and_md_link() {
+        let filters: Vec<_> = builtin_filters()
+            .into_iter()
+            .chain(crate::template::filters::valerter_filters())
+            .map(|(name, _)| name)
+            .collect();
+        assert!(filters.contains(&"urlencode"), "{filters:?}");
+        assert!(filters.contains(&"tojson"), "{filters:?}");
+        let functions: Vec<_> = crate::template::filters::valerter_functions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(functions, ["md_link"]);
+        for validate in [validate_template_render, validate_markdown_template_render] {
+            assert_eq!(
+                validate("{{ x | urlencode }} {{ x | tojson }} {{ md_link(x, y) }}"),
+                Ok(())
+            );
+            let err = validate("{{ host | urlencode }} {{ host | nosuch }}").unwrap_err();
+            assert!(err.contains("nosuch"), "{err}");
+        }
+    }
+
     // ============================================================
     // Markdown bodies (markdown-body-format)
     // ============================================================
@@ -777,7 +804,8 @@ mod tests {
 
     #[test]
     fn markdown_render_accepts_markdown_filters() {
-        let source = "{{ _msg | codeblock('json') }} {{ host | code }} {{ link(host, url) }} \
+        let source = "{{ _msg | codeblock('json') }} {{ host | code }} \
+            {{ md_link(host, url ~ (host | urlencode)) }} \
             {{ x | safe }} {{ x | tojson }} {{ x | e }} {{ x | md_escape }} \
             {% autoescape false %}{{ x }}{% endautoescape %}";
         assert_eq!(validate_markdown_template_render(source), Ok(()));
@@ -791,10 +819,10 @@ mod tests {
     }
 
     #[test]
-    fn notifier_template_reports_unknown_filter_after_link() {
+    fn notifier_template_reports_unknown_filter_after_md_link() {
         let err = validate_notifier_template(
             "body_template",
-            "{{ link(log.a, log.b) }} {{ log.c | nosuch }}",
+            "{{ md_link(log.a, log.b) }} {{ log.c | nosuch }}",
         )
         .unwrap_err();
         assert!(err.contains("body_template render"), "{err}");

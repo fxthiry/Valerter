@@ -16,7 +16,7 @@ templates:
     body: |
       **{{ host }}** reported an error
       {{ _msg | codeblock }}
-      {{ link("Logs", "https://vl.example.com/select?q=host:" ~ host) }}
+      {{ md_link("Logs", "https://vl.example.com/select?q=" ~ ("host:" ~ host) | urlencode) }}
     body_format: markdown
 
 notifiers:

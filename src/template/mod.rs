@@ -29,6 +29,7 @@ pub mod filters;
 
 use crate::config::{BodyFormat, CompiledTemplate, OutputFormat};
 use crate::error::TemplateError;
+use crate::markdown::MarkdownElement;
 use minijinja::value::merge_maps;
 use minijinja::{Environment, UndefinedBehavior, context};
 use serde::Serialize;
@@ -53,6 +54,10 @@ pub struct RenderedMessage {
     pub accent_color: Option<String>,
     /// Format of `body`.
     pub body_format: BodyFormat,
+    /// Elements of `code`, `codeblock` and `md_link` standing for the tokens
+    /// of a Markdown `body` (empty for a `text` body and the fallback
+    /// message).
+    pub slots: Arc<[MarkdownElement]>,
     /// Renderings of a Markdown `body`, computed on first use.
     pub renders: RenderCache,
 }
@@ -113,7 +118,7 @@ impl RenderedMessage {
                 text: self
                     .renders
                     .slot(format)
-                    .get_or_init(|| crate::markdown::render(&self.body, format)),
+                    .get_or_init(|| crate::markdown::render(&self.body, &self.slots, format)),
                 safe: format.is_safe(),
             },
         }
@@ -128,6 +133,7 @@ impl PartialEq for RenderedMessage {
             && self.email_body_html == other.email_body_html
             && self.accent_color == other.accent_color
             && self.body_format == other.body_format
+            && self.slots == other.slots
     }
 }
 
@@ -243,9 +249,12 @@ impl TemplateEngine {
         // (layer 2) contexts.
         let ctx = layer1_context(fields, rule_name, vl_source);
         let title = self.render_string(&template.title, &ctx)?;
-        let body = match template.body_format {
-            BodyFormat::Text => self.render_string(&template.body, &ctx)?,
-            BodyFormat::Markdown => render_with(&self.md_env, &template.body, &ctx)?,
+        let (body, slots) = match template.body_format {
+            BodyFormat::Text => (self.render_string(&template.body, &ctx)?, Vec::new()),
+            BodyFormat::Markdown => filters::render_markdown(&self.md_env, &template.body, &ctx)
+                .map_err(|e| TemplateError::RenderFailed {
+                    message: e.to_string(),
+                })?,
         };
 
         // Render email_body_html with HTML auto-escape if present
@@ -269,6 +278,7 @@ impl TemplateEngine {
             email_body_html,
             accent_color: template.accent_color.clone(),
             body_format: template.body_format,
+            slots: slots.into(),
             renders: RenderCache::default(),
         })
     }
@@ -348,6 +358,7 @@ impl TemplateEngine {
                     email_body_html: None,
                     accent_color: Some("#ff0000".to_string()), // Red for error
                     body_format: BodyFormat::Text,
+                    slots: Arc::default(),
                     renders: RenderCache::default(),
                 }
             }
@@ -1239,9 +1250,10 @@ mod tests {
             markdown_body("{{ summary | safe }}", json!({"summary": "**OK**"})),
             "**OK**"
         );
+        // `| tojson` is escaped as any value: `| safe` is the only opt-out.
         assert_eq!(
             markdown_body("{{ v | tojson }}", json!({"v": "a_b"})),
-            r#""a_b""#
+            r#"\"a\_b\""#
         );
         // `| e` escapes for the current context: Markdown, not HTML.
         assert_eq!(
@@ -1299,26 +1311,258 @@ mod tests {
         }
     }
 
+    /// The message of a Markdown body, its renderings in the order of
+    /// [`OutputFormat::ALL`].
+    fn markdown_renders(body: &str, fields: serde_json::Value) -> (RenderedMessage, [String; 4]) {
+        let msg = markdown_engine("t", body, None)
+            .render("md", &fields, "r", "vl")
+            .unwrap();
+        let renders = OutputFormat::ALL.map(|format| msg.body_for(format).text.to_string());
+        (msg, renders)
+    }
+
     #[test]
-    fn markdown_filters_and_link_function() {
+    fn markdown_filters_and_md_link_function() {
+        // Each element is a token of the source, kept in the slots.
+        let (msg, [plain, md, html, _]) = markdown_renders("{{ v | code }}", json!({"v": "a`b"}));
+        assert_eq!(msg.body, "\u{E000}0\u{E001}");
+        assert_eq!(&*msg.slots, &[MarkdownElement::Code("a`b".to_string())]);
+        assert_eq!((plain.as_str(), md.as_str()), ("a`b", "``a`b``"));
+        assert_eq!(html, "<p><code>a`b</code></p>");
+
+        let (msg, [_, md, ..]) = markdown_renders("{{ v | codeblock('js;x') }}", json!({"v": "a"}));
         assert_eq!(
-            markdown_body("{{ v | code }}", json!({"v": "a`b"})),
-            "``a`b``"
+            &*msg.slots,
+            &[MarkdownElement::CodeBlock {
+                lang: "jsx".to_string(),
+                text: "a".to_string()
+            }]
+        );
+        assert_eq!(md, "```jsx\na\n```");
+
+        let (_, [_, md, ..]) = markdown_renders(
+            r#"{{ md_link("logs " ~ host, "https://vl.example.com/q?h=" ~ host) }}"#,
+            json!({"host": "web_01"}),
+        );
+        assert_eq!(md, r"[logs web\_01](https://vl.example.com/q?h=web_01)");
+
+        let (_, [plain, md, ..]) =
+            markdown_renders(r#"{{ md_link("x", "javascript:alert(1)") }}"#, json!({}));
+        assert_eq!(plain, "x (javascript:alert(1))");
+        assert_eq!(md, "x (javascript:alert(1))");
+    }
+
+    /// Asserts that no rendering holds markup coming from a value.
+    fn assert_no_markup(renders: &[String; 4]) {
+        let [_, md, html, tg] = renders;
+        for out in [html, tg] {
+            for forbidden in ["<h1", "href", "<strong>", "<b>"] {
+                assert!(!out.contains(forbidden), "{forbidden} in {out}");
+            }
+        }
+        // No active link, heading or emphasis in the `markdown` rendering,
+        // read back as Markdown.
+        let reparsed = crate::markdown::render(md, &[], OutputFormat::Html);
+        for forbidden in ["<h1", "href", "<strong>"] {
+            assert!(!reparsed.contains(forbidden), "{forbidden} in {md}");
+        }
+    }
+
+    #[test]
+    fn code_filter_scenarios() {
+        let (_, [plain, md, html, tg]) = markdown_renders("{{ v | code }}", json!({"v": "a`b"}));
+        assert_eq!(md, "``a`b``");
+        assert_eq!(plain, "a`b");
+        assert_eq!(html, "<p><code>a`b</code></p>");
+        assert_eq!(tg, "<code>a`b</code>");
+
+        let (_, [plain, md, html, tg]) = markdown_renders("{{ v | code }}", json!({"v": "**x**"}));
+        assert_eq!(plain, "**x**");
+        assert_eq!(md, "`**x**`");
+        assert_eq!(html, "<p><code>**x**</code></p>");
+        assert_eq!(tg, "<code>**x**</code>");
+
+        let (_, renders) = markdown_renders(
+            "# Host {{ v | code }}",
+            json!({"v": "[a](https://evil.example)"}),
         );
         assert_eq!(
-            markdown_body("{{ v | codeblock('js;x') }}", json!({"v": "a"})),
-            "```jsx\na\n```"
+            renders[2],
+            "<h1>Host <code>[a](https://evil.example)</code></h1>"
+        );
+        assert_eq!(renders[0], "Host [a](https://evil.example)");
+        assert!(!renders.iter().any(|r| r.contains("href")), "{renders:?}");
+    }
+
+    #[test]
+    fn codeblock_filter_scenarios() {
+        let (_, [plain, md, html, tg]) = markdown_renders(
+            "Log:\n{{ _msg | codeblock('json') }}",
+            json!({"_msg": r#"{"a": "<b>"}"#}),
+        );
+        assert!(
+            html.contains(r#"<pre><code class="language-json">{&quot;a&quot;: &quot;&lt;b&gt;&quot;}</code></pre>"#),
+            "{html}"
+        );
+        assert_eq!(plain, "Log:\n\n{\"a\": \"<b>\"}");
+        assert_eq!(md, "Log:\n\n```json\n{\"a\": \"<b>\"}\n```");
+        assert!(tg.contains("<pre><code class=\"language-json\">"), "{tg}");
+
+        // A value holding a fence.
+        let (_, [plain, md, ..]) =
+            markdown_renders("{{ v | codeblock }}", json!({"v": "a\n```\nb"}));
+        assert_eq!(md, "````\na\n```\nb\n````");
+        assert_eq!(plain, "a\n```\nb");
+
+        // In a list item.
+        let v = "a\n# b\n[c](https://evil.example)";
+        let (_, renders) = markdown_renders("- x\n- {{ v | codeblock }}", json!({"v": v}));
+        assert!(
+            renders[2]
+                .contains("<li><pre><code>a\n# b\n[c](https://evil.example)</code></pre></li>"),
+            "{}",
+            renders[2]
+        );
+        assert_no_markup(&renders);
+
+        // In a quote.
+        let (_, renders) = markdown_renders("> {{ v | codeblock }}", json!({"v": "a\n<b>x</b>"}));
+        assert_eq!(
+            renders[3],
+            "<blockquote><pre>a\n&lt;b&gt;x&lt;/b&gt;</pre></blockquote>"
+        );
+        assert_no_markup(&renders);
+
+        // On an indented line (a code block of the template).
+        let (_, renders) = markdown_renders("    {{ v | codeblock }}", json!({"v": "a\n**b**"}));
+        assert_eq!(renders[0], "a\n**b**");
+        assert_no_markup(&renders);
+
+        // In the middle of a line: the paragraph is cut around the block.
+        let (_, renders) = markdown_renders("Log: {{ v | codeblock }} end", json!({"v": "a\nb"}));
+        assert_eq!(renders[0], "Log:\n\na\nb\n\nend");
+        assert_eq!(
+            renders[2],
+            "<p>Log:</p>\n<pre><code>a\nb</code></pre>\n<p>end</p>"
+        );
+    }
+
+    #[test]
+    fn markdown_filter_content_is_literal() {
+        let (_, renders) = markdown_renders(
+            "**{{ v | codeblock }}**",
+            json!({"v": "a\n[b](https://evil.example)"}),
         );
         assert_eq!(
-            markdown_body(
-                r#"{{ link("logs " ~ host, "https://vl.example.com/q?h=" ~ host) }}"#,
-                json!({"host": "web_01"})
+            renders[2],
+            "<p><strong><code>a [b](https://evil.example)</code></strong></p>"
+        );
+        assert_eq!(renders[3], "<b>a [b](https://evil.example)</b>");
+        assert!(!renders.iter().any(|r| r.contains("href")), "{renders:?}");
+
+        let (_, [plain, ..]) = markdown_renders("```\n{{ v | code }}\n```", json!({"v": "*x*"}));
+        assert_eq!(plain, "*x*");
+
+        let (_, [plain, md, html, _]) =
+            markdown_renders("{{ (v | code) ~ '!' }}", json!({"v": "x"}));
+        assert_eq!(plain, "`x`!");
+        assert_eq!(md, r"\`x\`!");
+        assert_eq!(html, "<p>`x`!</p>");
+    }
+
+    #[test]
+    fn value_imitating_a_markdown_filter() {
+        let (_, [plain, md, html, tg]) = markdown_renders(
+            "{{ v }} {{ w | code }}",
+            json!({"v": "\u{E000}0\u{E001}", "w": "x"}),
+        );
+        assert_eq!(plain, "\u{FFFD}0\u{FFFD} x");
+        assert_eq!(md, "\u{FFFD}0\u{FFFD} `x`");
+        assert_eq!(html, "<p>\u{FFFD}0\u{FFFD} <code>x</code></p>");
+        assert_eq!(tg, "\u{FFFD}0\u{FFFD} <code>x</code>");
+    }
+
+    #[test]
+    fn md_link_scenarios() {
+        let (_, renders) = markdown_renders(
+            r#"{{ md_link("logs " ~ host, "https://vl.example.com/select?q=host:" ~ host) }}"#,
+            json!({"host": "web_01"}),
+        );
+        assert!(
+            renders[2].contains(
+                r#"<a href="https://vl.example.com/select?q=host:web_01">logs web_01</a>"#
             ),
-            r"[logs web\_01](https://vl.example.com/q?h=web_01)"
+            "{}",
+            renders[2]
+        );
+        for render in markdown_renders(r#"{{ md_link("x", "javascript:alert(1)") }}"#, json!({})).1
+        {
+            assert!(
+                !render.contains("href") && !render.contains("]("),
+                "{render}"
+            );
+            assert!(render.contains("x (javascript:alert(1))"), "{render}");
+        }
+        // A field named `link` does not hide the function.
+        let msg = markdown_engine("t", "{{ md_link('x', 'https://a.example') }}", None)
+            .render_with_fallback("md", &json!({"link": "https://y.example"}), "r", "vl");
+        assert_eq!(msg.body_format, BodyFormat::Markdown, "{}", msg.body);
+        assert!(
+            msg.body_for(OutputFormat::Html)
+                .text
+                .contains(r#"<a href="https://a.example">x</a>"#)
+        );
+        // A link in a link: the inner one is text.
+        let (_, renders) = markdown_renders(
+            "[voir {{ md_link('x', 'https://a.example') }}](https://b.example)",
+            json!({}),
         );
         assert_eq!(
-            markdown_body(r#"{{ link("x", "javascript:alert(1)") }}"#, json!({})),
-            r"x \(javascript\:alert\(1\)\)"
+            renders[2],
+            r#"<p><a href="https://b.example">voir x (https://a.example)</a></p>"#
+        );
+    }
+
+    #[test]
+    fn urlencode_encodes_a_value_for_a_url() {
+        let mut templates = HashMap::new();
+        templates.insert("t".to_string(), make_template("t", "q={{ v | urlencode }}"));
+        let msg = TemplateEngine::new(templates)
+            .render("t", &json!({"v": "a&b c#d?e+f"}), "r", "vl")
+            .unwrap();
+        assert_eq!(msg.body, "q=a%26b%20c%23d%3Fe%2Bf");
+
+        let (_, renders) = markdown_renders(
+            r#"{{ md_link("logs", "https://vl.example.com/select?q=" ~ ("host:" ~ host) | urlencode) }}"#,
+            json!({"host": "a&b #1"}),
+        );
+        assert!(
+            renders[2].contains(r#"href="https://vl.example.com/select?q=host%3Aa%26b%20%231""#),
+            "{}",
+            renders[2]
+        );
+    }
+
+    #[test]
+    fn tojson_result_is_escaped_in_a_markdown_body() {
+        let v = "**bold** [phish](https://evil.example)";
+        let (_, renders) = markdown_renders("{{ v | tojson }}", json!({"v": v}));
+        for render in &renders {
+            for forbidden in ["<strong>", "<b>", "href"] {
+                assert!(!render.contains(forbidden), "{forbidden} in {render}");
+            }
+        }
+        assert_eq!(renders[0], format!("\"{v}\""));
+    }
+
+    #[test]
+    fn tojson_is_unchanged_in_email_body_html() {
+        let msg = markdown_engine("t", "x", Some("<pre>{{ v | tojson }}</pre>"))
+            .render("md", &json!({"v": "<a&b>"}), "r", "vl")
+            .unwrap();
+        assert_eq!(
+            msg.email_body_html.as_deref(),
+            Some(r#"<pre>"\u003ca\u0026b\u003e"</pre>"#)
         );
     }
 
@@ -1329,7 +1573,7 @@ mod tests {
             "t".to_string(),
             make_template(
                 "{{ v | code }}",
-                r#"{{ v | code }} {{ link(v, "https://h") }}"#,
+                r#"{{ v | code }} {{ md_link(v, "https://h") }}"#,
             ),
         );
         let msg = TemplateEngine::new(templates)
@@ -1421,7 +1665,7 @@ mod tests {
         let msg = render_test_message(
             "Disk {{ host }}",
             "**{{ host }}** is at {{ usage }}% on {{ mount | code }}\n\
-             {{ link(\"Logs in VictoriaLogs\", \"https://vl.example.com/select/vmui?query=host:\" ~ host) }}\n\
+             {{ md_link(\"Logs in VictoriaLogs\", \"https://vl.example.com/select/vmui?query=\" ~ (\"host:\" ~ host) | urlencode) }}\n\
              {{ _msg | codeblock }}\n",
             BodyFormat::Markdown,
             &json!({"host": "web_01", "usage": 97, "mount": "/var", "_msg": "disk <full> & read-only"}),
@@ -1429,13 +1673,13 @@ mod tests {
         assert_eq!(
             msg.body_for(OutputFormat::Markdown).text,
             "**web\\_01** is at 97% on `/var`\n\
-             [Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host:web_01)\n\n\
+             [Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host%3Aweb_01)\n\n\
              ```\ndisk <full> & read-only\n```"
         );
         assert_eq!(
             msg.body_for(OutputFormat::TelegramHtml).text,
             "<b>web_01</b> is at 97% on <code>/var</code>\n\
-             <a href=\"https://vl.example.com/select/vmui?query=host:web_01\">Logs in VictoriaLogs</a>\n\n\
+             <a href=\"https://vl.example.com/select/vmui?query=host%3Aweb_01\">Logs in VictoriaLogs</a>\n\n\
              <pre>disk &lt;full&gt; &amp; read-only</pre>"
         );
     }
