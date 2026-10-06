@@ -6,11 +6,11 @@ Cette capacité décrit le notifier générique `webhook`, qui envoie les alerte
 ## Requirements
 
 ### Requirement: Configuration du notifier webhook
-Le système SHALL accepter pour un notifier `type: webhook` la clé obligatoire `url` et les clés optionnelles `method` (défaut `POST`), `headers` (table nom → valeur, vide par défaut) et `body_template` (absent par défaut), et MUST rejeter la configuration si `url` est absente ou si une autre clé est présente.
+Le système SHALL accepter pour un notifier `type: webhook` la clé obligatoire `url` et les clés optionnelles `method` (défaut `POST`), `headers` (table nom → valeur, vide par défaut), `body_template` (absent par défaut) et `format` (`plain`, `markdown` ou `html`, défaut `plain`, voir `notification-dispatch`), et MUST rejeter la configuration si `url` est absente ou si une autre clé est présente.
 
 #### Scenario: Valeurs par défaut
 - **WHEN** un notifier déclare seulement `type: webhook` et `url`
-- **THEN** la méthode est `POST`, aucun en-tête personnalisé n'est envoyé et le corps par défaut est utilisé
+- **THEN** la méthode est `POST`, aucun en-tête personnalisé n'est envoyé, le corps par défaut est utilisé et le format de sortie est `plain`
 
 #### Scenario: url manquante
 - **WHEN** un notifier `type: webhook` ne déclare que `method: POST`
@@ -50,12 +50,16 @@ Le système SHALL envoyer à chaque requête les en-têtes de `headers` après s
 - **THEN** le démarrage échoue avec un message contenant `header` et `Authorization`
 
 ### Requirement: Corps JSON par défaut
-Le système SHALL, en l'absence de `body_template`, envoyer un objet JSON contenant exactement `alert_name` (nom du notifier), `rule_name`, `vl_source`, `title`, `body`, `timestamp` (instant d'envoi au format RFC 3339), `log_timestamp` et `log_timestamp_formatted`, et MUST n'y inclure ni `accent_color` ni couleur ni icône.
+Le système SHALL, en l'absence de `body_template`, envoyer un objet JSON contenant exactement `alert_name` (nom du notifier), `rule_name`, `vl_source`, `title`, `body` (corps transmis au notifier, voir « Corps transmis aux notifiers selon le format » de `notification-dispatch`), `timestamp` (instant d'envoi au format RFC 3339), `log_timestamp` et `log_timestamp_formatted`, et MUST n'y inclure ni `accent_color` ni couleur ni icône.
 
 #### Scenario: Contenu du corps par défaut
 - **WHEN** le notifier `webhook-1` envoie une alerte de la règle `cpu_alert` de titre `Test Alert`
 - **THEN** le JSON contient `"alert_name":"webhook-1"`, `"rule_name":"cpu_alert"`, `"title":"Test Alert"` et un champ `timestamp` non vide
 - **AND** il ne contient aucune clé `color`, `icon` ni `accent_color`
+
+#### Scenario: Corps Markdown en texte brut par défaut
+- **WHEN** un webhook sans `format` reçoit une alerte d'un template `markdown` dont le corps vaut `**{{ host }}** [logs](https://vl.example.com)` avec `host=web-01`
+- **THEN** le champ `body` du JSON vaut `web-01 logs (https://vl.example.com)`
 
 ### Requirement: Validation du body_template au démarrage
 Le système MUST vérifier la syntaxe Jinja du `body_template` à l'instanciation du notifier et refuser de démarrer en cas d'erreur avec `invalid notifier '<nom>': body_template: <détail>`, où `<détail>` est le message d'erreur du moteur de templates.
@@ -65,7 +69,7 @@ Le système MUST vérifier la syntaxe Jinja du `body_template` à l'instanciatio
 - **THEN** le démarrage échoue avec un message commençant par `invalid notifier '<nom>': body_template: ` suivi de l'erreur de syntaxe
 
 ### Requirement: Rendu du body_template
-Le système SHALL rendre le `body_template` (après résolution des variables d'environnement de sa source) avec les seules variables `title`, `body`, `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted` et `log` (champs de l'événement, voir `message-templating`), sans échappement automatique des valeurs, une variable inconnue étant rendue comme une chaîne vide, et MUST envoyer le résultat tel quel comme corps de la requête. Le filtre `tojson` MUST être disponible et produire une valeur JSON valide (chaîne entre guillemets, caractères spéciaux échappés), afin qu'un template comme `{"text": {{ body | tojson }}}` produise toujours du JSON valide.
+Le système SHALL rendre le `body_template` (après résolution des variables d'environnement de sa source) avec les seules variables `title`, `body` (corps transmis au notifier, voir « Corps transmis aux notifiers selon le format » de `notification-dispatch`), `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted` et `log` (champs de l'événement, voir `message-templating`), sans échappement automatique des valeurs, une variable inconnue étant rendue comme une chaîne vide, et MUST envoyer le résultat tel quel comme corps de la requête. Le filtre `tojson` MUST être disponible et produire une valeur JSON valide (chaîne entre guillemets, caractères spéciaux échappés), afin qu'un template comme `{"text": {{ body | tojson }}}` produise toujours du JSON valide.
 
 #### Scenario: Template personnalisé
 - **WHEN** `body_template` vaut `{"title": "{{ title }}", "rule": "{{ rule_name }}"}` pour la règle `test_rule` de titre `Test Alert`
@@ -86,6 +90,10 @@ Le système SHALL rendre le `body_template` (après résolution des variables d'
 #### Scenario: Pas de substitution d'environnement dans les champs du log
 - **WHEN** un champ de l'événement contient `${ROUTING_KEY}` et que le template insère ce champ via `log`
 - **THEN** le texte `${ROUTING_KEY}` est envoyé littéralement
+
+#### Scenario: Corps Markdown pour une cible Markdown
+- **WHEN** un webhook déclare `format: markdown` et `body_template: {"content": {{ body | tojson }}}`, et reçoit une alerte d'un template `markdown` dont le corps vaut `**{{ host }}**` avec `host=a_b`
+- **THEN** le corps envoyé est `{"content": "**a\\_b**"}`
 
 ### Requirement: Échec de rendu à l'envoi
 Le système MUST, si le rendu du `body_template` échoue au moment de l'envoi, abandonner l'alerte pour ce notifier sans émettre de requête ni de retry, avec l'erreur `failed to send notification: template render error: <détail>`, et MUST compter cet échec définitif en incrémentant une fois `valerter_notify_errors_total` et `valerter_alerts_failed_total` avec les labels `rule_name`, `vl_source`, `notifier_name` et `notifier_type="webhook"`.
