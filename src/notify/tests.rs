@@ -27,6 +27,7 @@ fn make_payload(rule_name: &str) -> AlertPayload {
             body: "Test body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
@@ -45,6 +46,7 @@ fn make_payload_with_destinations(rule_name: &str, destinations: Vec<String>) ->
             body: "Test body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: rule_name.to_string(),
         vl_source: "vlprod".to_string(),
@@ -69,6 +71,10 @@ impl Notifier for TestNotifier {
 
     fn notifier_type(&self) -> &str {
         &self.notifier_type
+    }
+
+    fn output_format(&self) -> crate::config::OutputFormat {
+        crate::config::OutputFormat::Plain
     }
 
     async fn send(&self, _alert: &AlertPayload) -> Result<(), NotifyError> {
@@ -243,6 +249,7 @@ fn registry_from_config_creates_mattermost_notifiers() {
                     channel: Some("infra-alerts".to_string()),
                     username: Some("valerter".to_string()),
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -254,6 +261,7 @@ fn registry_from_config_creates_mattermost_notifiers() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -293,6 +301,7 @@ fn registry_from_config_fails_on_undefined_env_var() {
                 channel: None,
                 username: None,
                 icon_url: None,
+                format: None,
             }),
         );
 
@@ -335,6 +344,7 @@ fn registry_from_config_collects_all_errors() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -344,6 +354,7 @@ fn registry_from_config_collects_all_errors() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -377,6 +388,7 @@ fn registry_from_config_reports_errors_in_notifier_name_order() {
                         channel: None,
                         username: None,
                         icon_url: None,
+                        format: None,
                     }),
                 );
             }
@@ -433,6 +445,7 @@ fn registry_from_config_creates_webhook_notifiers() {
                     h
                 },
                 body_template: Some(r#"{"alert": "{{ title }}"}"#.to_string()),
+                format: None,
             }),
         );
 
@@ -465,6 +478,7 @@ fn registry_from_config_webhook_with_defaults() {
             method: "POST".to_string(),
             headers: std::collections::HashMap::new(),
             body_template: None,
+            format: None,
         }),
     );
 
@@ -499,6 +513,7 @@ fn registry_from_config_webhook_fails_on_undefined_env_var() {
                     h
                 },
                 body_template: None,
+                format: None,
             }),
         );
 
@@ -540,6 +555,7 @@ fn registry_from_config_mixed_notifiers() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
             notifiers_config.insert(
@@ -556,6 +572,7 @@ fn registry_from_config_mixed_notifiers() {
                         h
                     },
                     body_template: None,
+                    format: None,
                 }),
             );
 
@@ -638,6 +655,10 @@ impl Notifier for RecordingTestNotifier {
 
     fn notifier_type(&self) -> &str {
         "test"
+    }
+
+    fn output_format(&self) -> crate::config::OutputFormat {
+        crate::config::OutputFormat::Plain
     }
 
     async fn send(&self, alert: &AlertPayload) -> Result<(), NotifyError> {
@@ -1160,6 +1181,7 @@ fn alert_payload_clone_works() {
             body: "Body".to_string(),
             email_body_html: None,
             accent_color: Some("#ff0000".to_string()),
+            ..Default::default()
         },
         rule_name: "my_rule".to_string(),
         vl_source: "vlprod".to_string(),
@@ -1233,6 +1255,7 @@ fn registry_from_config_creates_email_notifiers() {
             subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }),
     );
 
@@ -1276,6 +1299,7 @@ fn registry_from_config_email_with_auth() {
                     subject_template: "{{ title }}".to_string(),
                     body_template: None,
                     body_template_file: None,
+                    format: None,
                 }),
             );
 
@@ -1315,6 +1339,7 @@ fn registry_from_config_email_fails_on_undefined_env_var() {
                 subject_template: "{{ title }}".to_string(),
                 body_template: None,
                 body_template_file: None,
+                format: None,
             }),
         );
 
@@ -1354,6 +1379,7 @@ fn registry_from_config_email_fails_on_invalid_from_address() {
             subject_template: "{{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }),
     );
 
@@ -1390,6 +1416,7 @@ fn registry_from_config_all_three_notifier_types() {
                     channel: None,
                     username: None,
                     icon_url: None,
+                    format: None,
                 }),
             );
 
@@ -1401,6 +1428,7 @@ fn registry_from_config_all_three_notifier_types() {
                     method: "POST".to_string(),
                     headers: std::collections::HashMap::new(),
                     body_template: None,
+                    format: None,
                 }),
             );
 
@@ -1421,6 +1449,7 @@ fn registry_from_config_all_three_notifier_types() {
                     subject_template: "{{ title }}".to_string(),
                     body_template: None,
                     body_template_file: None,
+                    format: None,
                 }),
             );
 
@@ -1459,6 +1488,7 @@ fn registry_from_config_creates_telegram_notifier() {
             disable_notification: None,
             disable_web_page_preview: Some(true),
             body_template: None,
+            format: None,
         }),
     );
 
@@ -1493,6 +1523,7 @@ fn registry_from_config_propagates_telegram_validation_errors() {
             disable_notification: None,
             disable_web_page_preview: None,
             body_template: None,
+            format: None,
         }),
     );
 
@@ -1513,6 +1544,7 @@ fn mattermost_registry_errors(env_value: &str) -> String {
                 channel: None,
                 username: None,
                 icon_url: None,
+                format: None,
             }),
         );
         match NotifierRegistry::from_config(
@@ -1559,4 +1591,280 @@ fn registry_accepts_resolved_mattermost_url() {
         mattermost_registry_errors("https://mm.example.com/hooks/abc"),
         ""
     );
+}
+
+// ============================================================
+// Output format of notifiers (markdown-body-format)
+// ============================================================
+
+/// Builds the notifiers of `yaml` (a `notifiers:` map).
+fn registry_from_yaml(yaml: &str) -> Result<NotifierRegistry, Vec<String>> {
+    let config: crate::config::NotifiersConfig = serde_yaml::from_str(yaml).unwrap();
+    NotifierRegistry::from_config(&config, reqwest::Client::new(), &test_config_dir())
+        .map_err(|errors| errors.iter().map(ToString::to_string).collect())
+}
+
+const MATTERMOST: &str = "type: mattermost\n  webhook_url: https://mm.example.com/hooks/x";
+const TELEGRAM: &str = "type: telegram\n  bot_token: \"123:abc\"\n  chat_ids: [\"-100\"]";
+const EMAIL: &str = "type: email\n  smtp: {host: smtp.example.com, port: 587}\n  from: a@example.com\n  to: [b@example.com]\n  subject_template: \"{{ title }}\"";
+const WEBHOOK: &str = "type: webhook\n  url: https://hook.example.com/x";
+
+fn format_of(definition: &str, extra: &str) -> Result<crate::config::OutputFormat, Vec<String>> {
+    let yaml = format!("n:\n  {definition}\n  {extra}\n");
+    registry_from_yaml(&yaml).map(|registry| registry.get("n").unwrap().output_format())
+}
+
+#[test]
+fn notifier_output_format_defaults() {
+    use crate::config::OutputFormat::*;
+    assert_eq!(format_of(MATTERMOST, ""), Ok(Markdown));
+    assert_eq!(format_of(TELEGRAM, ""), Ok(TelegramHtml));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: HTML"), Ok(TelegramHtml));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: MarkdownV2"), Ok(Plain));
+    assert_eq!(format_of(TELEGRAM, "parse_mode: Markdown"), Ok(Plain));
+    assert_eq!(format_of(EMAIL, ""), Ok(Html));
+    assert_eq!(format_of(WEBHOOK, ""), Ok(Plain));
+}
+
+#[test]
+fn notifier_output_format_accepted_values() {
+    use crate::config::OutputFormat::*;
+    assert_eq!(format_of(MATTERMOST, "format: markdown"), Ok(Markdown));
+    assert_eq!(
+        format_of(TELEGRAM, "format: telegram_html"),
+        Ok(TelegramHtml)
+    );
+    assert_eq!(format_of(TELEGRAM, "format: plain"), Ok(Plain));
+    assert_eq!(
+        format_of(TELEGRAM, "format: plain\n  parse_mode: MarkdownV2"),
+        Ok(Plain)
+    );
+    assert_eq!(format_of(EMAIL, "format: html"), Ok(Html));
+    assert_eq!(format_of(WEBHOOK, "format: plain"), Ok(Plain));
+    assert_eq!(format_of(WEBHOOK, "format: markdown"), Ok(Markdown));
+    assert_eq!(format_of(WEBHOOK, "format: html"), Ok(Html));
+}
+
+#[test]
+fn notifier_output_format_refused_values() {
+    let refused = |definition: &str, format: &str| {
+        format_of(definition, &format!("format: {format}")).unwrap_err()
+    };
+    assert_eq!(
+        refused(EMAIL, "plain"),
+        [
+            "invalid notifier 'n': format 'plain' is not supported for email notifiers (expected html)"
+        ]
+    );
+    assert_eq!(
+        refused(MATTERMOST, "plain"),
+        [
+            "invalid notifier 'n': format 'plain' is not supported for mattermost notifiers (expected markdown)"
+        ]
+    );
+    assert_eq!(
+        refused(TELEGRAM, "markdown"),
+        [
+            "invalid notifier 'n': format 'markdown' is not supported for telegram notifiers (expected telegram_html, plain)"
+        ]
+    );
+    assert_eq!(
+        refused(WEBHOOK, "telegram_html"),
+        [
+            "invalid notifier 'n': format 'telegram_html' is not supported for webhook notifiers (expected plain, markdown, html)"
+        ]
+    );
+}
+
+#[test]
+fn telegram_html_format_requires_html_parse_mode() {
+    assert_eq!(
+        format_of(TELEGRAM, "format: telegram_html\n  parse_mode: MarkdownV2").unwrap_err(),
+        ["invalid notifier 'n': format 'telegram_html' requires parse_mode HTML"]
+    );
+}
+
+#[test]
+fn unknown_format_value_is_rejected_at_load() {
+    let yaml = format!("n:\n  {WEBHOOK}\n  format: md\n");
+    let err = serde_yaml::from_str::<crate::config::NotifiersConfig>(&yaml)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("format") || err.contains("md"), "{err}");
+}
+
+// ============================================================
+// Markdown body end to end (markdown-body-format): engine → queue →
+// Mattermost, Telegram and webhook notifiers (wiremock). Here rather than in
+// tests/: the Telegram Bot API endpoint is only redirectable from the crate.
+// ============================================================
+
+/// Bodies received for one alert of a rule whose template body is
+/// `**{{ host }}**` (`host=a_b`) in `body_format`, routed to a Mattermost, a
+/// Telegram and a default webhook notifier: (Mattermost attachment text,
+/// Telegram text, webhook JSON `body`).
+async fn markdown_end_to_end(body_format: crate::config::BodyFormat) -> (String, String, String) {
+    use crate::config::{
+        CompiledParser, CompiledRule, CompiledTemplate, DefaultsConfig, MetricsConfig,
+        NotifyConfig, RuntimeConfig, ThrottleConfig, VlSourceConfig,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let sink = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+        .mount(&sink)
+        .await;
+
+    let vl = MockServer::start().await;
+    let line = b"{\"_time\":\"2026-01-15T10:49:35Z\",\"_stream\":\"{}\",\"_msg\":\"x\",\"host\":\"a_b\"}\n";
+    Mock::given(method("GET"))
+        .and(path("/select/logsql/tail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(line.to_vec(), "application/x-ndjson"),
+        )
+        .up_to_n_times(1)
+        .mount(&vl)
+        .await;
+
+    let client = reqwest::Client::new();
+    let mut registry = NotifierRegistry::new();
+    registry
+        .register(Arc::new(MattermostNotifier::new(
+            "mm".to_string(),
+            SecretString::new(format!("{}/mm", sink.uri())),
+            client.clone(),
+        )))
+        .unwrap();
+    registry
+        .register(Arc::new(TelegramNotifier::new_for_tests(
+            "tg",
+            format!("{}/botTOKEN/sendMessage", sink.uri()),
+            vec!["-100".to_string()],
+            client.clone(),
+        )))
+        .unwrap();
+    let webhook_config = WebhookNotifierConfig {
+        url: SecretString::new(format!("{}/hook", sink.uri())),
+        method: "POST".to_string(),
+        headers: HashMap::new(),
+        body_template: None,
+        format: None,
+    };
+    registry
+        .register(Arc::new(
+            WebhookNotifier::from_config("hook", &webhook_config, client.clone()).unwrap(),
+        ))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let queue = NotificationQueue::new(10, &registry);
+    let mut worker = NotificationWorker::new(&queue, registry);
+
+    let config = RuntimeConfig {
+        victorialogs: BTreeMap::from([(
+            "vlprod".to_string(),
+            VlSourceConfig {
+                url: vl.uri(),
+                basic_auth: None,
+                headers: None,
+                tls: None,
+            },
+        )]),
+        defaults: DefaultsConfig {
+            throttle: ThrottleConfig {
+                key: None,
+                count: 5,
+                window: Duration::from_secs(60),
+            },
+            timestamp_timezone: "UTC".to_string(),
+            max_streams: crate::config::DEFAULT_MAX_STREAMS,
+        },
+        templates: HashMap::from([(
+            "tpl".to_string(),
+            CompiledTemplate {
+                title: "Alert".to_string(),
+                body: "**{{ host }}**".to_string(),
+                email_body_html: None,
+                accent_color: None,
+                body_format,
+            },
+        )]),
+        rules: vec![CompiledRule {
+            name: "md_rule".to_string(),
+            enabled: true,
+            query: "_stream:test".to_string(),
+            parser: CompiledParser {
+                regex: None,
+                json: None,
+            },
+            throttle: None,
+            notify: NotifyConfig {
+                template: "tpl".to_string(),
+                mattermost_channel: None,
+                destinations: vec!["mm".to_string(), "tg".to_string(), "hook".to_string()],
+            },
+            vl_sources: vec![],
+        }],
+        metrics: MetricsConfig::default(),
+        notifiers: None,
+        config_dir: std::path::PathBuf::from("."),
+    };
+    let engine = crate::RuleEngine::new(config, client, queue);
+
+    let cancel = CancellationToken::new();
+    let engine_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { engine.run(cancel).await }
+    });
+    let worker_handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+    let start = tokio::time::Instant::now();
+    while sink.received_requests().await.unwrap_or_default().len() < 3
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), engine_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+
+    let requests = sink.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "one request per notifier");
+    let body_of = |prefix: &str| -> serde_json::Value {
+        let request = requests
+            .iter()
+            .find(|r| r.url.path().starts_with(prefix))
+            .unwrap_or_else(|| panic!("no request to {prefix}"));
+        serde_json::from_slice(&request.body).unwrap()
+    };
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    (
+        text(&body_of("/mm")["attachments"][0]["text"]),
+        text(&body_of("/botTOKEN")["text"]),
+        text(&body_of("/hook")["body"]),
+    )
+}
+
+#[tokio::test]
+async fn markdown_rule_reaches_each_notifier_in_its_format() {
+    let (mattermost, telegram, webhook) =
+        markdown_end_to_end(crate::config::BodyFormat::Markdown).await;
+    assert_eq!(mattermost, r"**a\_b**");
+    assert_eq!(telegram, "<b>Alert</b>\n<b>a_b</b>");
+    assert_eq!(webhook, "a_b");
+}
+
+#[tokio::test]
+async fn text_rule_reaches_each_notifier_unchanged() {
+    let (mattermost, telegram, webhook) =
+        markdown_end_to_end(crate::config::BodyFormat::Text).await;
+    assert_eq!(mattermost, "**a_b**");
+    assert_eq!(telegram, "<b>Alert</b>\n**a_b**");
+    assert_eq!(webhook, "**a_b**");
 }

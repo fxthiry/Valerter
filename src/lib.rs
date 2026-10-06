@@ -6,6 +6,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub(crate) mod http_body;
+pub mod markdown;
 pub mod metrics;
 pub mod notify;
 pub mod parser;

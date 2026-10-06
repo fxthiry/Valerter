@@ -141,6 +141,7 @@ mod tests {
                 method: "POST".to_string(),
                 headers: Default::default(),
                 body_template: Some(r#"{"host": {{ host | tojson }}}"#.to_string()),
+                format: None,
             };
             crate::notify::WebhookNotifier::from_config("hook", &config, reqwest::Client::new())
                 .expect("a warning never fails the notifier");

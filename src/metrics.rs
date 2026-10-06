@@ -780,6 +780,7 @@ mod tests {
                 body: String::new(),
                 email_body_html: None,
                 accent_color: None,
+                ..Default::default()
             },
             rule_name: "re".to_string(),
             vl_source: "vlprod".to_string(),
@@ -825,6 +826,9 @@ mod tests {
         }
         fn notifier_type(&self) -> &str {
             self.1
+        }
+        fn output_format(&self) -> crate::config::OutputFormat {
+            crate::config::OutputFormat::Plain
         }
         async fn send(
             &self,

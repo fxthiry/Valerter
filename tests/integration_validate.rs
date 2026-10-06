@@ -605,6 +605,33 @@ fn docs_log_field_examples_pass_validate() {
     assert_no_unknown_variable_warning(&output);
 }
 
+// Test: the YAML examples of the Markdown bodies documentation (docs, config
+// example) pass --validate without an unknown-variable warning
+#[test]
+fn docs_markdown_examples_pass_validate() {
+    let output = run_validate(
+        "config_docs_markdown.yaml",
+        &[
+            (
+                "DISCORD_WEBHOOK_URL",
+                "https://discord.example.com/api/webhooks/dummy",
+            ),
+            ("TELEGRAM_BOT_TOKEN", "dummy_bot_token"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Templates: 3"), "{stdout}");
+    assert!(stdout.contains("Notifiers: 4"), "{stdout}");
+    assert_no_unknown_variable_warning(&output);
+}
+
 // Test: --validate redacts credentials and query strings of source URLs
 #[test]
 fn validate_redacts_source_url_secrets() {
@@ -907,5 +934,55 @@ fn validate_webhook_body_template_undefined_env_var_exits_failure() {
         !stderr.contains("event_action"),
         "stderr should not echo the template: {}",
         stderr
+    );
+}
+
+// ============================================================================
+// Markdown bodies (markdown-body-format)
+// ============================================================================
+
+// Test: a Markdown template needs no email_body_html for an email destination
+#[test]
+fn validate_email_markdown_template_without_email_body_html_exits_success() {
+    let output = run_validate("config_email_markdown_no_email_body_html.yaml", &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "valerter --validate should exit with code 0\nstderr: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Configuration is valid"),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!stderr.contains("requires email_body_html"), "{stderr}");
+}
+
+// Test: --validate rejects a format the notifier type does not accept
+#[test]
+fn validate_notifier_unsupported_format_exits_failure() {
+    let output = run_validate("config_notifier_unsupported_format.yaml", &[]);
+    let stderr = assert_preflight_failure(&output);
+    assert!(
+        stderr.contains("Notifier configuration error"),
+        "stderr should log a notifier configuration error: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "invalid notifier 'mail': format 'plain' is not supported for email notifiers \
+             (expected html)"
+        ),
+        "stderr should report the unsupported format: {stderr}"
+    );
+}
+
+// Test: --validate rejects telegram_html with a parse_mode other than HTML
+#[test]
+fn validate_telegram_html_format_with_markdownv2_exits_failure() {
+    let output = run_validate("config_telegram_html_format_markdownv2.yaml", &[]);
+    let stderr = assert_preflight_failure(&output);
+    assert!(
+        stderr.contains("invalid notifier 'tg': format 'telegram_html' requires parse_mode HTML"),
+        "stderr should report the format / parse_mode mismatch: {stderr}"
     );
 }

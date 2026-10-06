@@ -10,7 +10,7 @@
 //! - Testing: Uses `MockEmailTransport` for unit tests without SMTP server
 
 use crate::config::{
-    EmailNotifierConfig, TlsMode, resolve_body_template, resolve_env_vars,
+    EmailNotifierConfig, OutputFormat, TlsMode, resolve_body_template, resolve_env_vars,
     validate_notifier_template,
 };
 use crate::error::{ConfigError, NotifyError};
@@ -273,6 +273,15 @@ impl EmailNotifier {
             });
         }
 
+        // The message is a single `text/html` part: `html` is the only format.
+        OutputFormat::resolve(
+            config.format,
+            OutputFormat::Html,
+            &[OutputFormat::Html],
+            name,
+            "email",
+        )?;
+
         // 5. Validate the subject template (syntax, then render test), then
         // compile it once
         let subject_template =
@@ -446,12 +455,13 @@ impl EmailNotifier {
         Ok(builder.build())
     }
 
-    /// Render the subject template with alert context.
+    /// Render the subject template with alert context. A subject is text:
+    /// `body` is the `plain` rendering of a Markdown body.
     fn render_subject(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
         self.subject_template
             .render(context! {
                 title => &alert.message.title,
-                body => &alert.message.body,
+                body => alert.message.body_for(OutputFormat::Plain).text,
                 rule_name => &alert.rule_name,
                 vl_source => &alert.vl_source,
                 accent_color => &alert.message.accent_color,
@@ -464,26 +474,23 @@ impl EmailNotifier {
 
     /// Render the body template with alert context.
     ///
-    /// Uses `email_body_html` from the template engine (already HTML-escaped) if available,
-    /// otherwise falls back to `body`. The body is marked as "safe" (pre-escaped) so
-    /// the template doesn't need `| safe` filter - this prevents user errors if they
-    /// edit the email template and accidentally remove the filter. Every
-    /// other value, `log` fields included, is HTML-escaped automatically.
+    /// `body` is, by priority: `email_body_html` from the template engine
+    /// (already HTML-escaped), the `html` rendering of a Markdown body
+    /// (already escaped), or the text `body` (fallback message), escaped by
+    /// the template. The first two are marked "safe" so the template doesn't
+    /// need `| safe` filter - this prevents user errors if they edit the
+    /// email template and accidentally remove the filter. Every other value,
+    /// `log` fields included, is HTML-escaped automatically.
     fn render_body(&self, alert: &AlertPayload) -> Result<String, NotifyError> {
-        // Use email_body_html if available (already HTML-escaped), otherwise fall back to body
-        let body_content = alert
-            .message
-            .email_body_html
-            .as_ref()
-            .unwrap_or(&alert.message.body);
-
-        // Mark body as pre-escaped (safe) so template doesn't need | safe filter
-        let body_safe = minijinja::Value::from_safe_string(body_content.clone());
+        let body = match &alert.message.email_body_html {
+            Some(html) => minijinja::Value::from_safe_string(html.clone()),
+            None => alert.message.body_for(OutputFormat::Html).to_value(),
+        };
 
         self.body_template
             .render(context! {
                 title => &alert.message.title,
-                body => body_safe,
+                body => body,
                 rule_name => &alert.rule_name,
                 vl_source => &alert.vl_source,
                 accent_color => &alert.message.accent_color,
@@ -575,6 +582,10 @@ impl Notifier for EmailNotifier {
 
     fn notifier_type(&self) -> &str {
         "email"
+    }
+
+    fn output_format(&self) -> OutputFormat {
+        OutputFormat::Html
     }
 
     /// Send alert to all configured recipients.
@@ -822,6 +833,7 @@ mod tests {
             subject_template: "[{{ rule_name }}] {{ title }}".to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         }
     }
 
@@ -837,6 +849,7 @@ mod tests {
                 body: "Something happened".to_string(),
                 email_body_html: None,
                 accent_color: Some("#ff0000".to_string()),
+                ..Default::default()
             },
             rule_name: rule_name.to_string(),
             vl_source: "vlprod".to_string(),
@@ -1779,6 +1792,7 @@ Accent Color: {{ accent_color }}"#;
             subject_template: "{{ title }}".to_string(),
             body_template: Some("{% if unclosed".to_string()), // Invalid template
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("invalid-body", &config, &test_config_dir());
@@ -1816,6 +1830,7 @@ Accent Color: {{ accent_color }}"#;
             subject_template: "{{ title }}".to_string(),
             body_template: body_template.map(str::to_string),
             body_template_file: body_template_file.map(str::to_string),
+            format: None,
         }
     }
 
@@ -1945,6 +1960,7 @@ Accent Color: {{ accent_color }}"#;
             subject_template: "[TEST] {{ _msg | truncate(50) }}".to_string(), // Unknown filter
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("bad-subject", &config, &test_config_dir());
@@ -1987,6 +2003,7 @@ Accent Color: {{ accent_color }}"#;
                 .to_string(),
             body_template: None,
             body_template_file: None,
+            format: None,
         };
 
         let result = EmailNotifier::from_config("good-subject", &config, &test_config_dir());
@@ -2039,5 +2056,86 @@ Accent Color: {{ accent_color }}"#;
                 "unexpected labels in:\n{rendered}"
             );
         }
+    }
+
+    // ===================================================================
+    // Markdown bodies (markdown-body-format)
+    // ===================================================================
+
+    fn markdown_alert(body: &str, email_body_html: Option<&str>, host: &str) -> AlertPayload {
+        let mut message = crate::template::render_test_message(
+            "Disk {{ host }}",
+            body,
+            crate::config::BodyFormat::Markdown,
+            &serde_json::json!({"host": host}),
+        );
+        message.email_body_html = email_body_html.map(str::to_string);
+        AlertPayload {
+            message,
+            ..make_alert_payload("r")
+        }
+    }
+
+    #[test]
+    fn markdown_body_without_email_body_html_is_rendered_as_html() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let body = notifier
+            .render_body(&markdown_alert("**{{ host }}**", None, "<x>"))
+            .unwrap();
+        assert_eq!(body, "<div><p><strong>&lt;x&gt;</strong></p></div>");
+    }
+
+    #[test]
+    fn email_body_html_takes_priority_over_the_markdown_rendering() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let body = notifier
+            .render_body(&markdown_alert(
+                "**{{ host }}**",
+                Some("<p>custom</p>"),
+                "x",
+            ))
+            .unwrap();
+        assert_eq!(body, "<div><p>custom</p></div>");
+    }
+
+    #[test]
+    fn text_body_without_email_body_html_is_escaped() {
+        let notifier = notifier_with_templates("{{ title }}", Some("<div>{{ body }}</div>"));
+        let mut alert = make_alert_payload("r");
+        alert.message.body = "Template render failed: <x>".to_string();
+        let body = notifier.render_body(&alert).unwrap();
+        assert_eq!(body, "<div>Template render failed: &lt;x&gt;</div>");
+    }
+
+    #[test]
+    fn subject_gets_the_plain_rendering_of_a_markdown_body() {
+        let notifier = notifier_with_templates("{{ title }}: {{ body }}", Some("{{ body }}"));
+        let subject = notifier
+            .render_subject(&markdown_alert(
+                "**{{ host }}** [logs](https://vl.example.com)",
+                None,
+                "a_b",
+            ))
+            .unwrap();
+        assert_eq!(subject, "Disk a_b: a_b logs (https://vl.example.com)");
+    }
+
+    #[tokio::test]
+    async fn markdown_alert_is_sent_with_the_default_body_template() {
+        let mock = Arc::new(MockEmailTransport::new());
+        let notifier = make_notifier_with_mock(mock.clone());
+
+        notifier
+            .send(&markdown_alert("**{{ host }}**", None, "<x>"))
+            .await
+            .unwrap();
+
+        let sent = mock.sent_emails();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].body.contains("<p><strong>&lt;x&gt;</strong></p>"),
+            "{}",
+            sent[0].body
+        );
     }
 }

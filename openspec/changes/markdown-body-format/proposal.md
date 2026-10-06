@@ -15,7 +15,7 @@ Il dépend du change `expose-log-fields-to-notifier-templates` (filtres valerter
 - Pour une alerte `markdown`, le `body` vu par les notifiers (texte de l'attachment Mattermost, JSON par défaut du webhook, variable `body` des `body_template`) est le rendu dans le format du notifier ; les rendus `html` et `telegram_html` sont déjà échappés, si bien que le template Telegram par défaut (`{{ body|e }}`) fonctionne sans modification.
 - Email : priorité `email_body_html` > rendu `html` du corps Markdown > `body` texte échappé ; un template `markdown` n'a plus besoin d'`email_body_html` pour une destination email. Le `body` texte n'est plus inséré sans échappement dans le corps email (seul le message de repli était concerné).
 - Rendu d'essai de validation adapté aux corps Markdown et aux nouveaux filtres.
-- Documentation (`docs/configuration.md`, `docs/notifiers.md`), CHANGELOG `[2.1.0]` (Added) et MIGRATION « Upgrading to 2.1.0 » : aucune rupture, fonctionnalité opt-in.
+- Documentation (`docs/configuration.md`, `docs/notifiers.md`) et CHANGELOG `[2.1.0]` (Added, Fixed) ; MIGRATION inchangé : aucune rupture, fonctionnalité opt-in.
 
 ## Capabilities
 
@@ -37,6 +37,6 @@ Aucune.
 
 - Code : `src/config/types.rs` (`TemplateConfig.body_format`), `src/config/runtime.rs` (`CompiledTemplate`), `src/config/notifiers.rs` (clé `format` des quatre types), `src/config/validation.rs` et `src/config/types.rs` (rendu d'essai Markdown, garde-fou), `src/preflight.rs` (contrôle `email_body_html`), `src/template.rs` (environnement Markdown, `RenderedMessage`), nouveau module de rendu Markdown (`src/markdown/`), module de filtres (ajouts), `src/notify/{traits,mattermost,webhook,telegram,email}.rs`.
 - Dépendance : `pulldown-cmark = { version = "0.13.4", default-features = false }` (MIT, Rust pur, MSRV 1.71.1 ; compatible musl et cargo-deb).
-- Documentation : `docs/configuration.md`, `docs/notifiers.md`, `config/config.example.yaml`, `CHANGELOG.md`, `MIGRATION.md`.
+- Documentation : `docs/configuration.md`, `docs/notifiers.md`, `config/config.example.yaml`, `CHANGELOG.md`.
 - Compatibilité : opt-in ; une configuration sans `body_format` ni `format` produit des envois identiques à 2.1.0 sans ce change.
 - Hors périmètre (issue #24) : bascule du défaut vers `markdown` (envisagée en 3.0), L3 (champs natifs des canaux, troncature sur l'arbre, tableaux), L4 (nouveaux connecteurs, MarkdownV2 natif pour Telegram, multipart texte pour l'email).

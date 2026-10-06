@@ -30,6 +30,7 @@ fn engine_with(title_tpl: &str, body_tpl: &str) -> TemplateEngine {
             body: body_tpl.to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
     TemplateEngine::new(templates)

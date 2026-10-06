@@ -13,7 +13,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{error, info, warn};
 
-use crate::config::{NotifiersConfig, RuntimeConfig};
+use crate::config::{BodyFormat, NotifiersConfig, RuntimeConfig};
 use crate::error::ConfigError;
 use crate::notify::NotifierRegistry;
 
@@ -149,8 +149,9 @@ fn is_notifier_type(notifiers: &NotifiersConfig, name: &str, type_name: &str) ->
 /// Validate that templates used with email destinations have email_body_html.
 ///
 /// For each enabled rule, if any of its destinations is an email notifier,
-/// the template must have email_body_html defined. This is a fail-fast validation
-/// to prevent runtime errors.
+/// the template must have email_body_html defined, unless its body is
+/// Markdown (`body_format: markdown`): its `html` rendering is then the email
+/// body. This is a fail-fast validation to prevent runtime errors.
 fn validate_email_templates(
     config: &RuntimeConfig,
     notifiers: &NotifiersConfig,
@@ -180,6 +181,7 @@ fn validate_email_templates(
         // Check if template has email_body_html
         if let Some(template) = config.templates.get(template_name)
             && template.email_body_html.is_none()
+            && template.body_format == BodyFormat::Text
         {
             errors.push(format!(
                 "template '{}' requires email_body_html field when used with email destination{} {} (rule '{}')",
@@ -249,6 +251,10 @@ templates:
     title: "{{ title }}"
     body: "{{ body }}"
     email_body_html: "<p>{{ body }}</p>"
+  md:
+    title: "{{ title }}"
+    body: "**{{ body }}**"
+    body_format: markdown
 "#;
 
     const EMAIL_OK: &str = r#"
@@ -363,6 +369,17 @@ templates:
                 "template 'plain' requires email_body_html field when used with email destination 'email-ops' (rule 'r')"
             ]
         );
+    }
+
+    #[test]
+    fn markdown_template_without_html_passes_email_stage() {
+        let config = runtime_config(
+            &[EMAIL_OK, MATTERMOST_OK],
+            &[rule("r", true, "md", &["email-ops", "mm-ops"])],
+        );
+
+        assert_eq!(checks(&config).email_templates, Ok(()));
+        assert!(run_preflight(&config, build_http_client().unwrap()).is_ok());
     }
 
     #[test]

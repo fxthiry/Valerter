@@ -312,9 +312,14 @@ templates:
   default_alert:
     title: "{{ rule_name }}"                           # REQUIRED
     body: "{{ _msg }}"                                 # REQUIRED
-    email_body_html: "<p>{{ _msg }}</p>"               # REQUIRED for email destinations
+    email_body_html: "<p>{{ _msg }}</p>"               # REQUIRED for email destinations (text bodies)
     accent_color: "#ff0000"                            # Optional: hex color
+    body_format: text                                  # Optional: text (default) or markdown
 ```
+
+`body_format` describes the source of `body`: `text` (the default) sends it as
+rendered, `markdown` makes it a Markdown source rendered for each notifier (see
+[Markdown bodies](#markdown-bodies-body_format)).
 
 ### Available Variables
 
@@ -435,7 +440,109 @@ displayed literally instead of being read as Markdown:
 
 The result of `md_escape` and `mdv2_escape` is an ordinary string: in an
 HTML-escaped template (email body, `email_body_html`), it is still escaped as
-HTML afterwards.
+HTML afterwards. In the `body` of a `body_format: markdown` template, values are
+already escaped: `md_escape` there is the automatic escaping itself, applied
+once.
+
+The filters `code`, `codeblock` and the function `link` build Markdown from
+values; they are meant for [Markdown bodies](#markdown-bodies-body_format).
+
+### Markdown bodies (`body_format`)
+
+With `body_format: markdown`, the `body` of a rule template is written once in
+Markdown, and valerter renders it in the format of each notifier: Markdown for
+Mattermost, the HTML subset of the Bot API for Telegram, HTML for email, plain
+text for a webhook by default (see
+[Output format per notifier](notifiers.md#output-format-per-notifier)). The
+values of the log cannot become markup on any channel.
+
+```yaml
+templates:
+  disk_alert:
+    title: "Disk {{ host }}"
+    body_format: markdown
+    body: |
+      **{{ host }}** is at {{ usage }}% on {{ mount | code }}
+      {{ link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=host:" ~ host) }}
+      {{ _msg | codeblock }}
+```
+
+With `host=web_01`, `usage=97`, `mount=/var` and `_msg=disk <full> & read-only`,
+Mattermost receives:
+
+````
+**web\_01** is at 97% on `/var`
+[Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host:web_01)
+
+```
+disk <full> & read-only
+```
+````
+
+and Telegram (`parse_mode: HTML`) receives, as `body`, after the bold title of
+its default `body_template`:
+
+```
+<b>web_01</b> is at 97% on <code>/var</code>
+<a href="https://vl.example.com/select/vmui?query=host:web_01">Logs in VictoriaLogs</a>
+
+<pre>disk &lt;full&gt; &amp; read-only</pre>
+```
+
+`title` stays plain text (no escaping, no Markdown), and `email_body_html`, if
+present, is still rendered as HTML. A template without `body_format`, or with
+`body_format: text`, is rendered exactly as before.
+
+**Automatic escaping.** In a Markdown body, every value inserted with
+`{{ ... }}` is escaped: each ASCII punctuation character gets a backslash, so a
+value is always read as literal text (`a_b*c` stays `a_b*c`, never italics).
+The markup written in the template itself (`**...**`, `[...](...)`, lists...)
+is interpreted. To insert a value without escaping:
+
+- `{{ summary | safe }}`: the value is trusted Markdown (bold, links...);
+- `{{ value | tojson }}`: a JSON value, inserted as is;
+- `| e` escapes for the current context, which is Markdown here, not HTML (and
+  never twice): `{{ v | e }}` is the same as `{{ v }}`.
+
+**Filters and function.**
+
+| Name | Use | Result |
+|------|-----|--------|
+| `code` | `{{ host \| code }}` | A code span showing the value literally, whatever backticks it contains; a line break becomes a space. |
+| `codeblock(lang)` | `{{ _msg \| codeblock('json') }}` | A fenced code block showing the value literally; `lang` is optional and keeps only `A-Z a-z 0-9 _ + - . #`. Put it alone on its line. |
+| `link(text, url)` | `{{ link("Logs", vl_url) }}` | A link whose text is escaped; spaces, control characters, `<`, `>`, `(`, `)` and `\` of the URL are percent-encoded. A scheme other than `http`, `https` or `mailto` gives `text (url)`, without a link. |
+
+Outside a Markdown body, they return ordinary strings, escaped like any value
+(in `email_body_html`, `{{ x | code }}` gives an HTML-escaped `` `x` ``).
+
+**Recognised Markdown.** CommonMark plus `~~strikethrough~~`, limited to:
+paragraphs, line breaks, **bold**, *italics*, ~~strikethrough~~, code spans,
+code blocks, links, block quotes, lists, headings and thematic breaks. An image
+becomes a link to the image (its alternative text as link text).
+
+- A single line break is kept as a line break: alerts are line oriented.
+- Raw HTML in the source (`<b>`, `<br>`, `<div>`...) is shown as text, never
+  interpreted.
+- Tables are not recognised: their lines are shown as text.
+- Links are only emitted for the `http`, `https` and `mailto` schemes, in the
+  template as with `link`; `[x](javascript:...)` shows `x (javascript:...)`.
+
+**Pitfall: `{{ x }}` inside a fence or backticks.** A value written inside a
+code block or a code span of the template is escaped too, and code shows its
+content literally, backslashes included. With `_msg=disk <full> & read-only`:
+
+````jinja
+```
+{{ _msg }}
+```
+````
+
+shows `disk \<full\> \& read\-only`, and `` `{{ mount }}` `` shows `\/var`.
+Write `{{ _msg | codeblock }}` (alone on its line) and `{{ mount | code }}`
+instead.
+
+**Email.** A Markdown template needs no `email_body_html`: the HTML rendering of
+the body is the email body (`email_body_html` still wins when present).
 
 ### Template validation
 
@@ -459,6 +566,11 @@ in either pass:
   `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch
   or in a loop body (`{% for k, v in m | items %}{{ v | nosuch }}{% endfor %}`);
 - the `/` operator applied to a field path (see above).
+
+The `body` of a `body_format: markdown` template is test-rendered with the
+Markdown escaping active, as in production; `code`, `codeblock` and `link` are
+checked like the other valerter filters (an unknown filter after them is
+reported).
 
 In a notifier template (`body_template`, `subject_template`), a top-level
 variable that is not part of its context (see
@@ -496,7 +608,7 @@ Limits of the test render (these parts are not checked):
 
 ### email_body_html Requirement
 
-**Important:** Templates used with email destinations MUST include `email_body_html`. Valerter validates this at startup and in `--validate`, and fails if missing.
+**Important:** Templates used with email destinations MUST include `email_body_html`, unless their body is Markdown (`body_format: markdown`, whose HTML rendering is then the email body). Valerter validates this at startup and in `--validate`, and fails if missing.
 
 ## Rules
 

@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::{
-    NotifierConfig, NotifiersConfig, SecretString, resolve_env_vars, validate_resolved_url,
+    NotifierConfig, NotifiersConfig, OutputFormat, SecretString, resolve_env_vars,
+    validate_resolved_url,
 };
 use crate::error::ConfigError;
 
@@ -178,6 +179,14 @@ impl NotifierRegistry {
                     name: name.to_string(),
                     message: format!("webhook_url: {}", e),
                 })?;
+
+                OutputFormat::resolve(
+                    mm_config.format,
+                    OutputFormat::Markdown,
+                    &[OutputFormat::Markdown],
+                    name,
+                    "mattermost",
+                )?;
 
                 let notifier = MattermostNotifier::with_options(
                     name.to_string(),

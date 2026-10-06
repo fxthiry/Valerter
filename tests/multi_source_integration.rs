@@ -105,6 +105,7 @@ fn runtime(sources: BTreeMap<String, VlSourceConfig>, rules: Vec<CompiledRule>) 
             body: "source={{ vl_source }} msg={{ _msg }}".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
 
@@ -428,6 +429,7 @@ async fn template_engine_renders_vl_source_directly_without_http() {
             body: "b".to_string(),
             email_body_html: None,
             accent_color: None,
+            body_format: valerter::config::BodyFormat::Text,
         },
     );
     let engine = Arc::new(TemplateEngine::new(templates));
