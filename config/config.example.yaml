@@ -12,7 +12,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Option 1 - Direct values (simple deployments):
-#   Secure with: chmod 600 /etc/valerter/config.yaml
+#   The .deb package sets config.yaml to 640 root:valerter and /etc/valerter
+#   to 750 root:valerter; keep these permissions on a manual install.
 #   webhook_url: "https://mattermost.example.com/hooks/abc123"
 #
 # Option 2 - Environment variables (Kubernetes, orchestrators):
@@ -60,11 +61,11 @@
 # ┌────────────────────────────────────────────────────────────────────────────┐
 # │ VICTORIALOGS SOURCES                                             [REQUIRED]│
 # └────────────────────────────────────────────────────────────────────────────┘
-# `victorialogs` is a map of named sources (breaking change in v2.0.0).
-# Each rule can target a subset via `vl_sources: [name, ...]`, or omit the
-# field to fan out across every configured source.
+# `victorialogs` is a map of named sources. Each rule can target a subset via
+# `vl_sources: [name, ...]`, or omit the field to fan out across every
+# configured source.
 #
-# See docs/configuration.md for the v1.x → v2.0 migration snippet.
+# Upgrading a v1.x configuration: see MIGRATION.md.
 
 victorialogs:
   default:
@@ -113,6 +114,12 @@ defaults:
 # └────────────────────────────────────────────────────────────────────────────┘
 # Message templates using Jinja2 syntax (minijinja).
 #
+# The entries below are rule templates: `title`, `body`, `email_body_html`
+# (and a rule's `throttle.key`) see the event fields at top level
+# ({{ host }}). Notifier templates (`body_template`, `subject_template` of a
+# notifier) see them under `log` ({{ log.host }}).
+# See docs/templates.md#rule-templates-and-notifier-templates.
+#
 # A template entry has two sides:
 #
 # 1. Template variables AVAILABLE on the right-hand side of each line below.
@@ -122,23 +129,25 @@ defaults:
 #                                              streams configured server-side)
 #      <any parser-extracted field>           JSON field or named regex group
 #      rule_name                              name of the triggered rule
-#                                             (available in `title`, `body`,
-#                                              `email_body_html`, `throttle.key`,
-#                                              and in notifier-level
-#                                              `subject_template` /
-#                                              `body_template`)
+#      vl_source                              name of the VictoriaLogs source
+#                                             the event came from
+#                                             (rule_name and vl_source are
+#                                              available in rule templates,
+#                                              throttle.key and notifier
+#                                              templates)
 #      log_timestamp                          event timestamp (ISO8601)
-#                                             (notifier-level templates only)
 #      log_timestamp_formatted                human timestamp (defaults.timestamp_timezone)
-#                                             (notifier-level templates only)
+#                                             (both exist only in notifier
+#                                              templates, not here)
 #      log                                    every field of the event, in
-#                                             notifier-level templates only:
+#                                             notifier templates only:
 #                                             {{ log.host }}, {{ log["k8s.pod"] }}
 #                                             (in rule templates, fields are
 #                                             top-level: {{ host }})
 #
 #    Escaping filters (any template): `| e` (HTML), `| md_escape` (Markdown
 #    for Mattermost), `| mdv2_escape` (Telegram MarkdownV2).
+#    See docs/templates.md#valerter-filters-and-functions.
 #
 # 2. Template OUTPUT KEYS that you define below (left-hand side). These are
 #    the slots valerter fills and hands off to notifiers:
@@ -188,7 +197,7 @@ templates:
   # `md_link` build Markdown from values and keep them literal wherever they
   # are written; never write {{ value }} inside backticks or a ``` fence (use
   # them instead). Encode values put in a URL with | urlencode.
-  # See docs/configuration.md#markdown-bodies-body_format.
+  # See docs/templates.md#markdown-bodies-body_format.
   #
   # markdown_alert:
   #   title: "{{ rule_name }} on {{ host }}"
@@ -234,9 +243,10 @@ notifiers:
   # {
   #   "alert_name": "<notifier_name>",
   #   "rule_name": "...",
+  #   "vl_source": "<source name>",
   #   "title": "...",
   #   "body": "...",
-  #   "timestamp": "<ISO8601>",
+  #   "timestamp": "<ISO8601, time of sending>",
   #   "log_timestamp": "<ISO8601>",
   #   "log_timestamp_formatted": "DD/MM/YYYY HH:MM:SS TZ"
   # }
@@ -301,6 +311,11 @@ notifiers:
   #   tls      - Direct TLS (port 465)
   #
   # If no body template is specified, a default HTML template is used.
+  # In the body template, `body` is already HTML (email_body_html of the rule
+  # template, or the HTML rendering of a Markdown body): insert it alone, not
+  # in <p>. A rule template sent to email needs email_body_html unless it has
+  # body_format: markdown. See templates/README.md and
+  # docs/templates.md#email-body-html-requirement.
 
   # email-ops:
   #   type: email
@@ -318,7 +333,7 @@ notifiers:
   #   subject_template: "[{{ rule_name | upper }}] {{ title }}"
   #   body_template: |                     # Optional: inline HTML body
   #     <h2>{{ title }}</h2>
-  #     <p>{{ body }}</p>
+  #     {{ body }}
   #   # body_template_file: /etc/valerter/email-template.html  # Or: external file
 
   # ── Telegram (Bot API) ─────────────────────────────────────────────────────
@@ -342,7 +357,8 @@ notifiers:
   #   chat_ids:
   #     - "-100123456789"
   #     - "-100987654321"
-  #   parse_mode: HTML                       # Default: HTML (also: MarkdownV2)
+  #   parse_mode: HTML                       # HTML (default), MarkdownV2 or Markdown;
+  #                                          # case-insensitive
   #   disable_notification: false            # Default: not set (Telegram default = false)
   #   disable_web_page_preview: true         # Default: not set
   #   # Optional; default: "<b>{{ title|e }}</b>\n{{ body|e }}". Write the
@@ -374,10 +390,14 @@ notifiers:
 
 rules:
   # ── Example 1: JSON logs with per-host throttling ──────────────────────────
+  # The JSON log line is in _msg: `unpack_json` turns its keys into fields,
+  # then `filter` keeps the events with cpu above 90. When VictoriaLogs
+  # already stores the JSON keys as fields (JSON ingestion), filter them
+  # directly: '_stream:{host="server1"} AND cpu:>90'.
 
   - name: high_cpu_alert
     # enabled: false                       # Optional: disable rule (default: true)
-    query: '_stream:{host="server1"} AND _msg:"cpu" | json | cpu:>90'
+    query: '_stream:{host="server1"} | unpack_json | filter cpu:>90'
     parser:
       json:
         fields:

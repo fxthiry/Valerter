@@ -10,7 +10,7 @@
   <a href="https://github.com/fxthiry/valerter/actions/workflows/ci.yml"><img src="https://github.com/fxthiry/valerter/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/gh/fxthiry/valerter"><img src="https://codecov.io/gh/fxthiry/valerter/branch/main/graph/badge.svg" alt="codecov"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.85+-orange.svg" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/rust-1.88+-orange.svg" alt="Rust 1.88+">
 </p>
 
 ## What is Valerter?
@@ -51,7 +51,9 @@ See [Cisco Switches example](examples/cisco-switches/) for a complete implementa
 
 - **One Valerter for every VictoriaLogs you run.** Tail prod, staging, per-region or per-tenant backends from a single instance; pin rules to a specific source or fan out across all of them, with isolated reconnects, per-source metrics, and a `vl_source` label everywhere
 - **Multi-channel notifications** — Webhook (PagerDuty, Slack, Discord), Email SMTP, Mattermost, Telegram
-- **Full log context** — Alerts include the actual log line and extracted fields
+- **Write once, render per channel** — A Markdown alert body becomes Markdown for Mattermost, HTML for Telegram and email, plain text (or the `format` you choose) for webhooks, with every log value escaped
+- **Full log context** — Alerts include the actual log line and extracted fields, available to every notifier template under `log`
+- **Isolated delivery** — One queue per destination: a slow or failing channel never delays the others, and queued alerts are delivered on shutdown
 - **Intelligent throttling** — Avoid alert spam with per-key rate limiting
 - **Real-time alerting** — Less than 5 seconds from log event to notification
 - **Declarative rules** — YAML configuration with regex/JSON parsing
@@ -132,12 +134,16 @@ rules:
 
 - **[Getting Started](docs/getting-started.md)** — Installation and first setup
 - **[Configuration](docs/configuration.md)** — Full configuration reference
-- **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost, Telegram setup
+- **[Templates](docs/templates.md)** — Variables, filters, Markdown bodies
+- **[Notifiers](docs/notifiers.md)** — Webhook, Email, Mattermost, Telegram setup and delivery
+- **[Operations](docs/operations.md)** — Service, logs, exit codes, upgrades, containers
 - **[Metrics](docs/metrics.md)** — Prometheus metrics and alerting rules
 - **[Performance](docs/performance.md)** — Benchmarks and capacity planning
 - **[Architecture](docs/architecture.md)** — How Valerter works
 - **[Examples](examples/)** — Real-world configurations
 - **[Multi-source example](examples/multi-source/)** — Tail several VictoriaLogs backends from one Valerter instance
+- **[Migration guide](MIGRATION.md)** — Upgrade notes, newest first
+- **[Changelog](CHANGELOG.md)** — Release notes
 
 ## Contributing
 

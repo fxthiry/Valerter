@@ -367,13 +367,13 @@ pub(crate) fn slash_field_hint(source: &str) -> Option<String> {
             "field names containing '/' must use bracket notation on their parent object; \
              a top-level field like '{field}' has no parent and cannot be referenced directly: \
              rename it in the rule query, e.g. `| rename \"{field}\" as {renamed}`, then use `{{{{ {renamed} }}}}` \
-             (see docs/configuration.md#fields-with-special-characters)"
+             (see docs/templates.md#fields-with-special-characters)"
         ));
     };
     let rewrite = format!("{{{{ {prefix}[\"{leaf}/{right}\"] }}}}");
     Some(format!(
         "field names containing '/' must use bracket notation, e.g. `{rewrite}` \
-         (in Jinja, '/' is the division operator; see docs/configuration.md#fields-with-special-characters)"
+         (in Jinja, '/' is the division operator; see docs/templates.md#fields-with-special-characters)"
     ))
 }
 

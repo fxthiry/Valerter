@@ -1,5 +1,5 @@
 # Fixture: the YAML examples added by the "Markdown bodies" change, copied from
-# docs/configuration.md ("Markdown bodies", disk_alert), docs/notifiers.md
+# docs/templates.md ("Markdown bodies", disk_alert), docs/notifiers.md
 # (Webhook > Markdown alerts: choosing `format`, mattermost-md and discord; Telegram >
 # Formatting messages, disk_alert, renamed telegram_disk_alert here) and
 # config/config.example.yaml (markdown_alert, uncommented). Keep them in sync:
@@ -15,7 +15,7 @@ defaults:
     window: 60s
 
 templates:
-  # docs/configuration.md, Markdown bodies (`body_format`)
+  # docs/templates.md, Markdown bodies (`body_format`)
   disk_alert:
     title: "Disk {{ host }}"
     body_format: markdown

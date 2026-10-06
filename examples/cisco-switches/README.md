@@ -65,13 +65,13 @@ Two extraction methods work together:
 
 | Method | Purpose | Result |
 |--------|---------|--------|
-| **JSON** | Extract top-level fields from the log | `hostname`, `site`, `severity` become variables |
 | **Regex** | Extract data embedded in `_msg` | Named group `(?P<switch_name>...)` creates `switch_name` variable |
+| **JSON** | Pick fields of the VictoriaLogs event by path | `hostname`, `site`, `severity` become variables (a dotted path such as `data.host` gives `host`) |
 
 **Adapt it:**
 - If your logs are JSON, list the fields you need
 - If you need to parse unstructured text, use regex with named capture groups `(?P<name>pattern)`
-- You can use both together — JSON first, then regex on `_msg`
+- You can use both together — the regex is applied to `_msg` first, then the `json.fields` paths are read
 
 ### 3. Throttle — Prevent Alert Spam
 
@@ -114,7 +114,7 @@ Each rule must specify:
 
 ### 5. Template — Format the Notification
 
-Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) with all extracted variables:
+The rule template uses [Jinja2 syntax](https://jinja.palletsprojects.com/) with the event fields at top level (see the [template guide](../../docs/templates.md)):
 
 ```yaml
 templates:
@@ -130,11 +130,13 @@ templates:
 ```
 
 **Available variables:**
-- All JSON fields extracted by parser
+- All fields of the event, including those extracted by the `json.fields` paths
 - All regex named groups
 - `_msg` — original log message
 - `rule_name` — name of the triggered rule
-- `log_timestamp_formatted` — human-readable timestamp
+- `vl_source` — name of the VictoriaLogs source the event came from
+
+`log_timestamp_formatted` (human-readable timestamp) is not available in a rule template: it exists only in notifier templates, such as the `subject_template` of the email notifier, and in the Mattermost footer. See [Rule templates and notifier templates](../../docs/templates.md#rule-templates-and-notifier-templates).
 
 ## Result
 

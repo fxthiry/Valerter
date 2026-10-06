@@ -1,5 +1,5 @@
 // src/lib.rs
-//! Valerter - Real-time alerting from VictoriaLogs to Mattermost.
+//! Valerter - Real-time alerting from VictoriaLogs to Mattermost, Telegram, email or webhooks.
 
 pub mod cli;
 pub mod config;

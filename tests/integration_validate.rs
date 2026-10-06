@@ -966,6 +966,25 @@ fn validate_email_markdown_template_without_email_body_html_exits_success() {
     assert!(!stderr.contains("requires email_body_html"), "{stderr}");
 }
 
+// Test: text logs written to a pipe (journald, a file) carry no ANSI color
+// codes, even without NO_COLOR
+#[test]
+fn text_logs_to_a_pipe_have_no_ansi_codes() {
+    let output = Command::new(valerter_binary())
+        .args(["--validate", "-c"])
+        .arg(fixture_path("config_markdown_filters.yaml"))
+        .env_remove("NO_COLOR")
+        .env_remove("LOG_FORMAT")
+        .output()
+        .expect("Failed to run valerter");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Validating configuration"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "ANSI escape in logs: {stderr:?}"
+    );
+}
+
 // Test: the Markdown filters pass --validate wherever they are written:
 // md_link with an urlencoded query, codeblock after a list marker and in a
 // quote, tojson in a Markdown body, urlencode in a notifier template

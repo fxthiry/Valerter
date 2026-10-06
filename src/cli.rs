@@ -17,11 +17,13 @@ pub enum LogFormat {
     Json,
 }
 
-/// Real-time alerting from VictoriaLogs to Mattermost.
+/// Real-time alerting from VictoriaLogs to Mattermost, Telegram, email or webhooks.
 #[derive(Parser, Debug)]
 #[command(name = "valerter")]
 #[command(version)]
-#[command(about = "Real-time alerting from VictoriaLogs to Mattermost")]
+#[command(
+    about = "Real-time alerting from VictoriaLogs to Mattermost, Telegram, email or webhooks"
+)]
 pub struct Cli {
     /// Path to configuration file.
     #[arg(short = 'c', long = "config", default_value = DEFAULT_CONFIG_PATH)]

@@ -2,6 +2,13 @@
 
 Valerter supports multiple notification channels. Configure them in the `notifiers:` section of your config file.
 
+Every notifier receives the rendered `title` and `body` of the rule template
+(see [Templates](templates.md)). `email_body_html` is used by email notifiers
+only: to format a message for another channel, write the markup in its
+notifier template (`body_template`), or use a
+[Markdown body](templates.md#markdown-bodies-body_format), rendered for each
+channel.
+
 ## Overview
 
 | Type | Description | Best For |
@@ -14,7 +21,7 @@ Valerter supports multiple notification channels. Configure them in the `notifie
 ## Output format per notifier
 
 A rule template with
-[`body_format: markdown`](configuration.md#markdown-bodies-body_format) has a
+[`body_format: markdown`](templates.md#markdown-bodies-body_format) has a
 Markdown body that valerter renders in the format of each notifier. The
 optional `format` key of a notifier chooses that format; without it, the
 default of its type applies:
@@ -45,13 +52,6 @@ default of its type applies:
 ## Webhook (Generic HTTP)
 
 The most flexible notifier - works with any HTTP API.
-
-> **Note about `email_body_html`** — Webhook reads the outer template's `body`
-> output key (and `title`, `rule_name`, `log_timestamp`, `log_timestamp_formatted`)
-> inside its own `body_template`, along with the event fields under `log`. It
-> does **not** receive `email_body_html`; `email_body_html` is email-only. If
-> your HTTP target needs HTML, write the markup in the webhook `body_template`
-> and insert each value escaped (`{{ log.host | e }}`).
 
 ### Configuration
 
@@ -99,7 +99,7 @@ every field of the log line, secrets included: prefer an explicit selection.
 | Field | Required | Description |
 |-------|----------|-------------|
 | `url` | Yes | Endpoint URL (`http` or `https`, supports `${VAR}` substitution) |
-| `method` | No | HTTP method (default: `POST`) |
+| `method` | No | HTTP method: `POST` (default) or `PUT`, case-insensitive; any other value is refused (`unsupported method '<value>': only POST and PUT are supported`) |
 | `headers` | No | Custom headers (supports `${VAR}` substitution) |
 | `body_template` | No | Custom JSON body (Jinja2 template, supports `${VAR}` substitution in its source) |
 | `format` | No | Format of the body of a [Markdown alert](#output-format-per-notifier): `plain` (default), `markdown` or `html` |
@@ -198,7 +198,7 @@ by the synthetic source name.
 (`log["k8s.pod"]`) and expanded (`log.k8s.pod`), a missing field rendering empty
 (`null` with `tojson`). It does not contain `rule_name` nor `vl_source`, and
 exists only in notifier templates, not in the rule template (see
-[Rule templates and notifier templates](configuration.md#rule-templates-and-notifier-templates)).
+[Rule templates and notifier templates](templates.md#rule-templates-and-notifier-templates)).
 `{{ log | tojson }}` renders the whole event as a JSON object, dotted keys
 included twice. Values are inserted as is, never resolved as `${VAR}`.
 
@@ -401,24 +401,20 @@ With `host=<b>x</b>`, the cell contains `&lt;b&gt;x&lt;&#x2f;b&gt;`.
 | `starttls` | 587 | STARTTLS upgrade (recommended) |
 | `tls` | 465 | Direct TLS connection |
 
-### email_body_html Requirement
+### email_body_html requirement
 
-**Important:** When using email destinations, your message template MUST include `email_body_html`:
+A rule template sent to an email destination must define `email_body_html`
+(its HTML body), unless its body is Markdown (`body_format: markdown`), whose
+HTML rendering is then the email body. See
+[Email body HTML requirement](templates.md#email-body-html-requirement):
 
 ```yaml
 templates:
   my_template:
-    title: "{{ title }}"
-    body: "{{ body }}"
-    email_body_html: "<p>{{ body }}</p>"    # REQUIRED for email
+    title: "{{ rule_name }} on {{ host }}"
+    body: "{{ _msg }}"
+    email_body_html: "<p>{{ _msg }}</p>"    # REQUIRED for email (text body)
 ```
-
-Valerter validates this at startup and in `valerter --validate`, and fails if missing.
-
-A template with `body_format: markdown` does not need `email_body_html`: the HTML
-rendering of its body is the email body (see
-[Markdown bodies](configuration.md#markdown-bodies-body_format)).
-`email_body_html`, when present, still takes priority.
 
 ### Retries and SMTP errors
 
@@ -430,11 +426,11 @@ Each recipient is sent separately and retried independently, based on the SMTP r
 | `4xx` reply (transient: `421`, `451`, `454`...) | Yes |
 | No SMTP reply: network, TLS or timeout error | Yes |
 
-Retries use exponential backoff with a 1 s base and a 30 s cap, up to 3 attempts per recipient (see [Retry Behavior](#retry-behavior)).
+Retries use exponential backoff with a 1 s base and a 30 s cap, up to 3 attempts per recipient (see [Delivery](#delivery)).
 
 ### Custom Email Templates
 
-See [templates/README.md](../templates/README.md) for detailed template documentation.
+See [Email body templates](../templates/README.md) for writing a body template.
 
 **Priority:** `body_template_file` > `body_template` > default template
 
@@ -468,13 +464,12 @@ notifiers:
 
 Send alerts to Mattermost channels via incoming webhooks.
 
-> **Note about `email_body_html`** — Mattermost reads the outer template's `body`
-> output key, **not** `email_body_html`. `email_body_html` is email-only. Mattermost
-> renders Markdown in `body` (`**bold**`, `*italic*`, fenced code blocks,
-> lists, links); write your formatting there. With
-> [`body_format: markdown`](configuration.md#markdown-bodies-body_format), the
-> values inserted in `body` are escaped, so `web_01` is not read as italics:
-> the attachment text is `**web\_01**`.
+Mattermost has no notifier template: it posts the rendered `title` and `body`
+of the rule template as an attachment, and renders Markdown in `body`
+(`**bold**`, `*italic*`, fenced code blocks, lists, links). With
+[`body_format: markdown`](templates.md#markdown-bodies-body_format), the values
+inserted in `body` are escaped, so `web_01` is not read as italics: the
+attachment text is `**web\_01**`.
 
 ### Configuration
 
@@ -550,8 +545,8 @@ The `accent_color` from your template is used for the Mattermost attachment side
 ```yaml
 templates:
   critical_alert:
-    title: "{{ title }}"
-    body: "{{ body }}"
+    title: "{{ rule_name }} on {{ host }}"
+    body: "{{ _msg }}"
     accent_color: "#ff0000"    # Red sidebar in Mattermost
 ```
 
@@ -575,12 +570,10 @@ This helps operators quickly locate the original log entry in VictoriaLogs.
 
 Send alerts to one or more Telegram chats via the Bot API.
 
-> **Note about `email_body_html`** — Telegram reads the outer template's `body`
-> output key, **not** `email_body_html`. `email_body_html` is email-only. With
-> the default `body_template`, `body` is escaped (`{{ body|e }}`): HTML written
-> in the rule template's `body` is shown literally, tags included. For rich
-> formatting, write the markup in the Telegram `body_template` and escape each
-> inserted value (see [Formatting messages](#formatting-messages)).
+With the default `body_template`, `body` is escaped (`{{ body|e }}`): HTML
+written in the rule template's `body` is shown literally, tags included. For
+rich formatting, use a Markdown body or write the markup in the Telegram
+`body_template` (see [Formatting messages](#formatting-messages)).
 
 ### Prerequisites
 
@@ -654,7 +647,7 @@ With `parse_mode: HTML`, Telegram rejects messages containing unescaped `<`, `>`
 ### Formatting messages
 
 The simplest way to format a Telegram message is a rule template with
-[`body_format: markdown`](configuration.md#markdown-bodies-body_format): its
+[`body_format: markdown`](templates.md#markdown-bodies-body_format): its
 body, written once in Markdown, reaches Telegram as HTML of the Bot API subset
 (`<b>`, `<i>`, `<s>`, `<code>`, `<pre>`, `<a>`, `<blockquote>`), always well
 formed and nested as the Bot API allows, with the values of the log escaped.
@@ -709,7 +702,7 @@ With `host=<web&01>`, the message shows `Host: <web&01>` in monospace, and a
   log data it contains unescaped. Write `{{ body }}` without `|e` only for a
   `body` that holds no data from the log.
 - With `parse_mode: MarkdownV2`, escape values with
-  [`mdv2_escape`](configuration.md#valerter-filters) instead of `|e`:
+  [`mdv2_escape`](templates.md#valerter-filters-and-functions) instead of `|e`:
   `*{{ title | mdv2_escape }}*`.
 - `body_format: markdown` (above) follows the same approach without a
   `body_template` per notifier.
@@ -730,9 +723,9 @@ notifiers:
     disable_web_page_preview: true
 ```
 
-## Multi-Destination Routing
+## Delivery
 
-Send alerts to multiple notifiers per rule:
+A rule can send its alerts to several notifiers:
 
 ```yaml
 rules:
@@ -749,22 +742,46 @@ rules:
         - pagerduty           # On-call paging
 ```
 
-Alerts are sent to all destinations **in parallel**. Each destination's success/failure is independent.
+- **One queue per destination.** Each notifier has its own queue of 100 alerts
+  and its own delivery task: destinations are delivered independently, and a
+  slow or failing one only delays its own alerts. When a queue is full, its
+  oldest alert is dropped, for that destination only
+  (`valerter_destination_alerts_dropped_total`, backlog in
+  `valerter_destination_queue_size`).
+- **Order.** Each destination receives the alerts in the order they were
+  produced, one at a time (the next send starts when the current one,
+  retries included, is over). There is no ordering between destinations.
+- **Retries.** Every send is tried up to **3 times**, with exponential backoff
+  between attempts:
 
-## Retry Behavior
+  | Notifier | Base delay | Max delay | Timeout per attempt |
+  |----------|------------|-----------|---------------------|
+  | `webhook`, `mattermost`, `telegram` | 500 ms | 5 s | 10 s (HTTP request) |
+  | `email` | 1 s | 30 s | 60 s per SMTP command |
 
-All notifiers implement exponential backoff retry, up to **3 attempts** per send:
+  HTTP notifiers retry 5xx, 429 and network errors (Telegram honors
+  `Retry-After`) and give up immediately on other 4xx statuses, with two
+  exceptions: the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection)
+  and the Mattermost [resend to the notifier default](#channel-per-rule). Email
+  retries each recipient separately on 4xx SMTP replies and network, TLS or
+  timeout errors, and gives up immediately on 5xx replies (see
+  [Retries and SMTP errors](#retries-and-smtp-errors)). An unreachable HTTP
+  endpoint can hold a destination for about 31.5 s per alert (3 × 10 s plus
+  the delays).
+- **Failure.** After the last attempt, the alert is logged and counted as
+  failed for that destination. A notifier template that fails to render at
+  send time (`body_template` of a `webhook`, subject or body of an `email`,
+  message text of a `telegram` notifier) is a permanent failure too: nothing
+  is sent, nothing is retried.
+- **Shutdown.** On SIGTERM, every destination delivers its in-flight and queued
+  alerts within 20 seconds before the process exits (see
+  [Shutdown and alert drain](operations.md#shutdown-and-alert-drain)). An alert
+  stuck on an unreachable endpoint (up to ~31.5 s) can exceed that drain.
 
-| Notifier | Base delay | Max delay |
-|----------|------------|-----------|
-| `webhook`, `mattermost`, `telegram` | 500ms | 5s |
-| `email` | 1s | 30s |
-
-What is retried depends on the notifier: HTTP notifiers retry 5xx, 429 and network errors and give up immediately on other 4xx statuses (see the Telegram [plain-text fallback](#plain-text-fallback-on-html-rejection) and the Mattermost [resend to the notifier default](#channel-per-rule) for the two exceptions); email retries 4xx SMTP replies and network, TLS or timeout errors, and gives up immediately on 5xx replies (see [Retries and SMTP errors](#retries-and-smtp-errors)).
-
-After all retries are exhausted, the alert is marked as failed and logged.
-
-Metrics count each alert **once per notifier** (see [Metrics](metrics.md)): `valerter_alerts_sent_total` when it is delivered (to at least one recipient or chat for `email` and `telegram`), `valerter_notify_errors_total` and `valerter_alerts_failed_total` when it permanently fails. A template that fails to render at send time (`body_template` of a `webhook`, subject or body of an `email`, message text of a `telegram` notifier) is such a permanent failure: nothing is sent, nothing is retried, and both counters increase by 1.
+Metrics count each alert **once per notifier** (see [Metrics](metrics.md)):
+`valerter_alerts_sent_total` when it is delivered (to at least one recipient or
+chat for `email` and `telegram`), `valerter_notify_errors_total` and
+`valerter_alerts_failed_total` when it permanently fails.
 
 ## Troubleshooting
 
@@ -788,7 +805,29 @@ Metrics count each alert **once per notifier** (see [Metrics](metrics.md)): `val
 3. Verify channel exists (if specified); a rejected `mattermost_channel` logs `Mattermost rejected channel override, resending to notifier default`
 4. Check logs for HTTP errors
 
+### Telegram not delivering
+
+A failed chat logs `Telegram returned client error, not retrying` with its
+`chat_id` and `status`, then `Telegram send permanently failed for chat`, and is
+counted in `valerter_telegram_chat_errors_total`. valerter does not log the
+error text of the Bot API: reproduce the call by hand to read it
+(`curl "https://api.telegram.org/bot<TOKEN>/sendMessage" -d chat_id=<id> -d text=test`).
+
+1. `status=400 Bad Request`: usually a wrong `chat_id` (`chat not found`), or a
+   bot that was never added to the chat.
+2. `status=403 Forbidden`: the bot was removed from the chat, or is not an
+   admin of the channel.
+3. `status=401 Unauthorized`: the `bot_token` is wrong or was revoked.
+4. `Telegram rejected HTML message, resending as plain text`: a custom
+   `body_template` produces invalid HTML; escape every inserted value with `|e`
+   (see [HTML escaping](#html-escaping)). The alert was still delivered, as
+   plain text.
+5. `Telegram message truncated to fit codepoint limit`: the message exceeded
+   4096 characters (see [Message length](#message-length)).
+
 ## See Also
 
 - [Configuration](configuration.md) - Full configuration reference
-- [templates/README.md](../templates/README.md) - Email template documentation
+- [Templates](templates.md) - Variables, filters, Markdown bodies
+- [Email body templates](../templates/README.md) - Writing an email body template
+- [Operations](operations.md) - Shutdown, logs, upgrades
