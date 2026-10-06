@@ -12,36 +12,44 @@ Valerter is a real-time log alerting daemon that streams logs from VictoriaLogs 
 
 ```
 src/
-├── main.rs              # Entry point, startup, shutdown
+├── main.rs              # Entry point: logging, startup, signals, shutdown
 ├── lib.rs               # Library root, module re-exports
 ├── cli.rs               # CLI argument parsing (clap)
-├── engine.rs            # RuleEngine - orchestrates rule tasks
+├── preflight.rs         # Startup checks shared with --validate (notifiers, destinations, email bodies)
+├── engine.rs            # RuleEngine: one task per (rule, source), supervision
 ├── error.rs             # Error types (thiserror)
-├── tail.rs              # VictoriaLogs streaming client
-├── parser.rs            # Regex/JSON field extraction
-├── throttle.rs          # LRU cache-based rate limiting
-├── template.rs          # Jinja2 templating (minijinja)
+├── tail.rs              # VictoriaLogs streaming client, reconnection
 ├── stream_buffer.rs     # UTF-8 safe NDJSON buffering
-├── metrics.rs           # Prometheus metrics server
-├── config/              # Configuration module
-│   ├── mod.rs           # Module root
-│   ├── types.rs         # Config, RuleConfig, etc.
-│   ├── notifiers.rs     # Notifier-specific configs
+├── http_body.rs         # Size-limited reading of HTTP error bodies
+├── parser.rs            # Regex/JSON field extraction, dotted-key expansion
+├── throttle.rs          # Fixed-window rate limiting (moka cache)
+├── metrics.rs           # Prometheus metrics server and series inventory
+├── template/            # Rule templates
+│   ├── mod.rs           # TemplateEngine, RenderedMessage (renderings per format)
+│   └── filters.rs       # valerter filters and functions, Markdown auto-escaping
+├── markdown/            # Markdown bodies (body_format: markdown)
+│   ├── mod.rs           # Restricted tree, escaping
+│   ├── parse.rs         # pulldown-cmark events → tree
+│   └── render.rs        # plain, markdown, html, telegram_html renderings
+├── config/              # Configuration
+│   ├── mod.rs           # Module root, loading of config.yaml and .d/ files
+│   ├── types.rs         # Config, RuleConfig, TemplateConfig, ...
+│   ├── notifiers.rs     # Notifier configurations
 │   ├── runtime.rs       # Compiled runtime config
-│   ├── validation.rs    # Validation functions
-│   ├── env.rs           # Environment variable resolution
-│   ├── secret.rs        # SecretString for sensitive values
-│   └── tests.rs         # Config tests
-└── notify/              # Notification module
+│   ├── validation.rs    # Template test render, color and query checks
+│   ├── env.rs           # ${VAR} resolution
+│   └── secret.rs        # SecretString for sensitive values
+└── notify/              # Notification
     ├── mod.rs           # Module root
     ├── traits.rs        # Notifier async trait
     ├── registry.rs      # NotifierRegistry
-    ├── payload.rs       # AlertPayload structure
+    ├── payload.rs       # AlertPayload (rendered message, log fields)
     ├── queue.rs         # Per-destination queues + delivery workers
+    ├── notifier_template.rs  # Notifier templates (body_template, subject_template)
     ├── mattermost.rs    # Mattermost notifier
     ├── email.rs         # Email notifier (SMTP)
     ├── webhook.rs       # Webhook notifier
-    └── tests.rs         # Notify tests
+    └── telegram.rs      # Telegram notifier
 ```
 
 ## Pipeline Stages
@@ -76,11 +84,23 @@ Prevents alert spam using a fixed window per key:
 
 ### 4. Template
 
-Renders the final message using Jinja2 templates (via minijinja):
+Renders the message with Jinja2 templates (via minijinja), at two levels (see
+[Templates](templates.md)):
 
-- **Variables:** Extracted fields + built-in (`rule_name`, `_msg`, etc.)
-- **Filters:** `default`, `upper`, `lower`, `length`, etc.
-- **Fallback:** On render error, sends a fallback message (never drops alerts)
+- **Rule template**, once per alert: `title`, `body` and `email_body_html`, from
+  the event fields, `rule_name` and `vl_source`. A rule template that fails to
+  render is replaced by a fallback message (`Template render failed: ...`), so
+  the alert is still sent.
+- **Markdown body:** with `body_format: markdown`, `body` is a Markdown source,
+  parsed and rendered once per output format used by the destinations
+  (`plain`, `markdown`, `html`, `telegram_html`), the rendering being shared by
+  the destinations of the alert.
+- **Notifier templates**, at send time, per destination: `body_template` and
+  `subject_template`, which see the rendered message and the event fields under
+  `log`. A notifier template that fails to render is a permanent failure for
+  that destination (nothing is sent, the failure is counted).
+- **Filters:** the built-in filters of minijinja, plus `md_escape`,
+  `mdv2_escape`, `code`, `codeblock` and the `md_link` function.
 
 ### 5. Notify
 
@@ -129,8 +149,8 @@ main.rs
 - **Error isolation:** one task's failure doesn't affect others — neither sibling sources of the same rule, nor sibling rules of the same source.
 - **Shared throttle state:** each task has its own parser and stream connection, but the throttle cache belongs to the rule and is shared by its tasks. It survives a task respawn after panic, so a panic does not let a burst of duplicates through.
 - **Panic recovery:** a panicked task is respawned with the same `(rule, source)` spawn context (source config, shared throttle store) after a delay that grows per consecutive panic: 5 s, doubled each time, capped at 5 min (`PANIC_RESTART_BASE_DELAY`, `PANIC_RESTART_MAX_DELAY`). A task that ran 10 min without panicking starts over at 5 s (`PANIC_STABLE_RUN_RESET`). The delay is spent inside the respawned task, not in the supervision loop: the other tasks stay supervised, a shutdown ends the wait at once without restarting the task, and a task waiting for its restart counts as active. Restarts are unlimited, a `(rule, source)` pair is never abandoned (`Respawning rule-source task after panic delay` logs `delay_secs` and `consecutive_panics`, then `Rule-source task respawned after panic` once the delay is over).
-- **Graceful shutdown:** on SIGTERM/SIGINT, all rule tasks are cancelled through the shared `CancellationToken`; only once they have all stopped (`All rule tasks stopped`) does `main` cancel the separate drain token of the notification worker, which then drains its queues within 20 s (see [Notification Queue](#notification-queue)). A second SIGTERM/SIGINT, in any phase of the shutdown, logs `Second shutdown signal received, forcing immediate exit` and exits at once with code 1
-- **No silent exit:** the engine returns `Ok` only after a shutdown request (SIGINT/SIGTERM). If no task can be spawned (`No enabled rules found, engine will exit`) or every task ends without a shutdown request (`All rule tasks completed unexpectedly`), it logs at ERROR and returns an error. `main` then cancels the shared token and drains the (usually empty) notification queues right away, instead of waiting for a timeout, and the process exits with code 1, so the shipped systemd unit (`Restart=on-failure`) restarts it and `systemctl status` shows it as failed. Exit code 0 means a requested shutdown and is never restarted.
+- **Graceful shutdown:** on SIGTERM/SIGINT, all rule tasks are cancelled through the shared `CancellationToken`; only once they have all stopped (`All rule tasks stopped`) does `main` cancel the separate drain token of the notification worker, which then drains its queues (see [Notification Queue](#notification-queue) and, for the operator's view, [Shutdown and alert drain](operations.md#shutdown-and-alert-drain))
+- **No silent exit:** the engine returns `Ok` only after a shutdown request (SIGINT/SIGTERM). If no task can be spawned (`No enabled rules found, engine will exit`) or every task ends without a shutdown request (`All rule tasks completed unexpectedly`), it logs at ERROR and returns an error; `main` drains the (usually empty) queues right away and exits with code 1 (see [Exit codes](operations.md#exit-codes)).
 - **Metric:** `valerter_rule_panics_total{rule_name, vl_source}` counts panics per `(rule, source)` task and keeps growing while a task panics in a loop: alert on its increase. Panics do not count in `valerter_rule_errors_total` (fatal errors only).
 - **Delivery isolation:** one delivery task per notifier, each consuming its own queue sequentially (the next alert is taken once the current send, retries included, is over). Destinations progress independently: an endpoint that times out never delays the others.
 
@@ -157,8 +177,7 @@ When the server ends the response cleanly (EOF without error), this is not a fai
 - **Delivery:** `NotificationWorker` runs one task per destination, each delivering its alerts one by one in arrival order (FIFO per destination)
 - **Panic isolation:** a panic during a send is caught, logged and counted in `valerter_notify_errors_total` / `valerter_alerts_failed_total`; the destination continues with its next alert
 - **Shutdown drain:** the worker has its own drain token, cancelled by `main` once every rule task has stopped, so no alert can be queued anymore. Each destination task then finishes its in-flight send (retries included), delivers the alerts still in its queue in order until it is empty, and closes its queue (further sends fail with `notification queue closed`). Destinations drain in parallel: a slow one does not hold back the others. An empty queue does not delay the exit
-- **Drain deadline:** `main` waits at most 20 s for the drain (constant `SHUTDOWN_DRAIN_TIMEOUT`, not configurable), counted once the rule tasks have stopped. It logs `Waiting for notification worker to drain queue...` (field `queued`), then either `Notification queue drained`, or, when the deadline expires, aborts the worker and logs the WARN `Shutdown drain timeout reached, alerts not delivered` with `undelivered` = alerts left in all queues (an interrupted in-flight send is not counted). The process still exits with code 0
-- **Shutdown budget:** stopping the rule tasks + at most 20 s of drain fits in the `TimeoutStopSec=30` of the shipped systemd unit (about 20 s at worst: the metrics server stops as soon as the engine returns, and the teardown of the runtime waits at most 2 s for blocking tasks). Container runtimes must allow as much: `docker stop --stop-timeout 30`, or `stop_grace_period: 30s` in Compose (Docker's default of 10 s kills the process before the drain ends). A second SIGTERM/SIGINT skips the drain and exits immediately with code 1
+- **Drain deadline:** `main` waits at most 20 s for the drain (constant `SHUTDOWN_DRAIN_TIMEOUT`, not configurable), counted once the rule tasks have stopped, then aborts the worker; `undelivered` counts the alerts left in all queues (an interrupted in-flight send is not counted). The metrics server stops as soon as the engine returns, and the teardown of the runtime waits at most 2 s for blocking tasks. Logs, exit codes and the stop timeouts to configure are described in [Operations](operations.md#shutdown-and-alert-drain)
 
 ```
 RuleEngine (producers)        NotificationQueue (router)       Destination tasks
@@ -168,35 +187,15 @@ RuleEngine (producers)        NotificationQueue (router)       Destination tasks
     └── rule_task ─┘                 └── queue[webhook-pager]   ──► task ──► webhook-pager
 ```
 
-## Fail-Fast Validation
+## Startup checks
 
-At startup, Valerter validates (in order):
-
-1. **YAML syntax** — Config file is valid YAML
-2. **Required fields** — All mandatory fields present, at least one notifier, one template and one **enabled** rule (a config whose rules are all `enabled: false` is refused)
-3. **Template syntax** — All templates compile (minijinja)
-4. **Notifier config** — URLs, credentials, env vars resolve correctly
-5. **Destinations exist** — Rule destinations match declared notifier names
-6. **Email template body** — Templates used with email destinations have `email_body_html`
-7. **Mattermost channel warning** — Warns if `mattermost_channel` set but no Mattermost notifier in destinations
-
-If any validation fails, Valerter exits with a clear error message and exit code 1. Steps 4 to 7 form the preflight (`src/preflight.rs`): all of its stages are evaluated before exiting, so every notifier, destination and email template error is reported in one pass, and a notifier that failed to build is not reported as an unknown destination.
-
-`valerter --validate` runs this exact sequence (same code, same messages, same exit code) and then prints a summary instead of starting the engine, the notification worker and the metrics server. It makes no network call.
-
-### Multi-File Configuration
-
-Config can be split across multiple files:
-
-```
-/etc/valerter/
-├── config.yaml         # Main config (victorialogs, defaults, metrics)
-├── rules.d/            # Rules as HashMap (name: config)
-├── templates.d/        # Templates as HashMap
-└── notifiers.d/        # Notifiers as HashMap
-```
-
-Files are loaded alphabetically. Duplicate names across files cause startup failure.
+At startup, valerter loads and validates the configuration, then runs the
+preflight (`src/preflight.rs`): it builds every notifier, checks that every rule
+destination exists and that email destinations get an HTML body. All the
+preflight stages are evaluated before exiting, so every error is reported in
+one pass. `valerter --validate` runs the same code and prints a summary
+instead of starting the engine. The checks and their order are described in
+[Validation](configuration.md#validation).
 
 ## Metrics Pipeline
 
@@ -212,32 +211,17 @@ Metrics are emitted throughout the pipeline:
 - `valerter_alerts_sent_total` - After successful notification
 - etc.
 
-## Error Handling
-
-**Log+Continue pattern:** Errors in spawned tasks are logged, never propagated up.
-
-```rust
-// ✅ CORRECT
-match process().await {
-    Ok(_) => continue,
-    Err(e) => {
-        tracing::error!(error = %e, "Processing failed");
-        tokio::time::sleep(backoff).await;
-    }
-}
-
-// ❌ NEVER DO THIS
-tokio::spawn(async { process().unwrap(); }); // Silent crash
-```
-
 ## Security
 
-- **Config file:** `chmod 600` recommended (secrets in plaintext)
-- **HTML escaping:** `email_body_html` templates auto-escape variables (XSS prevention)
+- **Config file:** secrets in plaintext, so the package installs it `640 root:valerter` (see [Files and permissions](operations.md#files-and-permissions))
+- **HTML escaping:** `email_body_html` and email body templates auto-escape variables (XSS prevention); Markdown bodies escape every inserted value
+- **Secrets in logs:** secret values are never logged, VictoriaLogs source URLs are masked
 - **TLS verification:** Enabled by default (`tls.verify: true`)
 - **No shell execution:** No user input ever reaches a shell
 
 ## See Also
 
 - [Configuration](configuration.md) - Configure the pipeline
+- [Templates](templates.md) - Rule and notifier templates
+- [Operations](operations.md) - Run the daemon
 - [Metrics](metrics.md) - Monitor the pipeline

@@ -1659,7 +1659,7 @@ mod tests {
         assert_eq!(msg, other);
     }
 
-    /// The example of docs/configuration.md, "Markdown bodies".
+    /// The example of docs/templates.md, "Markdown bodies".
     #[test]
     fn markdown_documentation_example() {
         let msg = render_test_message(

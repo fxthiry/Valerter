@@ -1,19 +1,28 @@
 # Configuration Reference
 
 Valerter is configured via a YAML file, typically at `/etc/valerter/config.yaml`.
+See [config/config.example.yaml](../config/config.example.yaml) for a complete
+annotated example.
 
-See [config/config.example.yaml](../config/config.example.yaml) for a complete annotated example.
+This page covers the configuration file itself. Related pages:
 
-## Configuration File
+- [Templates](templates.md): variables, filters, Markdown bodies, template validation
+- [Notifiers](notifiers.md): Mattermost, Telegram, email and webhook notifiers, delivery
+- [Operations](operations.md): service, permissions, logs, upgrades, shutdown
+
+## Configuration file
 
 | Location | Description |
 |----------|-------------|
 | `/etc/valerter/config.yaml` | Default location (systemd) |
 | Custom path via `-c` flag | `valerter -c /path/to/config.yaml` |
 
-**Security:** The file should be owned by `valerter:valerter` with mode `600` (owner read/write only).
+The file holds secrets (webhook URLs, tokens, passwords). The Debian package
+installs it owned by `root:valerter` with mode `640`, in a directory with mode
+`750`: the service reads it, other users cannot (see
+[Files and permissions](operations.md#files-and-permissions)).
 
-## Multi-File Configuration
+## Multi-file configuration
 
 For large deployments, you can split rules, templates, and notifiers into separate files in `.d/` directories alongside `config.yaml`:
 
@@ -29,9 +38,9 @@ For large deployments, you can split rules, templates, and notifiers into separa
     └── team-channels.yaml
 ```
 
-### Format in `.d/` Files
+### Format in `.d/` files
 
-Files in `.d/` directories use a **HashMap format** where the name is the YAML key:
+Files in `.d/` directories use a **map format** where the name is the YAML key:
 
 ```yaml
 # rules.d/security.yaml
@@ -58,8 +67,9 @@ brute_force:
 ```yaml
 # templates.d/custom.yaml
 security_alert:
-  title: "Security: {{ title }}"
-  body: "{{ body }}"
+  title: "Security: {{ rule_name }} on {{ vl_source }}"
+  body: "{{ _msg }}"
+  email_body_html: "<p>{{ _msg }}</p>"
   accent_color: "#ff0000"
 ```
 
@@ -74,7 +84,7 @@ infra-team:
   webhook_url: "https://mattermost.example.com/hooks/infra"
 ```
 
-### Rules
+### Loading rules
 
 - **Files processed:** `*.yaml` and `*.yml` only
 - **Order:** Files are read in alphabetical order of their path. Rules keep a
@@ -86,12 +96,13 @@ infra-team:
 - **Name uniqueness:** Names must be unique across `config.yaml` and all `.d/` files
 - **Cross-references:** Rules in `.d/` can reference templates in `config.yaml` and vice versa
 
-### Collision Detection
+### Collision detection
 
-If the same name is defined in multiple files, Valerter fails at startup with an explicit error:
+If the same name is defined in two files, the configuration is refused at
+startup and by `valerter --validate` (exit code 1), with an explicit error:
 
 ```
-Error: duplicate rule name 'my_rule': defined in 'config.yaml' and 'rules.d/extra.yaml'
+ERROR valerter: Failed to load configuration error=duplicate rule name 'auth_failure': defined in 'rules.d/extra.yaml' and 'rules.d/security.yaml'
 ```
 
 The message has the same form for templates and notifiers (`duplicate template
@@ -99,18 +110,20 @@ name '...'`, `duplicate notifier name '...'`), whether the collision is between
 `config.yaml` and a `.d/` file or between two files of the same `.d/` directory
 (the first file in alphabetical order is cited first).
 
-## Structure Overview
+## Structure overview
 
 ```yaml
-victorialogs:    # VictoriaLogs connection (REQUIRED)
-metrics:         # Prometheus metrics (optional)
+victorialogs:    # VictoriaLogs sources (REQUIRED, at least one)
+metrics:         # Prometheus metrics (optional, enabled on port 9090 by default)
 notifiers:       # Named notification channels (REQUIRED, at least one)
 defaults:        # Default throttle, timestamp timezone and stream cap (REQUIRED)
 templates:       # Message templates (REQUIRED)
-rules:           # Alert rules (REQUIRED, at least one)
+rules:           # Alert rules (REQUIRED, at least one enabled)
 ```
 
-## VictoriaLogs Sources (multi-source)
+[Templates](templates.md) and [notifiers](notifiers.md) have their own pages.
+
+## VictoriaLogs sources
 
 `victorialogs` is a map of named sources. A single valerter instance can tail
 multiple VL backends concurrently and route alerts per source. At least one
@@ -188,40 +201,11 @@ victorialogs:
 ```
 
 Rules can target a subset of sources via `vl_sources: [name, ...]`, or omit
-the field to fan out across every configured source. The current source name
-is exposed in templates as `{{ vl_source }}` (layer 1 templates,
-`throttle.key`, and notifier-level layer 2 contexts).
+the field to fan out across every configured source. Source names must match
+`^[a-zA-Z0-9_]+$`. The current source name is available as `{{ vl_source }}`
+in every template and in `throttle.key` (see [Templates](templates.md)).
 
-### Migration from v1.x (breaking change)
-
-The v1.x single-URL shape (`victorialogs.url: ...` at the top level) is
-rejected at load with a clear error. Wrap your existing settings under a
-named key (we recommend `default` for single-source deployments):
-
-```yaml
-# Before (v1.x):
-victorialogs:
-  url: "http://victorialogs:9428"
-  basic_auth:
-    username: "u"
-    password: "p"
-
-# After (v2.0+):
-victorialogs:
-  default:
-    url: "http://victorialogs:9428"
-    basic_auth:
-      username: "u"
-      password: "p"
-```
-
-The default throttle key also changed from `{rule}:global` to
-`{rule}-{source}:global` so multi-source buckets are isolated by default. To
-preserve v1.x cross-source dedup, set `throttle.key: "{{ rule_name }}"`
-explicitly on the rules that need it (effective since v2.1.0, see
-[Throttling](#throttling)).
-
-### Reverse Proxy Configuration
+### Reverse proxy
 
 If VictoriaLogs is behind a reverse proxy (nginx, Traefik, etc.), you **must** disable buffering and caching for the `/select/logsql/tail` endpoint. Valerter uses HTTP streaming to receive logs in real-time, and proxy buffering will cause delays or connection issues.
 
@@ -253,6 +237,7 @@ location = /select/logsql/tail {
 - `proxy_buffering off` — Send data immediately to client
 - `proxy_cache off` — Don't cache streaming responses
 - `proxy_read_timeout 3600s` — Keep connection alive for 1 hour
+
 
 ## Defaults
 
@@ -287,13 +272,16 @@ total = sum(if rule.vl_sources is empty then sources.len() else rule.vl_sources.
             for rule in enabled_rules)
 ```
 
-Disabled rules do not contribute. Breaching the cap fails `valerter --validate`
-with a message stating both the actual count and the cap so an operator knows
-whether to raise the cap or trim rules. Default: `50`.
+Disabled rules do not contribute. Breaching the cap fails the configuration at
+load time (and `valerter --validate`) with a message stating both the actual
+count and the cap (`defaults.max_streams exceeded: N stream(s) required by
+enabled rules > cap of M`), so an operator knows whether to raise the cap or
+trim rules. Default: `50`. `max_streams: 0` is refused
+(`defaults.max_streams must be >= 1`).
 
-### Timestamp Timezone
+### Timestamp timezone
 
-The `timestamp_timezone` setting controls the timezone used for `{{ log_timestamp_formatted }}` in templates and Mattermost footers.
+The `timestamp_timezone` setting controls the timezone of `{{ log_timestamp_formatted }}` in notifier templates and of the Mattermost footer.
 
 | Value | Example Output |
 |-------|----------------|
@@ -303,353 +291,34 @@ The `timestamp_timezone` setting controls the timezone used for `{{ log_timestam
 
 Uses [IANA timezone names](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). Invalid timezone will fail at startup.
 
-## Templates
 
-Message templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via minijinja).
+## Metrics
+
+```yaml
+metrics:
+  enabled: true    # Default: true
+  port: 9090       # Default: 9090
+```
+
+The Prometheus endpoint is served on `http://<host>:<port>/metrics` while the
+daemon runs (never by `--validate`). The section is optional: without it,
+metrics are enabled on port 9090. See [Metrics](metrics.md) for the exposed
+series.
+
+## Templates
 
 ```yaml
 templates:
   default_alert:
-    title: "{{ rule_name }}"                           # REQUIRED
-    body: "{{ _msg }}"                                 # REQUIRED
-    email_body_html: "<p>{{ _msg }}</p>"               # REQUIRED for email destinations (text bodies)
-    accent_color: "#ff0000"                            # Optional: hex color
-    body_format: text                                  # Optional: text (default) or markdown
+    title: "{{ rule_name }}"                 # REQUIRED
+    body: "{{ _msg }}"                       # REQUIRED
+    email_body_html: "<p>{{ _msg }}</p>"     # REQUIRED for email destinations (text bodies)
+    accent_color: "#ff0000"                  # Optional: hex color
+    body_format: text                        # Optional: text (default) or markdown
 ```
 
-`body_format` describes the source of `body`: `text` (the default) sends it as
-rendered, `markdown` makes it a Markdown source rendered for each notifier (see
-[Markdown bodies](#markdown-bodies-body_format)).
-
-### Available Variables
-
-Variables come from the parser output plus built-in fields:
-
-| Variable | Description |
-|----------|-------------|
-| `rule_name` | Name of the rule that triggered |
-| `vl_source` | Name of the VictoriaLogs source the event came from |
-| `_msg` | Original log message (from VictoriaLogs) |
-| `_time` | Log timestamp (raw from VictoriaLogs) |
-| `_stream` | Stream labels |
-| `log_timestamp` | Original log timestamp in ISO 8601 format (for VictoriaLogs search) |
-| `log_timestamp_formatted` | Human-readable timestamp (respects `timestamp_timezone` setting) |
-| Custom fields | Extracted by regex/JSON parser |
-
-**Note:** `rule_name` and `vl_source` are available in all template contexts:
-the top-level template fields (`title`, `body`, `email_body_html`), the
-`throttle.key`, and the notifier-level templates (`subject_template`,
-`body_template`). If an event field happens to be named `rule_name` or
-`vl_source`, the synthetic value wins.
-
-**Note:** `log_timestamp` and `log_timestamp_formatted` are available in:
-- Email subject and body templates
-- Webhook `body_template`
-- Mattermost footer (automatically includes `log_timestamp_formatted`)
-
-These timestamps are computed **after** the top-level template renders, so they are only accessible in notifier-level templates. If you need a timestamp at the top-level, reference `{{ _time }}` (raw VictoriaLogs field) directly.
-
-#### Rule templates and notifier templates
-
-Templates are rendered at two levels:
-
-| Level | Templates | Event fields | Other variables |
-|-------|-----------|--------------|-----------------|
-| Rule template (level 1) | `title`, `body`, `email_body_html`, `throttle.key` | At the top level: `{{ host }}`, `{{ _msg }}` | `rule_name`, `vl_source` |
-| Notifier template (level 2) | `body_template` (webhook, Telegram, email), `subject_template` (email) | Under `log`: `{{ log.host }}`, `{{ log._msg }}` | `title`, `body` (the rendered rule template), `rule_name`, `vl_source`, `log_timestamp`, `log_timestamp_formatted`, plus `accent_color` for email |
-
-`log` holds every field of the parsed event, in the same view as the rule
-template: dotted keys are available both flat and expanded
-(`{{ log["k8s.pod"] }}` and `{{ log.k8s.pod }}`), and a missing field renders
-empty (`{{ log.missing }}`). It does not contain `rule_name` nor `vl_source`:
-use the top-level variables. Because the notifier template is written for one
-channel, it is the place for markup (HTML for Telegram and email, JSON for a
-webhook), each value from `log` being escaped for that channel (see
-[valerter filters](#valerter-filters)). `{{ log | tojson }}` renders the whole
-event as a JSON object, with dotted keys present twice (flat and expanded).
-
-`log` exists only in notifier templates: in a rule template, `{{ log }}` is the
-event field named `log` if there is one (container output collected by
-Fluent Bit, for instance). In a notifier template, a variable that is none of
-the above renders empty: valerter logs the warning
-`Notifier template references unknown variable` at startup and in
-`--validate` (see [Template validation](#template-validation)).
-
-### Fields with special characters
-
-VictoriaLogs field names may contain characters that are operators in Jinja,
-most commonly `/` in Kubernetes/OpenShift annotation keys such as
-`ocp.annotations.authentication.openshift.io/username`. Dotted keys are
-expanded into nested objects at render time, so reference the last segment
-with bracket notation:
-
-```jinja
-{# WRONG: '/' is parsed as a division #}
-{{ ocp.annotations.authentication.openshift.io/username }}
-
-{# RIGHT #}
-{{ ocp.annotations.authentication.openshift["io/username"] }}
-```
-
-`valerter --validate` detects this pattern and prints the rewritten expression.
-
-Expansion has two limits, each logged as a warning and never stopping the
-alert. A dotted key whose first segment is already a plain field (`a` and
-`a.b`) is not expanded: `{{ a }}` keeps the plain value
-(`skipping dotted-key expansion: top-level scalar already exists`). A dotted
-key of more than 32 segments is not expanded either: only the flat key exists,
-reachable with bracket notation (`{{ log["a.b.c…"] }}`), so that a malformed
-log line cannot build objects thousands of levels deep
-(`skipping dotted-key expansion: too many segments`, the key truncated to 128
-bytes in the log).
-
-A **top-level** field whose name contains `/` (e.g. `io/user-name`, with no dot
-before it) has no parent object to index, so it cannot be referenced from a
-template. Rename it in the rule query with the LogsQL `rename` pipe, then use
-the new name:
-
-```yaml
-query: '_stream:{app="oauth"} | rename "io/user-name" as io_user_name'
-# template: {{ io_user_name }}
-```
-
-`valerter --validate` suggests this rename for `{{ io/user-name }}`. A `/`
-between two plain identifiers (`{{ total/count }}`) is read as a division and
-accepted: it cannot be told apart from a field named `total/count`, so a
-top-level field like `io/username` (no `.`, `-` or `/` in its last part) is not
-detected and must be renamed the same way.
-
-### valerter filters
-
-Besides the built-in filters of minijinja (`default`, `upper`, `lower`,
-`length`, `replace`, `tojson`, `urlencode`, `e`...), valerter provides two escaping filters,
-available in every template (rule templates, `throttle.key`, notifier
-templates). Filters that minijinja does not provide, such as `truncate`, are
-unknown and refused by the [test render](#template-validation).
-
-| Filter | Target | Escaped characters |
-|--------|--------|--------------------|
-| `md_escape` | Markdown (CommonMark) read by Mattermost | `` \ ` * _ { } [ ] ( ) # + - . ! > \| ~ `` |
-| `mdv2_escape` | Telegram `parse_mode: MarkdownV2` | `` _ * [ ] ( ) ~ ` > # + - = \| { } . ! `` and `\` |
-
-Both convert their value to a string (`none` and a missing value give an empty
-string) and put a backslash before each character of their set, so the value is
-displayed literally instead of being read as Markdown:
-`{{ host | md_escape }}` renders `web_01` as `web\_01`.
-
-- `md_escape` escapes exactly the characters Mattermost's Markdown engine
-  recognises: other punctuation (`:`, `/`, `=`, `?`, `@`...) is left alone, as
-  Mattermost would show the backslash (`10\:49`). `<` and `&` are not
-  neutralised either: harmless in Mattermost, which does not render HTML, but a
-  CommonMark renderer that does would interpret them.
-- `mdv2_escape` applies to MarkdownV2 text **outside** `pre` and `code`
-  entities; inside them, Telegram only requires `` ` `` and `\` to be escaped.
-- For HTML (Telegram `parse_mode: HTML`, a custom HTML body), use the built-in
-  `| e`: it produces the entities Telegram expects (`&lt;`, `&gt;`, `&amp;`).
-  In an email body template, values are escaped as HTML automatically.
-
-The result of `md_escape` and `mdv2_escape` is an ordinary string: in an
-HTML-escaped template (email body, `email_body_html`), it is still escaped as
-HTML afterwards. In the `body` of a `body_format: markdown` template, values are
-already escaped: `md_escape` there is the automatic escaping itself, applied
-once.
-
-The filters `code`, `codeblock` and the function `md_link` build Markdown from
-values; they are meant for [Markdown bodies](#markdown-bodies-body_format).
-
-### Markdown bodies (`body_format`)
-
-With `body_format: markdown`, the `body` of a rule template is written once in
-Markdown, and valerter renders it in the format of each notifier: Markdown for
-Mattermost, the HTML subset of the Bot API for Telegram, HTML for email, plain
-text for a webhook by default (see
-[Output format per notifier](notifiers.md#output-format-per-notifier)). The
-values of the log are shown as text on every channel, unless you insert them
-with `| safe`. As in a text body, the client may still detect bare URLs,
-`@channel`/`@here` (Mattermost) and mentions in a value: valerter does not
-filter them.
-
-```yaml
-templates:
-  disk_alert:
-    title: "Disk {{ host }}"
-    body_format: markdown
-    body: |
-      **{{ host }}** is at {{ usage }}% on {{ mount | code }}
-      {{ md_link("Logs in VictoriaLogs", "https://vl.example.com/select/vmui?query=" ~ ("host:" ~ host) | urlencode) }}
-      {{ _msg | codeblock }}
-```
-
-With `host=web_01`, `usage=97`, `mount=/var` and `_msg=disk <full> & read-only`,
-Mattermost receives:
-
-````
-**web\_01** is at 97% on `/var`
-[Logs in VictoriaLogs](https://vl.example.com/select/vmui?query=host%3Aweb_01)
-
-```
-disk <full> & read-only
-```
-````
-
-and Telegram (`parse_mode: HTML`) receives, as `body`, after the bold title of
-its default `body_template`:
-
-```
-<b>web_01</b> is at 97% on <code>/var</code>
-<a href="https://vl.example.com/select/vmui?query=host%3Aweb_01">Logs in VictoriaLogs</a>
-
-<pre>disk &lt;full&gt; &amp; read-only</pre>
-```
-
-`title` stays plain text (no escaping, no Markdown), and `email_body_html`, if
-present, is still rendered as HTML. A template without `body_format`, or with
-`body_format: text`, is rendered exactly as before.
-
-**Automatic escaping.** In a Markdown body, every value inserted with
-`{{ ... }}` is escaped: each ASCII punctuation character gets a backslash, so a
-value is always read as literal text (`a_b*c` stays `a_b*c`, never italics).
-The markup written in the template itself (`**...**`, `[...](...)`, lists...)
-is interpreted.
-
-- `{{ summary | safe }}` is the only way to insert a value without escaping:
-  the value is trusted Markdown (bold, links...).
-- `{{ value | tojson }}` is escaped like any value: the JSON text is shown
-  literally.
-- `| e` escapes for the current context, which is Markdown here, not HTML (and
-  never twice): `{{ v | e }}` is the same as `{{ v }}`.
-- The line breaks of a value stay line breaks, but a value cannot change the
-  structure around it: each leading space of a line of the value becomes a
-  no-break space (U+00A0, four for a tab) and an empty line a lone U+00A0. So
-  `**{{ _msg }}**` stays bold over a multi-line message, `- {{ _msg }}` stays one
-  item, and the indentation of a stack trace stays visible instead of turning
-  into a code block. The renderings, `plain` included, contain these U+00A0.
-- The characters U+E000 and U+E001 of a value are shown as U+FFFD (valerter
-  uses them internally for `code`, `codeblock` and `md_link`).
-
-**Filters and function.**
-
-| Name | Use | Result |
-|------|-----|--------|
-| `code` | `{{ host \| code }}` | A code span showing the value literally, whatever backticks it contains; a line break becomes a space. |
-| `codeblock(lang)` | `{{ _msg \| codeblock('json') }}` | A fenced code block showing the value literally; `lang` is optional and keeps only `A-Z a-z 0-9 _ + - . #`. |
-| `md_link(text, url)` | `{{ md_link("Logs", vl_url) }}` | A link whose text is literal (on one line); spaces, control characters, `<`, `>`, `(`, `)` and `\` of the URL are percent-encoded. A scheme other than `http`, `https` or `mailto` gives `text (url)`, without a link. |
-
-Their content is always literal, wherever they are written: after a list
-marker, in a quote, on an indented line or in the middle of a line.
-
-- `codeblock` cuts the paragraph it is written in: `Log: {{ _msg | codeblock }}`
-  gives the paragraph `Log:`, then the block. Where a block cannot stand (in
-  `**...**`, a heading or the text of a link), it becomes a code span; in a
-  code block of the template, its text is written as is.
-- A Markdown filter must end its expression: `{{ (v | code) ~ '!' }}` or
-  `{{ v | code | upper }}` gives an ordinary string, escaped like any value
-  (backticks shown).
-- `md_link` does not encode the query of the URL: encode the values you put in
-  it with the built-in `urlencode` filter, as in the example above
-  (`("host:" ~ host) | urlencode` gives `host%3Aweb_01`).
-- An event field named `md_link` would hide the function, as any field hides
-  a global function of the same name.
-
-Outside a Markdown body, they return ordinary strings, escaped like any value
-(in `email_body_html`, `{{ x | code }}` gives an HTML-escaped `` `x` ``).
-
-**Recognised Markdown.** CommonMark plus `~~strikethrough~~`, limited to:
-paragraphs, line breaks, **bold**, *italics*, ~~strikethrough~~, code spans,
-code blocks, links, block quotes, lists, headings and thematic breaks. An image
-becomes a link to the image (its alternative text as link text).
-
-- A single line break is kept as a line break: alerts are line oriented.
-- Raw HTML in the source (`<b>`, `<br>`, `<div>`...) is shown as text, never
-  interpreted.
-- Tables are not recognised: their lines are shown as text.
-- Links are only emitted for the `http`, `https` and `mailto` schemes, in the
-  template as with `md_link`; `[x](javascript:...)` shows `x (javascript:...)`.
-- Nesting is limited to 32 levels (quotes, lists, emphasis...): a deeper
-  element is not recognised, its text is kept. A log line inserted with
-  `| safe` cannot exhaust the stack of the process.
-
-**Pitfall: `{{ x }}` inside a fence or backticks.** A value written inside a
-code block or a code span of the template is escaped too, and code shows its
-content literally, backslashes included. With `_msg=disk <full> & read-only`:
-
-````jinja
-```
-{{ _msg }}
-```
-````
-
-shows `disk \<full\> \& read\-only`, and `` `{{ mount }}` `` shows `\/var`.
-Write `{{ _msg | codeblock }}` and `{{ mount | code }}` instead.
-
-**Email.** A Markdown template needs no `email_body_html`: the HTML rendering of
-the body is the email body (`email_body_html` still wins when present).
-
-### Template validation
-
-Templates (`title`, `body`, `email_body_html`, `throttle.key`, and the notifier
-`subject_template`/`body_template`) are checked for syntax, then test-rendered
-twice with placeholder values where every field is defined:
-
-1. every condition on a field is true and every loop over a field iterates one
-   element, so `{% if %}` bodies and `{% for %}` bodies are checked;
-2. every condition on a field is false, every loop is empty and `is defined` is
-   false for a field, so `{% else %}` branches, `{% if not x %}` and
-   `{% if x is not defined %}` bodies are checked.
-
-The test render refuses only errors that do not depend on the event's values,
-in either pass:
-
-- an unknown filter, test, function or method (`{{ _msg | truncate(50) }}`,
-  `{% if host is nosuchtest %}`), reported as `<field> render: ...`, including
-  after a built-in or [valerter filter](#valerter-filters) applied to a field
-  (`{{ status | int }}-{{ host | truncat(10) }}`,
-  `{{ host | split('.') | first }} {{ host | nosuch }}`), in an `else` branch
-  or in a loop body (`{% for k, v in m | items %}{{ v | nosuch }}{% endfor %}`);
-- the `/` operator applied to a field path (see above).
-
-The `body` of a `body_format: markdown` template is test-rendered with the
-Markdown escaping active, as in production; `code`, `codeblock`, `md_link`,
-`urlencode` and `tojson` are checked like the other filters (an unknown filter
-after them is reported).
-
-In a notifier template (`body_template`, `subject_template`), a top-level
-variable that is not part of its context (see
-[Rule templates and notifier templates](#rule-templates-and-notifier-templates))
-is not refused, since it renders empty, but logs a warning when the notifier is
-built, at startup and in `--validate`:
-
-```
-WARN Notifier template references unknown variable notifier=hook field=body_template variable=host
-```
-
-The usual cause is a log field written `{{ host }}` instead of
-`{{ log.host }}`. Loop and `set` variables and global functions (`range`,
-`namespace`, `dict`) are not reported.
-
-Conversions and arithmetic on fields (`{{ status | int }}`, `{{ (latency |
-float) > 1.5 }}`, `{{ ratio | round }}`, `{{ count + 1 }}`) are accepted: their
-outcome depends on the real values. A built-in filter applied to a field
-(`| int`, `| float`, `| round`, `| split`, `| upper`, `| items`...) does not
-stop the check: the rest of the template is still verified. An error of that
-kind at runtime falls back to a generic message (templates) or to the
-`<rule>:error` key (throttle).
-
-Limits of the test render (these parts are not checked):
-
-- **Arithmetic on a raw field** (`{{ count + 1 }}`) stops the current pass
-  without error: what follows it is not checked in that pass. VictoriaLogs
-  fields are strings, so this expression also fails at runtime: write
-  `{{ count | int + 1 }}`, which is checked and works.
-- **The body of an `elif`** is reached by neither pass (the first takes the
-  `if`, the second the `else`).
-- **A loop nested over a loop item** (`{% for y in x %}` inside
-  `{% for x in items %}`) does not iterate, and unpacking an item without
-  `| items` (`{% for a, b in x %}`) stops the pass.
-
-### email_body_html Requirement
-
-**Important:** Templates used with email destinations MUST include `email_body_html`, unless their body is Markdown (`body_format: markdown`, whose HTML rendering is then the email body). Valerter validates this at startup and in `--validate`, and fails if missing.
+Variables, filters, Markdown bodies and the checks applied to templates are
+described in [Templates](templates.md).
 
 ## Rules
 
@@ -659,13 +328,12 @@ Alert rules define what logs to monitor and how to process them.
 rules:
   - name: "high_cpu_alert"           # REQUIRED: unique name
     enabled: true                     # Default: true (at least one rule must be enabled)
-    query: '_stream:{host="server1"} | json | cpu > 90'    # REQUIRED: LogsQL
+    query: '_stream:{app="node"} | unpack_json | filter cpu:>90'   # REQUIRED: LogsQL
 
-    parser:                           # At least one recommended
-      json:
-        fields: ["host", "cpu", "timestamp"]
-      # OR
-      regex: '(?P<level>\S+) (?P<message>.*)'
+    parser:                           # REQUIRED key, may be empty: parser: {}
+      regex: '(?P<level>\S+) (?P<message>.*)'   # Optional, applied to _msg first
+      json:                                     # Optional, applied after the regex
+        fields: ["host", "cpu"]
 
     throttle:                         # Optional: overrides defaults
       key: "{{ host }}"               # Group throttling by field
@@ -703,29 +371,45 @@ supported by `/tail` and are rejected by `valerter --validate`:
 `stats`, `sort`, `top`, `uniq`, `limit`, `offset`, `first`, `last`, `facets`,
 `join`, `field_names`, `field_values`, `block_stats`, `blocks_count`, `union`.
 
-Filter-style pipes (`filter`, `json`, `extract`, `extract_regexp`, `unpack_json`,
-`format`, `fields`, `rename`, `math`, `replace`, ...) work as expected.
+Pipes that transform or filter each line work as expected: `filter`,
+`unpack_json`, `extract`, `extract_regexp`, `format`, `fields`, `rename`,
+`math`, `replace`... A filter placed after a pipe goes through the `filter`
+pipe and uses the LogsQL comparison syntax: `| unpack_json | filter cpu:>90`
+(not `cpu > 90`). See the
+[LogsQL reference](https://docs.victoriametrics.com/victorialogs/logsql/).
 
 For aggregation-based alerts ("more than N distinct versions per host"),
 run the `stats` query on a schedule with [vmalert](https://docs.victoriametrics.com/vmalert/)
 and let Valerter alert on individual events instead.
 
-### Parser Types
+### Parser
 
-**JSON Parser:** Extract specific fields from JSON logs.
+The `parser` key is required, but may be empty (`parser: {}`): every field of
+the line returned by VictoriaLogs (`_msg`, `_time`, `_stream` and the fields of
+the log) is available to templates whatever the parser. A parser adds fields:
 
-```yaml
-parser:
-  json:
-    fields: ["host", "level", "message", "timestamp"]
-```
-
-**Regex Parser:** Extract fields using named capture groups.
+- **`regex`**: applied to `_msg` first. Each named capture group
+  (`(?P<name>...)`) becomes a field. A line whose `_msg` does not match is
+  dropped (counted in `valerter_parse_errors_total{error_type="regex_no_match"}`):
+  the regex also acts as a filter.
+- **`json.fields`**: applied next, to the fields of the line. Each listed path
+  (`data.server.hostname`) is copied to a top-level field named after its last
+  segment (`hostname`). A top-level path (`host`) is already available as is;
+  a missing path is ignored.
 
 ```yaml
 parser:
   regex: '(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)'
 ```
+
+```yaml
+parser:
+  json:
+    fields: ["data.server.hostname", "data.status"]
+```
+
+A line that is not valid JSON is dropped
+(`valerter_parse_errors_total{error_type="invalid_json"}`).
 
 ### Throttling
 
@@ -747,7 +431,7 @@ throttle:
 ```
 
 `count` must be >= 1 and `window` > 0. `key` is checked at load time like the
-templates (syntax, then [test render](#template-validation)): a syntax error is
+templates (syntax, then [test render](templates.md#template-validation)): a syntax error is
 reported as `invalid template in rule '<name>': throttle.key: ...`, an unknown
 filter, test or function as `invalid template in rule '<name>': throttle.key
 render: ...`, for enabled and disabled rules alike. A key whose rendering fails
@@ -808,11 +492,13 @@ keys render the same value.
 When a source reconnects after an error, only the counters fed exclusively by
 that source are reset; counters another source has contributed to are kept.
 
-## Secrets Management
 
-### Recommended: Direct Values
+## Secrets management
 
-Put secrets directly in the config file and secure with permissions:
+### Recommended: direct values
+
+Put secrets directly in the config file, protected by its permissions
+(`640 root:valerter`, set by the Debian package):
 
 ```yaml
 notifiers:
@@ -821,12 +507,14 @@ notifiers:
     webhook_url: "https://mattermost.example.com/hooks/abc123def456"
 ```
 
+For an installation without the package:
+
 ```bash
-sudo chmod 600 /etc/valerter/config.yaml
-sudo chown valerter:valerter /etc/valerter/config.yaml
+sudo chown root:valerter /etc/valerter/config.yaml
+sudo chmod 640 /etc/valerter/config.yaml
 ```
 
-### Alternative: Environment Variables
+### Alternative: environment variables
 
 `${VAR_NAME}` placeholders are resolved at startup in notifier secrets
 (`webhook_url`, `url`, `headers`, `bot_token`, SMTP `username`/`password`), in
@@ -851,16 +539,8 @@ Variables are resolved at startup from the process environment. You can use **an
 - `${SMTP_USER}`, `${SMTP_PASSWORD}` - Email credentials
 - `${SLACK_WEBHOOK_URL}`, `${PAGERDUTY_ROUTING_KEY}` - Notification services
 
-## Runtime Environment Variables
 
-These variables are read directly by the process (not substituted in config):
-
-| Variable | Description |
-|----------|-------------|
-| `RUST_LOG` | Log level: `error`, `warn`, `info` (default), `debug`, `trace` |
-| `LOG_FORMAT` | Output format: `text` (default), `json` |
-
-## CLI Options
+## CLI and environment variables
 
 ```
 valerter [OPTIONS]
@@ -873,6 +553,17 @@ Options:
   -V, --version                    Print version
 ```
 
+These variables are read directly by the process (not substituted in the
+configuration):
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Log level: `error`, `warn`, `info` (default), `debug`, `trace`, or per module (`info,valerter::notify=debug`) |
+| `LOG_FORMAT` | Log format: `text` (default) or `json`; `--log-format` wins |
+| `NO_COLOR` | When set to a non-empty value, text logs have no colors even on a terminal (they never have colors under journald or in a file) |
+
+See [Logs](operations.md#logs) for the format of the logs.
+
 ## Validation
 
 Always validate before deploying:
@@ -881,18 +572,21 @@ Always validate before deploying:
 valerter --validate -c /etc/valerter/config.yaml
 ```
 
-`--validate` runs every blocking check of the daemon startup, with the same error messages and exit code 1 on failure:
+`--validate` runs every blocking check of the daemon startup, in this order, with the same error messages and exit code 1 on failure:
 
-1. **Loading** — YAML syntax, unknown fields, `rules.d/`, `templates.d/` and `notifiers.d/` merge, `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
-2. **Validation** — required fields, regexes, template syntax and [test render](#template-validation) (including `throttle.key`), source names, URLs and headers, `defaults.throttle`, `max_streams` cap, at least one enabled rule
-3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, resolved webhook and Mattermost URLs are checked, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids`, Telegram `parse_mode` and notifier templates (syntax and test render) are checked
+1. **Loading** — YAML syntax, unknown fields, `rules.d/`, `templates.d/` and `notifiers.d/` merge (name collisions), `${VAR}` substitution in VictoriaLogs source URLs, `basic_auth` and `headers`
+2. **Validation** — required fields, regexes, template syntax and [test render](templates.md#template-validation) (including `throttle.key`), source names, URLs and headers, `defaults.throttle`, `max_streams` cap, at least one enabled rule
+3. **Notifier construction** — every notifier is built: `${VAR}` placeholders in notifier secrets (webhook URLs, headers, bot tokens, SMTP credentials) are resolved, resolved webhook and Mattermost URLs are checked, `body_template_file` is read (size and UTF-8 checked), email addresses, HTTP methods, headers, `chat_ids`, Telegram `parse_mode`, `format` and notifier templates (syntax and test render) are checked
 4. **Rule destinations** — every rule destination (enabled or not) names a declared notifier
-5. **Email body** — templates of enabled rules sent to email destinations define `email_body_html`
-6. **Warnings** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination, and `Notifier template references unknown variable` when a notifier template reads a variable that does not exist at its level, such as `{{ host }}` instead of `{{ log.host }}` (see [Template validation](#template-validation)); the exit code stays 0
+5. **Email body** — templates of enabled rules sent to email destinations define `email_body_html`, unless their body is Markdown (`body_format: markdown`)
+6. **Warnings** — `mattermost_channel ignored - no mattermost notifier in destinations` is logged when a rule sets `mattermost_channel` without any Mattermost destination, and `Notifier template references unknown variable` when a notifier template reads a variable that does not exist at its level, such as `{{ host }}` instead of `{{ log.host }}` (see [Template validation](templates.md#template-validation)); the exit code stays 0
+
+The daemon runs the same checks at startup, in the same order, before
+connecting to anything.
 
 Errors from steps 3 to 5 are all reported in one pass. No daemon, metrics server or network connection is started: VictoriaLogs sources, SMTP servers and webhooks do not need to be reachable.
 
-Because notifiers are built, **every environment variable referenced by a notifier must be defined when running `--validate`**, including in CI (dummy values are fine, nothing is sent). Run it as a user that can read the `body_template_file` files.
+Because notifiers are built, **every environment variable referenced by a notifier must be defined when running `--validate`**, including in CI (dummy values are fine, nothing is sent). Run it as a user that can read the configuration and the `body_template_file` files: with the Debian package, `root` or a member of the `valerter` group (see [Validating the configuration](operations.md#validating-the-configuration)).
 
 On success, a summary is printed on stdout:
 
@@ -909,6 +603,8 @@ Source URLs are redacted: credentials are replaced by `***`, the query string by
 
 ## See Also
 
-- [Notifiers](notifiers.md) - Mattermost, Email, Webhook configuration
+- [Templates](templates.md) - Variables, filters, Markdown bodies
+- [Notifiers](notifiers.md) - Mattermost, Telegram, email and webhook notifiers
+- [Operations](operations.md) - Service, logs, upgrades, shutdown
 - [Metrics](metrics.md) - Prometheus metrics reference
 - [Architecture](architecture.md) - How Valerter works

@@ -10,15 +10,17 @@ metrics:
   port: 9090       # Default: 9090
 ```
 
+See [Metrics configuration](configuration.md#metrics).
+
 ## Exposed Metrics
 
-> **v2.0.0 — multi-source label.** Every per-rule metric also carries a
-> `vl_source` label naming the VictoriaLogs source that produced the event.
-> The legacy `valerter_victorialogs_up{rule_name}` gauge is **removed** and
-> replaced by `valerter_vl_source_up{vl_source}` (per-source, no `rule_name`).
-> Dashboards that grouped by `rule_name` alone now have an extra dimension
-> available; alerts that matched on `valerter_victorialogs_up` must move to
-> `valerter_vl_source_up`.
+> **Changed in 2.1.0:** the notification counters use the `notifier_name`
+> label (no more `notifier`), `valerter_notifier_config_errors_total` is
+> removed, clean stream ends are counted in `valerter_stream_ends_total`
+> instead of `valerter_reconnections_total`, and Telegram counts once per
+> alert. See [MIGRATION.md](../MIGRATION.md#prometheus-metrics-label-sets-and-counting);
+> the changes of 2.0.0 (`vl_source` label, `valerter_vl_source_up`) are in
+> [Upgrading from v1.x to v2.0.0](../MIGRATION.md#upgrading-from-v1x-to-v200).
 
 ### Counters
 
@@ -219,10 +221,10 @@ groups:
 
 - `valerter_parse_errors_total` - Log parsing issues
 - `valerter_notify_errors_total` - Permanent notification failures (after retries, or not retryable)
-- `valerter_email_recipient_errors_total` / `valerter_telegram_chat_errors_total` - Recipients or chats that missed an alert other targets received
+- `valerter_email_recipient_errors_total` / `valerter_telegram_chat_errors_total` - One unit per failed recipient or chat, even when the alert reached other recipients or chats
 - `valerter_rule_panics_total` - Critical: indicates bugs
 
 ## See Also
 
-- [Configuration](configuration.md) - Enable/configure metrics
+- [Configuration](configuration.md#metrics) - Enable/configure metrics
 - [Architecture](architecture.md) - How metrics fit into the pipeline

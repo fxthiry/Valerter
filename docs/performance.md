@@ -1,11 +1,12 @@
 # Performance Test Report
 
-> **Note:** Numbers in this page were measured against v1.x (single-source).
-> v2.0.0 introduces per-`(rule, source)` concurrency: the engine spawns one task
-> per pair, capped by `defaults.max_streams` (default 50), with `±10%` jitter on
-> reconnect backoff. Throughput, memory, and reconnect behaviour for multi-source
-> deployments are pending re-measurement. The single-source figures below remain
-> a useful baseline.
+> **Historical measurements.** The figures of this report were measured on
+> valerter **1.0.0-rc.5**: a single VictoriaLogs source and a single
+> notification queue shared by every destination. They have not been measured
+> again since. Later versions run one task per `(rule, source)` pair (capped by
+> `defaults.max_streams`) and one queue per destination; the throttle results
+> and the orders of magnitude remain a useful baseline. The memory bounds of the
+> current version are given in [Memory bounds (2.1.0)](#memory-bounds-210).
 
 **Date:** 2026-01-19
 **Version tested:** valerter 1.0.0-rc.5
@@ -195,7 +196,7 @@ To ensure that if someone misconfigures valerter (no throttle, or throttle too h
 
 Even without throttle:
 - **No crash** under any load tested
-- **Memory bounded** at ~22 MB (each destination queue has a fixed size)
+- **Memory stayed at ~22 MB** (the notification queue has a fixed size)
 - **Graceful degradation** (FIFO drops, not OOM)
 
 ---
@@ -215,7 +216,7 @@ Tests that valerter recovers from VictoriaLogs outages.
 
 **Results:**
 - Reconnection attempts: 5 (with exponential backoff)
-- Final state: `valerter_victorialogs_up = 1` (v1.x; renamed to `valerter_vl_source_up{vl_source}` in v2.0.0)
+- Final state: the connection gauge back to 1
 - Auto-reconnect successful
 
 **Verdict:** PASS
@@ -235,7 +236,7 @@ Tests that valerter recovers from VictoriaLogs outages.
 
 **Bottleneck:** HTTP notification delivery (network latency). This is expected and mitigated by throttle.
 
-### Memory Usage
+### Memory Usage (measured on 1.0.0-rc.5)
 
 | Scenario | RSS Memory |
 |----------|------------|
@@ -243,7 +244,13 @@ Tests that valerter recovers from VictoriaLogs outages.
 | With throttle (any load) | ~18-20 MB |
 | Without throttle (extreme) | ~22 MB |
 
-Memory is **always bounded** regardless of load: each notifier has its own queue of exactly 100 alerts, so at most 100 alerts × number of notifiers are pending. Alert payloads are shared between destinations (not copied): with ordinary log lines (a few hundred bytes), even dozens of notifiers keep the pending alerts within a few MB.
+## Memory bounds (2.1.0)
+
+The number of pending alerts is bounded whatever the load: each notifier has
+its own queue of 100 alerts, so at most 100 × number of notifiers alerts are
+pending. An alert is shared by its destinations (not copied). With ordinary log
+lines (a few hundred bytes), even dozens of notifiers keep the pending alerts
+within a few MB.
 
 The size of a pending alert grows with its log line (at most 1 MiB). For a line of L bytes:
 
@@ -262,7 +269,7 @@ valerter_alerts_sent_total          # Notifications actually delivered
 valerter_alerts_throttled_total     # Logs matched but throttled (expected)
 valerter_alerts_dropped_total       # Queue overflow, all destinations (should be 0 with throttle)
 valerter_destination_alerts_dropped_total{notifier_name}  # Which destination overflows
-valerter_vl_source_up{vl_source}    # Connection health (per source; v1.x: valerter_victorialogs_up)
+valerter_vl_source_up{vl_source}    # Connection health, per source
 ```
 
 ---
@@ -282,9 +289,9 @@ throttle:
 
 | Metric | Expected | Action if abnormal |
 |--------|----------|-------------------|
-| `valerter_alerts_dropped_total` | 0 | Enable/tighten throttle |
+| `valerter_destination_alerts_dropped_total` | 0 | Enable/tighten throttle, check the slow destination |
 | `valerter_alerts_throttled_total` | > 0 | Normal, throttle working |
-| `valerter_vl_source_up` | 1 (per source) | Check VL connection (v1.x: `valerter_victorialogs_up`) |
+| `valerter_vl_source_up` | 1 (per source) | Check VL connection |
 
 ### 3. Choose Appropriate Throttle Keys
 
@@ -314,7 +321,7 @@ throttle:
 Valerter handles **100,000 logs/sec** while sending only the notifications you configure:
 - ✅ Exact throttle behavior (25 notifications from 500k logs)
 - ✅ Zero drops
-- ✅ Stable memory (~20 MB)
+- ✅ Stable memory (~20 MB, measured on 1.0.0-rc.5)
 - ✅ No crashes
 
 ### Robustness (Without Throttle)
