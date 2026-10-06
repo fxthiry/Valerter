@@ -1,5 +1,6 @@
 //! Valerter - Real-time alerting from VictoriaLogs to Mattermost.
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,9 +20,17 @@ use valerter::{
     build_metrics_inventory, run_preflight,
 };
 
+/// Whether text logs carry ANSI colors: only when stderr is a terminal
+/// (journald and log files would store the escape codes as is), and never
+/// when `NO_COLOR` is set to a non-empty value.
+fn ansi_colors(stderr_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stderr_is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
 /// Initialize the tracing subscriber with the specified log format.
 ///
-/// - `LogFormat::Text`: Human-readable format for journalctl (AD-10)
+/// - `LogFormat::Text`: Human-readable format for journalctl (AD-10), colored
+///   only on a terminal ([`ansi_colors`])
 /// - `LogFormat::Json`: Structured JSON format for log aggregation (FR42)
 fn init_logging(format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -29,8 +38,13 @@ fn init_logging(format: LogFormat) {
 
     match format {
         LogFormat::Text => {
+            let ansi = ansi_colors(
+                std::io::stderr().is_terminal(),
+                std::env::var_os("NO_COLOR").as_deref(),
+            );
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
+                .with_ansi(ansi)
                 .with_env_filter(filter)
                 .init();
         }
@@ -409,6 +423,17 @@ async fn run(runtime_config: RuntimeConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ansi_colors_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(ansi_colors(true, None));
+        assert!(ansi_colors(true, Some(OsStr::new(""))));
+        assert!(!ansi_colors(true, Some(OsStr::new("1"))));
+        // journald, a pipe or a file: never colored.
+        assert!(!ansi_colors(false, None));
+        assert!(!ansi_colors(false, Some(OsStr::new(""))));
+    }
 
     /// Test that cancellation token triggers proper shutdown behavior.
     /// This validates the core shutdown mechanism used by signal handlers.

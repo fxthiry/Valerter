@@ -171,11 +171,15 @@ Les métriques émises avant l'installation de l'exporteur Prometheus SHALL êtr
 - **THEN** aucune série ni texte d'aide `valerter_notifier_config_errors_total` n'est présent
 
 ### Requirement: Logs structurés sur la sortie d'erreur
-Le démon SHALL écrire tous ses logs sur la sortie d'erreur standard, au format texte lisible par défaut ou au format JSON lorsque `--log-format json` ou la variable d'environnement `LOG_FORMAT=json` est fourni, l'option en ligne de commande l'emportant sur la variable.
+Le démon SHALL écrire tous ses logs sur la sortie d'erreur standard, au format texte lisible par défaut ou au format JSON lorsque `--log-format json` ou la variable d'environnement `LOG_FORMAT=json` est fourni, l'option en ligne de commande l'emportant sur la variable. Le format texte MUST ne contenir des codes de couleur ANSI que lorsque la sortie d'erreur est un terminal et que `NO_COLOR` n'est pas définie à une valeur non vide.
 
 #### Scenario: Format texte par défaut
 - **WHEN** valerter est lancé sans `--log-format` ni `LOG_FORMAT`
 - **THEN** les logs sont écrits en texte lisible sur la sortie d'erreur
+
+#### Scenario: Pas de couleurs hors terminal
+- **WHEN** valerter tourne sous systemd (sortie d'erreur reliée à journald) ou avec sa sortie d'erreur redirigée vers un tube ou un fichier, sans `NO_COLOR`
+- **THEN** les logs au format texte ne contiennent aucun code d'échappement ANSI
 
 #### Scenario: Format JSON
 - **WHEN** valerter est lancé avec `LOG_FORMAT=json`
